@@ -1,1 +1,270 @@
-<!DOCTYPE html> <html lang="en"> <head> <meta charset="UTF-8"> <meta name="viewport" content="width=device-width, initial-scale=1.0"> <title>Ray's Daily Arcade — a new tiny game every day</title> <meta name="description" content="One tiny free browser game published every day. Play them all free."> <style> *{margin:0;padding:0;box-sizing:border-box} body{background:#0b1026;color:#e8ecff;font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:40px 20px} h1{font-size:clamp(28px,6vw,48px);background:linear-gradient(90deg,#6cf0ff,#b18cff,#ff8cd1);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:8px;text-align:center} .sub{color:#aab4e8;margin-bottom:32px;text-align:center} .games{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:20px;max-width:900px;width:100%} .card{background:#151c3f;border:1px solid #2b3572;border-radius:14px;overflow:hidden;text-decoration:none;color:inherit;transition:transform .15s,box-shadow .15s} .card:hover{transform:translateY(-4px);box-shadow:0 8px 30px rgba(76,120,255,.35)} .card img{width:100%;height:150px;object-fit:cover;display:block} .card .body{padding:14px} .card .title{font-weight:800;font-size:18px;margin-bottom:4px} .card .tag{font-size:12px;color:#7780b8;letter-spacing:1px;text-transform:uppercase} .card .desc{font-size:14px;color:#aab4e8;margin-top:6px;line-height:1.4} footer{margin-top:40px;color:#555fa0;font-size:13px} </style> </head> <body> <h1>🎮 DAILY ARCADE</h1> <p class="sub">One tiny free browser game, published every day. No installs, no ads — just play.</p> <div class="games"> <a class="card" href="./maze-sprint/"> <img src="./maze-sprint/cover.png" alt="Maze Sprint cover"> <div class="body"> <div class="tag">Day 1 · Maze · Sep 26 2026</div> <div class="title">Maze Sprint</div> <div class="desc">Outrun the clock through endless neon mazes. Swipe or use arrow keys — each maze you clear adds bonus time!</div> </div> </a> </div> <footer>Built with ❤ by Ray Martin · new game every day</footer> </body> </html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Word Rush — Daily Game</title>
+<meta name="description" content="Word Rush: 60 seconds, 7 letters, as many words as you can. Free daily browser game.">
+<meta property="og:title" content="Word Rush — Daily Game">
+<meta property="og:description" content="60 seconds, 7 letters, as many words as you can. Play free!">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{touch-action:manipulation}
+body{background:#141020;color:#f2ecff;font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:16px 12px;user-select:none}
+.wrap{width:100%;max-width:480px;display:flex;flex-direction:column;align-items:center;gap:12px}
+h1{font-size:clamp(30px,8vw,44px);background:linear-gradient(90deg,#ffd166,#ef476f,#9b5de5);-webkit-background-clip:text;background-clip:text;color:transparent;letter-spacing:1px}
+.tagline{color:#a79bc7;font-size:14px;text-align:center}
+.screen{width:100%;display:none;flex-direction:column;align-items:center;gap:12px}
+.screen.active{display:flex}
+.btn{background:linear-gradient(135deg,#9b5de5,#ef476f);border:none;color:#fff;font-weight:800;font-size:18px;padding:14px 34px;border-radius:999px;cursor:pointer;letter-spacing:1px;box-shadow:0 4px 18px rgba(155,93,229,.45)}
+.btn:active{transform:scale(.96)}
+.btn.small{font-size:15px;padding:10px 22px}
+.btn.ghost{background:#2a2145;box-shadow:none}
+.hud{width:100%;display:flex;justify-content:space-between;align-items:center;font-size:15px;color:#a79bc7}
+#score{font-size:26px;font-weight:800;color:#ffd166}
+#combo{color:#06d6a0;font-weight:700}
+.timerwrap{width:100%;height:12px;background:#2a2145;border-radius:99px;overflow:hidden}
+#timerbar{height:100%;width:100%;background:linear-gradient(90deg,#06d6a0,#ffd166,#ef476f);transition:width .2s linear}
+#time{font-weight:800;font-size:20px;color:#fff}
+.wordline{min-height:56px;display:flex;align-items:center;gap:6px;font-size:34px;font-weight:800;letter-spacing:4px;color:#fff}
+.wordline .ph{color:#4a3f6e}
+.tiles{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+.tile{width:58px;height:58px;border-radius:12px;background:linear-gradient(160deg,#3a2f63,#241c48);border:2px solid #574a92;display:flex;align-items:center;justify-content:center;font-size:28px;font-weight:800;cursor:pointer;color:#fff;text-transform:uppercase;box-shadow:0 3px 0 #17123a}
+.tile:active{transform:translateY(2px)}
+.tile.used{opacity:.25;pointer-events:none}
+.controls{display:flex;gap:10px;flex-wrap:wrap;justify-content:center}
+.foundwrap{width:100%;background:#1d1533;border:1px solid #3a2f63;border-radius:12px;padding:10px 12px;max-height:180px;overflow-y:auto}
+.foundwrap .head{font-size:13px;color:#a79bc7;margin-bottom:6px;display:flex;justify-content:space-between}
+#foundwords{display:flex;flex-wrap:wrap;gap:6px}
+.chip{background:#2a2145;border:1px solid #574a92;border-radius:8px;padding:4px 10px;font-size:14px;font-weight:700;color:#ffd166}
+.chip.new{animation:pop .3s}
+@keyframes pop{0%{transform:scale(.6)}100%{transform:scale(1)}}
+.shake{animation:shake .3s}
+@keyframes shake{0%,100%{transform:translateX(0)}25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
+.stat{font-size:16px;color:#a79bc7}
+.stat b{color:#ffd166}
+ul.words{list-style:none;display:flex;flex-wrap:wrap;gap:6px;justify-content:center;max-height:150px;overflow-y:auto;width:100%}
+ul.words li{background:#241c48;border:1px solid #574a92;border-radius:8px;padding:4px 10px;font-size:13px}
+ul.words li.missed{opacity:.5}
+.howto{background:#1d1533;border:1px solid #3a2f63;border-radius:12px;padding:14px 16px;font-size:15px;color:#cbbfec;line-height:1.6;width:100%}
+.howto b{color:#ffd166}
+.mutebtn{background:none;border:none;font-size:22px;cursor:pointer;opacity:.7}
+footer{margin-top:10px;color:#4a3f6e;font-size:12px;text-align:center}
+</style>
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <h1>⚡ WORD RUSH</h1>
+  <p class="tagline">One tiny game a day · free forever</p>
+
+  <!-- START SCREEN -->
+  <div class="screen active" id="startScreen">
+    <div class="howto">
+      ⏱️ <b>60 seconds.</b> 7 letters. Find as many words as you can.<br>
+      👆 <b>Tap letters</b> to spell, then hit <b>SUBMIT</b>.<br>
+      🌟 Longer words = bigger points. Chain correct words for a <b>combo bonus</b>.<br>
+      🔀 Stuck? <b>SHUFFLE</b> the tiles. ⌨️ Keyboard works too!
+    </div>
+    <button class="btn" id="startBtn">START ▶</button>
+    <p class="stat">🏆 Best score: <b id="bestStart">0</b></p>
+    <button class="mutebtn" id="muteStart" title="toggle sound">🔊</button>
+  </div>
+
+  <!-- GAME SCREEN -->
+  <div class="screen" id="gameScreen">
+    <div class="hud">
+      <div><span id="score">0</span><br><span id="combo"></span></div>
+      <div><span id="time">60</span>s</div>
+      <button class="mutebtn" id="muteGame" title="toggle sound">🔊</button>
+    </div>
+    <div class="timerwrap"><div id="timerbar"></div></div>
+    <div class="wordline" id="wordline"><span class="ph">tap letters…</span></div>
+    <div class="tiles" id="tiles"></div>
+    <div class="controls">
+      <button class="btn small" id="submitBtn">SUBMIT ✓</button>
+      <button class="btn small ghost" id="clearBtn">CLEAR ✕</button>
+      <button class="btn small ghost" id="shuffleBtn">SHUFFLE 🔀</button>
+    </div>
+    <div class="foundwrap">
+      <div class="head"><span>FOUND</span><span id="foundCount">0 / 0</span></div>
+      <div id="foundwords"></div>
+    </div>
+  </div>
+
+  <!-- END SCREEN -->
+  <div class="screen" id="endScreen">
+    <h1 style="font-size:34px">⏰ TIME!</h1>
+    <p class="stat">Your score: <b id="finalScore" style="font-size:28px">0</b></p>
+    <p class="stat">Words found: <b id="finalCount">0</b> / <b id="finalTotal">0</b></p>
+    <p class="stat">🏆 Best: <b id="bestEnd">0</b></p>
+    <p class="stat" id="newBest" style="display:none;color:#06d6a0;font-weight:800">🎉 NEW BEST SCORE!</p>
+    <p class="stat">You found:</p>
+    <ul class="words" id="foundList"></ul>
+    <p class="stat">You missed:</p>
+    <ul class="words" id="missedList"></ul>
+    <button class="btn" id="againBtn">PLAY AGAIN ↻</button>
+    <button class="btn ghost small" id="menuBtn">MENU</button>
+  </div>
+
+  <footer>Built with ❤ by Ray Martin · new game every day</footer>
+</div>
+
+<script>
+//LOGIC-START
+// --- pure game logic (also exercised by node smoke tests) ---
+function countsOf(s){const c={};for(const ch of s)c[ch]=(c[ch]||0)+1;return c;}
+function canForm(word, lc){const c=Object.assign({},lc);for(const ch of word){if(!c[ch])return false;c[ch]--;}return true;}
+function scoreForWord(len, streak){
+  const base={3:100,4:200,5:400,6:700,7:1200}[len]||50;
+  const mult=Math.min(2,1+0.25*streak);
+  return Math.round(base*mult);
+}
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function shuffleArr(arr,rng){const a=arr.slice();for(let i=a.length-1;i>0;i--){const j=Math.floor(rng()*(i+1));const t=a[i];a[i]=a[j];a[j]=t;}return a;}
+// valid guess: in solution set, not already found, letters fit
+function checkGuess(word, solSet, foundSet, letterCounts){
+  if(word.length<3)return{ok:false,reason:'short'};
+  if(!canForm(word,letterCounts))return{ok:false,reason:'letters'};
+  if(!solSet.has(word))return{ok:false,reason:'notword'};
+  if(foundSet.has(word))return{ok:false,reason:'dup'};
+  return{ok:true};
+}
+//LOGIC-END
+
+// --- embedded letter sets + solutions (generated at build time) ---
+const SETS=[["banters","abe abn abr abs abt aer aes aet ane ans ant arb are arn ars art asb ase ast ate bae ban bar bas bat bea ben ber bes bet bra ean ear eat ens era ern ers est eta nab nae nar nat nea neb net rab ran ras rat rea reb ren res ret rte sab sae san sar sat sea sen ser set sta str tab tae tan tar tas tbs tea ten ter tra trs abet anes anet anre ante ants arbs aren ares aret arne arse arte arts astr aten ates bane bans bant bare barn bars bart base bast bate bats bean bear beat bena bens bent bern bert besa best beta bets brae bran bras brat bren bret earn ears east eats entr eras erat erns erst etas etna nabs nare nast nate natr near neat nebs nest nets rane rant rase rate rats rebs rent rest rets sabe sane sant sare sart sate sean sear seat seba sena sent sera serb sert seta snab sneb stab stan star sten ster stra stre tabs taen tane tans tare tarn tars tean tear teas tens tera tern tran tres tsar abets abner abnet abret abstr anser antes antre arent arest arneb aster astre atren banes bares baret barns barse baser baste bater bates beans beant bears beast beats bents berat besan besra betas braes brans brant brast brats brens brent brest earns ernst estab etnas nares nates nears neats nerts rants rasen rates reast reban rents resat retan saber sabre saner sebat serab serta snare stane stare starn stean stern strae taber tabes tares tarns tarse tears teras terna terns trans treas absent antres astern banter barest basnet basten baster besant bestar brants brasen breast brents enstar restab stenar sterna tabers trabes transe banters"],["planets","aes aet ale aln alp als alt ane ans ant ape apl apt ase asp ast ate ean eat ela els elt enl ens epa esp est eta lan lap las lat lea len lep les let lst nae nap nat nea nep net pal pan pas pat pea pen pes pet pst pta pte pts sae sal san sap sat sea sel sen sep set sla slt spa spl spt sta tae tal tan tap tas tea tel ten tln tps tsp alen ales alps alts anes anet ante ants apes apse apts aten ates atle east eats elan elsa etas etna laen laet lane lant laps lase last late lats lean leap leas leat lena lens lent lepa lest lets nael nale nape naps nast nate natl neal neap neat nepa nest nets pale pals palt pane pans pant pase past pate pats peal pean peas peat pelt pens pent pesa pest pets plan plat plea sale salp salt sane sant sate seal sean seat selt sena sent sepn sept seta slae slap slat snap spae span spat spet stan stap sten step tael taen tale tane tans tape taps teal tean teap teas tela tens tepa alpen anlet ansel antes aspen astel elans elaps enapt ental etnas lanes lapse laten leans leant leaps leapt least lepas lepta napes nates neaps neats nepal pales palet panel panes panse pants paste patel paten pates peals peans peats pelta pelts penal penta petal plane plans plant plate plats pleas pleat plena salep salet saple senal sepal septa setal slane slant slape slate slent slept snape sneap spale spalt spane spate speal spean spelt spent splat splet stale stane steal stean stela taels tales tapen tapes teals tenla tepal tepas tesla latens naples palest palets panels pantle pastel patens petals planes planet plants platen plates pleats salten septal septan splent staple tansel tepals planets platens"],["casting","act agt ain ais ait anc ani ans ant asg ast ati cag cai can cat cgs cia cig cis cit csi cst ctg ctn cts gan gas gat gin gis git gns gtc ian ign inc ing ins int isn ist ita its nag nat nig nis nit sac sag sai san sat sci sct sia sic sig sin sit sta stg tag tai tan tas tgn tic tig tin tis tng tsi acis actg acts agin agit agst ains aint aits anis ansi anti ants asci atis cagn cain cans cant cast cats cist gain gait gant gast gats gins gist gnat inca inga inst inta isnt nags naig nais nasi nast ngai nias nist nits saic sain sang sant sati scag scan scat sign sina sing sita snag snig snit stag stan tags taig tain tang tans tics tina tinc ting tins tsia acing actin agist angst antic antis ating cagit cains canis canst cants cista gains gaist gaits giant gnast gnats inact incas saint sanct sanit satin scant scian signa staig stain stang sting tains tangi tangs tiang tings acting actins antics casing cating gainst giants gisant incast nastic sating actings casting"],["morning","gim gin gio goi gon gor gro ign ing inn ino ion mgr mig min mir mog moi mon mor nig nim nog nom non nor oni org rig rim rin rio rog roi rom ron ginn girn giro grim grin inro iron ming mino miro moir mong morg morn ning niog noir nong nori norm norn omni orig ring roin rong giron groin inorg mingo minor morin ronin ronni mignon morning"],["dreamer","ade adm aer ame are arm arr dae dam dar dea dee dem der ead eam ear eer eme era erd ere err mad mae mar mea med mee mer rad ram rea red ree rem ared daer dame dare darr dear deem deer deme dere derm dram dree edam edea emda emer erer erma erme made maed mare mead mear mede meed meer merd mere rame rare read ream rear rede reed reem adeem ameed ameer arder arere armed armer darer deare derma drame dream drear eared edema erade erred madre medea mered merer ramed ramee rearm dearer marred marree meader reader reamed reamer reared redame redare redear remade reread dreamer rearmed redream"],["sprints","ins int ipr ips irs isn ist its nip nis nit pin pir pis pit prn prs psi pst pts rin rip rit rps rpt rti sin sip sir sis sit sps spt sri ssi ssp str tin tip tis tpi tps tri trp trs tsi tsp tss insp inst intr isnt nips nist nits pins pint pirn piss pist pits prin psis psst rins rips risp riss rist sins sips sirs sist sits snip snit spin spit sris stir tins tips trin trip instr pints pirns print priss snips snirt snits spins spirt spits sprit stirp stirs strip trips prints spirts sprint sprits stirps strips sprints"],["flowers","efl efs elf els eof eos erf ers fer few flo foe fol for fow fro frs leo ler les lew loe lof lor low lwo oer oes ole ore orf orl ors ose owe owl ref rel res rew rfs rle roe ros row sel ser sew soe sol sow wef wer wes woe wos wro eros fels fers flew floe flor flow foes fole fore fowl froe frow leos lore lors lose lowe lows ofer oles ores orfe orle ower owes owls owse refl refs roes role rolf rose rows self seor serf sero slew sloe slow sole sore sowf sowl welf wels werf woes wolf wore flews floes flowe flows forel fores fowls froes frowl frows lores loser lower lowes lowse orles orsel owler owser resow roles rolfe rosel rowel serow sofer soler sorel sowel sower sowle swore wolfs worse flores flower fowler lowers lowser reflow rowels slower wolfer worsle flowers fowlers reflows wolfers"],["trainer","aer aet ain air ait ane ani ant are arn arr art ate ati ean ear eat eir era ern err eta ian int ira ire ita nae nar nat nea nei net nit ran rat rea rei ren ret ria rie rin rit rte rti tae tai tan tar tea ten ter tie tin tra tri aine aint aire airn airt anet anre ante anti aren aret arne arni arri arte aten earn entr erat eria erin etna iare inta intr iran itea iten iter nair nare narr nate natr near neat neri neti rain rane rani rant rare rate rear rein reit rent rier rine rita rite taen tain tane tare tari tarn tarr tean tear tera teri tern terr tiar tien tier tina tine tire tirr tran trin airer antre arent arite arret arrie arter artie atren entia erian inert inter intra irate irena niter nitre rater reina reran retan retar retia retin riant tairn tarie tarin tarre tarri teian tenai tenia terai terna terra terri tinea tirer train trier trina trine anteri arrent arriet artier entria errant irater irrate nerita rainer ranter ratine retain retina tanier tarrie ternar terran arterin retrain terrain trainer"],["masters","aer aes aet ame amt are arm ars art ase ass ast ate atm eam ear eat ems era ers ess est eta mae mar mas mat mea mer mes met mrs mss mts ram ras rat rea rem res ret rms rte sae sam sar sat sea sem ser set sma sta stm str tae tam tar tas tea tem ter tra trs tss ares aret arms arse arte arts asem asse asst astr ates ears east eats eras erat erma erst etas maes mare mars mart mass mast mate mats mear meas meat mesa mess mest meta mets rame rams rase rate rats ream rems rest rets same sare sart sate seam sear seas seat sera sers sert seta sets stam star stem ster stra stre tame tams tare tars tass team tear teas tema tera term tess tram tres tsar amess arest armet arses asset aster astre easts mares marse marts maser masse masts mater mates meats merat mesas metas metra mster ramet rases rasse rates reams reast resat rests satem sates seams sears seats serta sesma smart smear stare stars steam stema stems strae stram tamer tames tares tarse tasse teams tears teras terma terms trame trams trass treas trema tress tsars armets assert asters essart marses martes masers masser master maters matres ramets remass remast smarts smears stares steams stream tamers tasser terass masters streams"],["rainbow","abn abo abr ain air ani aob aor arb arn aro awn bai ban bar baw bin bio boa bon bor bow bra bro ian iao iba ibo ino ion ira iwa nab nar naw nib noa nob nor now oar oba obi ona oni ora orb own rab ran raw ria rib rin rio rob roi ron row wab wan war win wir woa wob won wro abir abow abri aion airn arni arow awin bain bani bari barn bawn bino bion birn biwa boar bona boni bora bori born bown bran braw brin brio brow iban inro iowa iran iron naib naio nair naoi narw noir nora nori oban obia orna rabi rain rani raob roan roin wabi wain wair warb warn wino woan worn wran abrin arion bairn baroi baron biron boran brain brawn brian brown inbow inorb iowan nawob noria rabin rawin robin rowan baroni barwin bonair borani obarni wabron rainbow"],["glisten","eli els elt eng enl ens est gel gen ges get gie gil gin gis git glt gns gte ign ile ing ins int ise isl isn ist its leg lei len les let lie lig lin lis lit lst neg nei net nig nil nis nit seg sei sel sen set sie sig sil sin sit slt stg teg tel ten tgn tie tig til tin tis tln tng tsi egis engl engs gein gels gelt genl gens gent gest gets gien gies gile gils gilt gins gise gist gite glen glis inst intl isle isnt itel iten legs leis leng lens lent lest lets lien lies lige line ling lins lint lise list lite lits neil nest neti nets nies nile nils nist nits seit selt sent sign sile silt sine sing site slit snig snit steg sten stge stlg tegs teil teli teng tens tien ties tige tile tils tine ting tins elsin geist gelts genit gents giles gilet gilse gilts gisel gleit glens glent glint glist ingle inlet inset intel islet istle legis legit lenis liens liest ligne lines linet linge lings lints lites neist niels nigel segni sengi senit senti silen singe slent sline sling slite snite stein steng stile stine sting tiens tiles tines tinge tings tsine enlist gentil gilten glinse glints ingest ingles inlets legist legits lignes linget listen seling signet silent single slinge slinte stinge tinges tingle tinsel glisten setling singlet tingles"],["painted","ade adp aet aid ain ait and ane ani ant ape apt ate ati dae dan dap dat dea dei den dep det dia die din dip dit dpt ead ean eat edp end epa epi eta ian ida ide ind int ita itd nad nae nap nat nea ned nei nep net nid nip nit pad pan pat pdn pea ped pen pet pia pie pin pit pta pte tad tae tai tan tap tea ted ten tid tie tin tip tpd tpi aden adet adin adit aide aine aint ande andi anet ante anti aped ated aten atip dain dane dani date dean deia dent depa dept deti detn dian diet dine dint dipt dita dite eadi edit edna enid epit etna idea inde inta itea iten naid nape nate neap neat nepa neti nide nipa paid pain pand pane pani pant patd pate peai pean peat peda pein pend pent pian pied pien piet pina pind pine pint pita tade taen tain tane tape tead tean teap teda tend tepa tide tied tien tina tind tine tipe adept anted daint dante denat depit detin diane enapt endia enpia entad entia idant idean ident ideta inapt inept nepit niepa paine paint paned pated paten patin penda penta pidan piend pieta pinda pined pinta pinte taped tapen teian teind tenai tenia tepid tinea tined adient danite detain pained pandit panted pantie patine pedant pentad pianet pineta tienda depaint inadept painted patined"]].map(function(x){return{letters:x[0].split(""),words:x[1].split(" ")};});
+</script>
+<script>
+// --- UI layer ---
+(function(){
+'use strict';
+const $=id=>document.getElementById(id);
+let sets=SETS.slice(), setIdx=-1, letters=[], solSet=new Set(), foundSet=new Set(),
+    letterCounts={}, current=[], score=0, streak=0, timeLeft=60, timerId=null,
+    soundOn=localStorage.getItem('wr_sound')!=='0', usedSetIdxs=[];
+
+// ---- audio ----
+let actx=null;
+function beep(freq,dur,type,vol){
+  if(!soundOn)return;
+  try{
+    actx=actx||new (window.AudioContext||window.webkitAudioContext)();
+    const o=actx.createOscillator(),g=actx.createGain();
+    o.type=type||'sine';o.frequency.value=freq;
+    g.gain.setValueAtTime(vol||0.15,actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001,actx.currentTime+dur);
+    o.connect(g);g.connect(actx.destination);o.start();o.stop(actx.currentTime+dur);
+  }catch(e){}
+}
+const sfx={
+  good(){beep(660,.12,'sine');setTimeout(()=>beep(880,.15,'sine'),80);},
+  bad(){beep(200,.2,'square',.08);},
+  tick(){beep(1200,.06,'sine',.06);},
+  end(){beep(523,.15,'sine');setTimeout(()=>beep(392,.15,'sine'),140);setTimeout(()=>beep(262,.3,'sine'),280);}
+};
+function updateMuteBtns(){$('muteStart').textContent=soundOn?'🔊':'🔇';$('muteGame').textContent=soundOn?'🔊':'🔇';}
+$('muteStart').onclick=$('muteGame').onclick=()=>{soundOn=!soundOn;localStorage.setItem('wr_sound',soundOn?'1':'0');updateMuteBtns();};
+updateMuteBtns();
+
+function show(id){['startScreen','gameScreen','endScreen'].forEach(s=>$(s).classList.toggle('active',s===id));}
+
+function newRound(){
+  if(usedSetIdxs.length>=sets.length)usedSetIdxs=[];
+  let i;do{i=Math.floor(Math.random()*sets.length);}while(usedSetIdxs.includes(i));
+  usedSetIdxs.push(i);setIdx=i;
+  const s=sets[i];
+  letters=shuffleArr(s.letters,mulberry32((Math.random()*1e9)|0));
+  solSet=new Set(s.words);foundSet=new Set();
+  letterCounts=countsOf(s.letters.join(''));
+  current=[];score=0;streak=0;timeLeft=60;
+  renderTiles();renderWord();renderFound();updateHud();updateTimer();
+}
+function renderTiles(){
+  const t=$('tiles');t.innerHTML='';
+  const avail=Object.assign({},letterCounts);
+  letters.forEach((ch,idx)=>{
+    const d=document.createElement('div');
+    d.className='tile'+(avail[ch]<=0?' used':'');
+    d.textContent=ch;
+    d.onclick=()=>{if(avail[ch]<=0)return;avail[ch]--;d.classList.add('used');current.push({ch,el:d});renderWord();};
+    t.appendChild(d);
+  });
+  // backspace-style: tap word letters to remove? use clear only; also allow clicking tile in word? keep simple: keyboard backspace or CLEAR
+}
+function renderWord(){
+  const w=$('wordline');
+  if(!current.length){w.innerHTML='<span class="ph">tap letters…</span>';return;}
+  w.textContent=current.map(c=>c.ch).join('');
+}
+function updateHud(){$('score').textContent=score;$('combo').textContent=streak>1?('🔥 x'+streak):'';}
+function updateTimer(){$('time').textContent=timeLeft;$('timerbar').style.width=(timeLeft/60*100)+'%';}
+function renderFound(){
+  const fw=$('foundwords');fw.innerHTML='';
+  [...foundSet].forEach(w=>{const c=document.createElement('span');c.className='chip new';c.textContent=w;fw.appendChild(c);});
+  $('foundCount').textContent=foundSet.size+' / '+solSet.size;
+}
+function shakeWord(){$('wordline').classList.remove('shake');void $('wordline').offsetWidth;$('wordline').classList.add('shake');}
+function clearCurrent(){current.forEach(c=>c.el.classList.remove('used'));current=[];renderWord();}
+function submit(){
+  const word=current.map(c=>c.ch).join('');
+  const r=checkGuess(word,solSet,foundSet,letterCounts);
+  if(!r.ok){
+    if(r.reason==='short')return;
+    sfx.bad();streak=0;updateHud();shakeWord();clearCurrent();return;
+  }
+  const pts=scoreForWord(word.length,streak);
+  score+=pts;streak++;foundSet.add(word);
+  sfx.good();updateHud();renderFound();clearCurrent();
+}
+$('submitBtn').onclick=submit;
+$('clearBtn').onclick=clearCurrent;
+$('shuffleBtn').onclick=()=>{letters=shuffleArr(letters,mulberry32((Math.random()*1e9)|0));clearCurrent();renderTiles();};
+$('startBtn').onclick=()=>{beep(440,.1);newRound();show('gameScreen');startTimer();};
+$('againBtn').onclick=()=>{newRound();show('gameScreen');startTimer();};
+$('menuBtn').onclick=()=>{show('startScreen');$('bestStart').textContent=best();};
+function best(){return parseInt(localStorage.getItem('wr_best')||'0',10);}
+function startTimer(){
+  clearInterval(timerId);
+  timerId=setInterval(()=>{
+    timeLeft--;
+    if(timeLeft<=10&&timeLeft>0)sfx.tick();
+    updateTimer();
+    if(timeLeft<=0){clearInterval(timerId);endGame();}
+  },1000);
+}
+function endGame(){
+  sfx.end();
+  const b=best();let nb=false;
+  if(score>b){localStorage.setItem('wr_best',String(score));nb=true;}
+  $('finalScore').textContent=score;
+  $('finalCount').textContent=foundSet.size;
+  $('finalTotal').textContent=solSet.size;
+  $('bestEnd').textContent=Math.max(b,score);
+  $('newBest').style.display=nb?'block':'none';
+  const fl=$('foundList');fl.innerHTML='';
+  [...foundSet].sort().forEach(w=>{const li=document.createElement('li');li.textContent=w;fl.appendChild(li);});
+  const ml=$('missedList');ml.innerHTML='';
+  const missed=[...solSet].filter(w=>!foundSet.has(w)).sort((a,b)=>b.length-a.length||a.localeCompare(b));
+  missed.slice(0,60).forEach(w=>{const li=document.createElement('li');li.className='missed';li.textContent=w;ml.appendChild(li);});
+  if(missed.length>60){const li=document.createElement('li');li.className='missed';li.textContent='…+'+(missed.length-60)+' more';ml.appendChild(li);}
+  show('endScreen');
+}
+// keyboard
+document.addEventListener('keydown',e=>{
+  if(!$('gameScreen').classList.contains('active'))return;
+  const k=e.key.toLowerCase();
+  if(k==='enter'){submit();return;}
+  if(k==='backspace'){const c=current.pop();if(c)c.el.classList.remove('used');renderWord();return;}
+  if(/^[a-z]$/.test(k)){
+    const tiles=$('tiles').children;
+    for(const t of tiles){
+      if(t.textContent===k&&!t.classList.contains('used')){t.click();break;}
+    }
+  }
+});
+$('bestStart').textContent=best();
+})();
+</script>
+</body>
+</html>
