@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Slingshot Stars — Daily Game</title>
+<meta name="description" content="Slingshot Stars: 60 seconds of physics flinging fun. Pull back, aim, and smash the stars out of the sky. A free daily browser game.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;background:#070b24;font-family:'Segoe UI',system-ui,sans-serif;touch-action:none;user-select:none;-webkit-user-select:none}
+#game{display:block;width:100vw;height:100vh;cursor:crosshair}
+.overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(5,8,32,.85);z-index:10;text-align:center;padding:24px;color:#eaf0ff}
+.overlay h1{font-size:clamp(32px,9vw,62px);font-weight:900;background:linear-gradient(90deg,#ffd166,#ff8cd1,#6cf0ff);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:6px}
+.overlay p{color:#aab4e8;margin:6px 0;max-width:430px;line-height:1.55;font-size:16px}
+.bigbtn{margin-top:22px;padding:16px 46px;font-size:20px;font-weight:800;border:none;border-radius:999px;background:linear-gradient(90deg,#ff9f1c,#ff5d8f);color:#fff;cursor:pointer;box-shadow:0 6px 24px rgba(255,93,143,.45)}
+.bigbtn:active{transform:scale(.96)}
+.stat{font-size:15px;color:#8b95c9;margin-top:10px}
+#score-line{font-size:24px;font-weight:800;color:#ffd166}
+.kbd{background:#1a2350;border:1px solid #3a4690;border-radius:6px;padding:1px 8px;font-size:13px;color:#cdd6ff}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div class="overlay" id="startScreen">
+  <h1>🎯 SLINGSHOT STARS</h1>
+  <p>You have <b>60 seconds</b>. Drag the glowing stone back on the slingshot, aim, and let it fly!<br>
+  Smash <b style="color:#6cf0ff">stars</b> for points — chain hits without missing for combo multipliers.<br>
+  ✨ <b style="color:#ffd166">Golden comets</b> zoom by: smash one for a big bonus!<br>
+  <span class="kbd">touch / mouse</span> drag to aim &amp; release to fire</p>
+  <button class="bigbtn" id="startBtn">START FLINGING</button>
+  <div class="stat" id="bestStart"></div>
+</div>
+
+<div class="overlay" id="endScreen" style="display:none">
+  <h1>⏰ TIME!</h1>
+  <div id="score-line">Score: 0</div>
+  <p id="finalStats"></p>
+  <button class="bigbtn" id="againBtn">FLING AGAIN</button>
+  <div class="stat" id="bestEnd"></div>
+</div>
+
+<script>
+'use strict';
+// ============================================================
+//LOGIC-START
+// Pure game logic (no DOM/canvas) — extracted and unit-tested by smoke-test.js
+
+// Seeded RNG (mulberry32)
+function makeRng(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+var GAME_TIME = 60;        // seconds
+var GRAVITY = 1500;        // px/s^2
+var MAX_PULL = 150;        // max drag distance in px
+var MIN_PULL = 18;         // below this the shot is cancelled
+var POWER = 9;             // velocity px/s per px of pull
+var STONE_R = 14;
+var TARGET_STARS = 7;      // stars kept on screen
+var SHOT_COOLDOWN = 0.45;  // seconds between shots
+
+// Clamp a pull vector to max radius. Returns {dx, dy}.
+function clampPull(dx, dy, maxR) {
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len <= maxR || len === 0) return { dx: dx, dy: dy };
+  const s = maxR / len;
+  return { dx: dx * s, dy: dy * s };
+}
+
+// Pull (dx,dy) is anchor->stone. Launch velocity points the opposite way.
+function launchVelocity(dx, dy) {
+  return { vx: -dx * POWER, vy: -dy * POWER };
+}
+
+// Advance a stone one step (mutates s = {x,y,vx,vy})
+function stepStone(s, dt) {
+  s.vy += GRAVITY * dt;
+  s.x += s.vx * dt;
+  s.y += s.vy * dt;
+}
+
+// True if the stone is fully outside the play area
+function offScreen(s, w, h, margin) {
+  return (s.x < -margin || s.x > w + margin || s.y < -margin || s.y > h + margin);
+}
+
+// Predicted trajectory points for the aim preview
+function trajectory(ax, ay, vx, vy, steps, dt) {
+  const pts = [];
+  let x = ax, y = ay, _vx = vx, _vy = vy;
+  for (let i = 0; i < steps; i++) {
+    _vy += GRAVITY * dt;
+    x += _vx * dt;
+    y += _vy * dt;
+    pts.push({ x: x, y: y });
+  }
+  return pts;
+}
+
+// Circle-circle collision
+function circleHit(ax, ay, ar, bx, by, br) {
+  const dx = ax - bx, dy = ay - by, rr = ar + br;
+  return dx * dx + dy * dy <= rr * rr;
+}
+
+// Combo multiplier: +1 per 4 chained hits, capped at x5
+function comboMultiplier(combo) {
+  return Math.min(5, 1 + Math.floor(combo / 4));
+}
+
+// Points for smashing a star/comet; returns {points, newCombo}
+function hitScore(type, combo) {
+  const newCombo = combo + 1;
+  const base = type === 'comet' ? 250 : 100;
+  return { points: base * comboMultiplier(newCombo), newCombo: newCombo };
+}
+
+// A shot that hit nothing: combo resets, no points
+function missReset() {
+  return { points: 0, newCombo: 0 };
+}
+
+// Spawn a star/comet in the sky region. t = elapsed fraction 0..1.
+function newStar(rng, w, h, t) {
+  const isComet = rng() < 0.12 + 0.10 * t;
+  const r = isComet ? 24 : 20 + rng() * 10;
+  const dir = rng() < 0.5 ? -1 : 1;
+  const speed = (isComet ? 130 : 30) + rng() * (isComet ? 90 : 40) + 40 * t;
+  return {
+    x: 30 + rng() * Math.max(1, w - 60),
+    y: h * 0.08 + rng() * h * 0.47,
+    r: r,
+    vx: dir * speed,
+    type: isComet ? 'comet' : 'star',
+    phase: rng() * Math.PI * 2,
+    hue: isComet ? 45 : 185 + Math.floor(rng() * 40)
+  };
+}
+
+// Delay before a popped star respawns
+function respawnDelay(rng) {
+  return 0.6 + rng() * 1.4;
+}
+//LOGIC-END
+// ============================================================
+// Rendering + input (DOM side)
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  buildStarfield();
+}
+window.addEventListener('resize', resize);
+
+// Static twinkling background stars
+let bgStars = [];
+function buildStarfield() {
+  const rng = makeRng(1234567);
+  bgStars = [];
+  const n = Math.floor(W * H / 9000);
+  for (let i = 0; i < n; i++) {
+    bgStars.push({ x: rng() * W, y: rng() * H * 0.85, r: 0.6 + rng() * 1.8, p: rng() * Math.PI * 2, s: 1 + rng() * 3 });
+  }
+}
+
+// --- audio ---
+let AC = null;
+function audio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  if (AC && AC.state === 'suspended') AC.resume();
+  return AC;
+}
+function tone(freq0, freq1, dur, type, vol) {
+  const ac = audio(); if (!ac) return;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type || 'sine';
+  o.frequency.setValueAtTime(freq0, ac.currentTime);
+  o.frequency.exponentialRampToValueAtTime(Math.max(1, freq1), ac.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.12, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+  o.connect(g); g.connect(ac.destination);
+  o.start(); o.stop(ac.currentTime + dur);
+}
+const sndTwang = () => tone(220, 90, 0.18, 'triangle', 0.16);
+const sndPop = (gold) => { tone(gold ? 880 : 520, gold ? 1320 : 760, 0.12, 'sine', 0.14); };
+const sndMiss = () => tone(160, 80, 0.25, 'sawtooth', 0.05);
+
+function buzz(ms) { try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) {} }
+
+// --- game state ---
+const BEST_KEY = 'slingshot_stars_best';
+let state = 'menu';           // menu | play | over
+let score = 0, combo = 0, hits = 0, timeLeft = GAME_TIME;
+let stars = [];               // active targets
+let pendingRespawns = [];     // {at, } timestamps (seconds remaining)
+let stone = null;             // flying stone {x,y,vx,vy} or null
+let dragging = false;         // player is pulling the slingshot
+let pullX = 0, pullY = 0;     // current stone offset from anchor (clamped)
+let shotHits = 0;             // hits during current flight
+let cooldown = 0;
+let particles = [];
+let floaters = [];            // floating score texts {x,y,txt,life,color}
+let trail = [];
+let elapsed = 0;
+let gameRng = makeRng((Date.now() ^ 0x9e3779b9) >>> 0);
+
+function anchor() { return { x: W / 2, y: H - 130 }; }
+
+function best() { try { return parseInt(localStorage.getItem(BEST_KEY) || '0', 10) || 0; } catch (e) { return 0; } }
+function saveBest(v) { try { localStorage.setItem(BEST_KEY, String(v)); } catch (e) {} }
+
+function startGame() {
+  score = 0; combo = 0; hits = 0; timeLeft = GAME_TIME; elapsed = 0;
+  stone = null; dragging = false; shotHits = 0; cooldown = 0;
+  particles = []; floaters = []; trail = [];
+  pendingRespawns = [];
+  stars = [];
+  for (let i = 0; i < TARGET_STARS; i++) stars.push(newStar(gameRng, W, H, 0));
+  state = 'play';
+  document.getElementById('startScreen').style.display = 'none';
+  document.getElementById('endScreen').style.display = 'none';
+  audio();
+}
+
+function endGame() {
+  state = 'over';
+  const b = best();
+  const isBest = score > b;
+  if (isBest) saveBest(score);
+  document.getElementById('score-line').textContent = 'Score: ' + score;
+  document.getElementById('finalStats').innerHTML =
+    '⭐ Stars smashed: <b>' + hits + '</b>' + (isBest ? '<br>🏆 <b>New best!</b>' : '');
+  document.getElementById('bestEnd').textContent = 'Best: ' + Math.max(b, score);
+  document.getElementById('endScreen').style.display = 'flex';
+  sndMiss();
+}
+
+function fireStone() {
+  const v = launchVelocity(pullX, pullY);
+  const a = anchor();
+  stone = { x: a.x + pullX, y: a.y + pullY, vx: v.vx, vy: v.vy };
+  shotHits = 0; trail = [];
+  cooldown = SHOT_COOLDOWN;
+  sndTwang();
+  buzz(10);
+}
+
+function popStar(st, idx) {
+  const res = hitScore(st.type, combo);
+  combo = res.newCombo; score += res.points; hits++;
+  shotHits++;
+  const gold = st.type === 'comet';
+  sndPop(gold); buzz(gold ? 40 : 15);
+  // particles
+  for (let i = 0; i < (gold ? 22 : 14); i++) {
+    const an = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 220;
+    particles.push({ x: st.x, y: st.y, vx: Math.cos(an) * sp, vy: Math.sin(an) * sp, life: 0.5 + Math.random() * 0.4, hue: st.hue });
+  }
+  floaters.push({ x: st.x, y: st.y - 10, txt: '+' + res.points + (comboMultiplier(combo) > 1 ? '  x' + comboMultiplier(combo) : ''), life: 1.1, color: gold ? '#ffd166' : '#6cf0ff' });
+  stars.splice(idx, 1);
+  pendingRespawns.push(respawnDelay(gameRng));
+}
+
+function resolveMiss() {
+  if (shotHits === 0) {
+    const r = missReset(); combo = r.newCombo;
+    floaters.push({ x: W / 2, y: H * 0.35, txt: 'miss — combo lost', life: 1.0, color: '#ff6b6b' });
+    sndMiss();
+  }
+  stone = null;
+}
+
+// --- input ---
+function ptrPos(e) {
+  const t = (e.touches && e.touches[0]) || e;
+  return { x: t.clientX, y: t.clientY };
+}
+canvas.addEventListener('pointerdown', (e) => {
+  if (state !== 'play' || stone || cooldown > 0) return;
+  const p = ptrPos(e), a = anchor();
+  const dx = p.x - a.x, dy = p.y - a.y;
+  if (Math.sqrt(dx * dx + dy * dy) < 110) {
+    dragging = true;
+    const c = clampPull(dx, dy, MAX_PULL);
+    pullX = c.dx; pullY = c.dy;
+    e.preventDefault();
+  }
+});
+window.addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  const p = ptrPos(e), a = anchor();
+  const c = clampPull(p.x - a.x, p.y - a.y, MAX_PULL);
+  pullX = c.dx; pullY = c.dy;
+});
+window.addEventListener('pointerup', () => {
+  if (!dragging) return;
+  dragging = false;
+  const len = Math.sqrt(pullX * pullX + pullY * pullY);
+  if (len >= MIN_PULL) fireStone();
+  pullX = 0; pullY = 0;
+});
+window.addEventListener('pointercancel', () => { dragging = false; pullX = 0; pullY = 0; });
+
+// --- update ---
+let lastT = 0;
+function loop(t) {
+  requestAnimationFrame(loop);
+  const dt = Math.min(0.05, (t - lastT) / 1000 || 0.016);
+  lastT = t;
+  if (state === 'play') update(dt);
+  render(t / 1000);
+}
+
+function update(dt) {
+  elapsed += dt;
+  timeLeft -= dt;
+  if (timeLeft <= 0) { timeLeft = 0; endGame(); return; }
+  if (cooldown > 0) cooldown -= dt;
+
+  const tFrac = elapsed / GAME_TIME;
+
+  // drift stars, wrap horizontally
+  for (const st of stars) {
+    st.x += st.vx * dt;
+    if (st.x < -40) st.x = W + 40;
+    if (st.x > W + 40) st.x = -40;
+  }
+  // respawns
+  for (let i = pendingRespawns.length - 1; i >= 0; i--) {
+    pendingRespawns[i] -= dt;
+    if (pendingRespawns[i] <= 0) {
+      pendingRespawns.splice(i, 1);
+      stars.push(newStar(gameRng, W, H, tFrac));
+    }
+  }
+  // flying stone
+  if (stone) {
+    stepStone(stone, dt);
+    trail.push({ x: stone.x, y: stone.y, life: 0.35 });
+    for (let i = stars.length - 1; i >= 0; i--) {
+      const st = stars[i];
+      if (circleHit(stone.x, stone.y, STONE_R, st.x, st.y, st.r)) popStar(st, i);
+    }
+    if (offScreen(stone, W, H, 60)) resolveMiss();
+  }
+  // particles / floaters / trail decay
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 500 * dt; p.life -= dt;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i]; f.y -= 40 * dt; f.life -= dt;
+    if (f.life <= 0) floaters.splice(i, 1);
+  }
+  for (let i = trail.length - 1; i >= 0; i--) {
+    trail[i].life -= dt;
+    if (trail[i].life <= 0) trail.splice(i, 1);
+  }
+}
+
+// --- rendering ---
+function drawStarShape(x, y, r, rot) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) {
+    const rr = i % 2 === 0 ? r : r * 0.45;
+    const an = rot + i * Math.PI / 5 - Math.PI / 2;
+    const px = x + Math.cos(an) * rr, py = y + Math.sin(an) * rr;
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+function render(now) {
+  // sky
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#05071a'); g.addColorStop(0.6, '#0b1030'); g.addColorStop(1, '#1a1440');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // moon
+  ctx.fillStyle = '#f4f1de';
+  ctx.beginPath(); ctx.arc(W - 70, 80, 34, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = 'rgba(5,7,26,0.25)';
+  ctx.beginPath(); ctx.arc(W - 82, 70, 30, 0, Math.PI * 2); ctx.fill();
+  // background stars
+  for (const s of bgStars) {
+    const tw = 0.35 + 0.65 * Math.abs(Math.sin(now * s.s + s.p));
+    ctx.fillStyle = 'rgba(220,230,255,' + (tw * 0.8).toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2); ctx.fill();
+  }
+  // ground
+  ctx.fillStyle = '#0e1430';
+  ctx.fillRect(0, H - 70, W, 70);
+  ctx.fillStyle = '#141c42';
+  ctx.fillRect(0, H - 70, W, 4);
+
+  const a = anchor();
+
+  if (state === 'play' || state === 'over') {
+    // targets
+    for (const st of stars) {
+      const pulse = 1 + 0.08 * Math.sin(now * 4 + st.phase);
+      const r = st.r * pulse;
+      ctx.save();
+      ctx.shadowColor = st.type === 'comet' ? '#ffd166' : '#6cf0ff';
+      ctx.shadowBlur = 18;
+      if (st.type === 'comet') {
+        // tail
+        const tailLen = 70;
+        const tx = st.x - Math.sign(st.vx) * tailLen, ty = st.y;
+        const tg = ctx.createLinearGradient(st.x, st.y, tx, ty);
+        tg.addColorStop(0, 'rgba(255,209,102,0.7)'); tg.addColorStop(1, 'rgba(255,209,102,0)');
+        ctx.strokeStyle = tg; ctx.lineWidth = r * 0.9; ctx.lineCap = 'round';
+        ctx.beginPath(); ctx.moveTo(st.x, st.y); ctx.lineTo(tx, ty); ctx.stroke();
+      }
+      ctx.fillStyle = st.type === 'comet' ? '#ffd166' : '#6cf0ff';
+      drawStarShape(st.x, st.y, r, now * 0.6 + st.phase);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // slingshot (behind stone)
+    ctx.strokeStyle = '#8b5a2b'; ctx.lineCap = 'round';
+    ctx.lineWidth = 16;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y + 46); ctx.lineTo(a.x, a.y - 6); ctx.stroke();
+    ctx.lineWidth = 11;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(a.x - 34, a.y - 52); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(a.x + 34, a.y - 52); ctx.stroke();
+
+    // stone position (pouch)
+    const sx = a.x + (dragging ? pullX : 0), sy = a.y + (dragging ? pullY : 0);
+    if (!stone) {
+      // elastic bands
+      ctx.strokeStyle = '#c98f4e'; ctx.lineWidth = 5;
+      ctx.beginPath(); ctx.moveTo(a.x - 34, a.y - 52); ctx.lineTo(sx, sy); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(a.x + 34, a.y - 52); ctx.lineTo(sx, sy); ctx.stroke();
+    }
+
+    // aim preview
+    if (dragging) {
+      const v = launchVelocity(pullX, pullY);
+      const pts = trajectory(sx, sy, v.vx, v.vy, 22, 1 / 30);
+      ctx.fillStyle = 'rgba(255,255,255,0.65)';
+      for (let i = 2; i < pts.length; i += 2) {
+        const p = pts[i];
+        if (p.y > H - 70) break;
+        ctx.beginPath(); ctx.arc(p.x, p.y, 4 - i * 0.1, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+
+    // trail
+    for (const tr of trail) {
+      ctx.fillStyle = 'rgba(255,159,28,' + (tr.life * 2).toFixed(2) + ')';
+      ctx.beginPath(); ctx.arc(tr.x, tr.y, 8 * tr.life + 2, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // stone (idle or flying)
+    if (!stone) {
+      ctx.save();
+      ctx.shadowColor = '#ff9f1c'; ctx.shadowBlur = 22;
+      ctx.fillStyle = '#ffb84d';
+      ctx.beginPath(); ctx.arc(sx, sy, STONE_R, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    } else {
+      ctx.save();
+      ctx.shadowColor = '#ff9f1c'; ctx.shadowBlur = 22;
+      ctx.fillStyle = '#ffb84d';
+      ctx.beginPath(); ctx.arc(stone.x, stone.y, STONE_R, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+
+    // particles
+    for (const p of particles) {
+      ctx.fillStyle = 'hsla(' + p.hue + ',95%,65%,' + Math.max(0, p.life * 2).toFixed(2) + ')';
+      ctx.beginPath(); ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2); ctx.fill();
+    }
+    // floaters
+    ctx.textAlign = 'center'; ctx.font = 'bold 20px system-ui,sans-serif';
+    for (const f of floaters) {
+      ctx.fillStyle = f.color;
+      ctx.globalAlpha = Math.max(0, Math.min(1, f.life));
+      ctx.fillText(f.txt, f.x, f.y);
+      ctx.globalAlpha = 1;
+    }
+
+    // HUD
+    ctx.textAlign = 'left'; ctx.font = '800 22px system-ui,sans-serif';
+    ctx.fillStyle = '#ffd166';
+    ctx.fillText('⭐ ' + score, 16, 36);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = timeLeft <= 10 ? '#ff6b6b' : '#eaf0ff';
+    ctx.fillText('⏱ ' + Math.ceil(timeLeft), W / 2, 36);
+    if (combo >= 2) {
+      ctx.fillStyle = '#ff8cd1';
+      ctx.font = '800 18px system-ui,sans-serif';
+      ctx.fillText('🔥 x' + comboMultiplier(combo) + ' COMBO', W / 2, 62);
+    }
+    ctx.textAlign = 'right'; ctx.font = '700 15px system-ui,sans-serif';
+    ctx.fillStyle = '#8b95c9';
+    ctx.fillText('BEST ' + Math.max(best(), score), W - 16, 34);
+  }
+}
+
+document.getElementById('startBtn').addEventListener('click', startGame);
+document.getElementById('againBtn').addEventListener('click', startGame);
+document.getElementById('bestStart').textContent = 'Best: ' + best();
+
+resize();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
