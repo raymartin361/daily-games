@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Bubble Panic — Daily Game</title>
+<meta name="description" content="Bubble Panic: 60 seconds of pop-everything panic. Tap bubbles to pop them, chain combos, dodge the bombs! A free daily browser game.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;background:#0a1030;font-family:'Segoe UI',system-ui,sans-serif;touch-action:none;user-select:none;-webkit-user-select:none}
+#game{display:block;width:100vw;height:100vh;cursor:pointer}
+.overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(6,10,40,.82);z-index:10;text-align:center;padding:24px;color:#eaf0ff}
+.overlay h1{font-size:clamp(34px,9vw,64px);font-weight:900;background:linear-gradient(90deg,#6cf0ff,#b18cff,#ff8cd1);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:6px}
+.overlay p{color:#aab4e8;margin:6px 0;max-width:420px;line-height:1.5;font-size:16px}
+.bigbtn{margin-top:22px;padding:16px 46px;font-size:20px;font-weight:800;border:none;border-radius:999px;background:linear-gradient(90deg,#4cc9f0,#7b6cff);color:#fff;cursor:pointer;box-shadow:0 6px 24px rgba(76,120,255,.5)}
+.bigbtn:active{transform:scale(.96)}
+.stat{font-size:15px;color:#8b95c9;margin-top:10px}
+#score-line{font-size:22px;font-weight:800;color:#ffd166}
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div class="overlay" id="startScreen">
+  <h1>🫧 BUBBLE PANIC</h1>
+  <p>60 seconds. Bubbles rise. <b>Tap to pop them!</b><br>
+  Chain pops for combo multipliers — but let one escape and your combo bursts.<br>
+  ⚠️ Don't tap the <b style="color:#ff6b6b">bombs</b>. Gold bubbles = big points!</p>
+  <button class="bigbtn" id="startBtn">START POPPING</button>
+  <div class="stat" id="bestStart"></div>
+</div>
+
+<div class="overlay" id="endScreen" style="display:none">
+  <h1>⏰ TIME!</h1>
+  <div id="score-line">Score: 0</div>
+  <p id="finalStats"></p>
+  <button class="bigbtn" id="againBtn">PLAY AGAIN</button>
+  <div class="stat" id="bestEnd"></div>
+</div>
+
+<script>
+'use strict';
+// ============================================================
+//LOGIC-START
+// Pure game logic (no DOM/canvas) — extracted and unit-tested by smoke-test.js
+
+// Seeded RNG (mulberry32)
+function makeRng(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+var GAME_TIME = 60;            // seconds
+var GOLD_PROB = 0.06;          // chance a spawned bubble is gold
+var BOMB_PROB_BASE = 0.10;     // base chance a spawn is a bomb
+var BOMB_PROB_GROW = 0.004;    // extra bomb chance per elapsed second
+
+// difficulty 0..1 — elapsed fraction of game
+function spawnIntervalMs(difficulty) {
+  return Math.round(850 - 500 * difficulty); // 850ms -> 350ms
+}
+function bubbleSpeedPx(difficulty) {
+  return 70 + 130 * difficulty;               // base px/s, scaled by size below
+}
+
+// Pick bubble type via rng and current difficulty
+function pickType(rng, difficulty) {
+  const bombP = BOMB_PROB_BASE + BOMB_PROB_GROW * difficulty * GAME_TIME;
+  const roll = rng();
+  if (roll < bombP) return 'bomb';
+  if (roll < bombP + GOLD_PROB) return 'gold';
+  return 'normal';
+}
+
+// Create a bubble below the screen. Returns {x,y,r,vy,wobbleAmp,wobbleFreq,phase,type,hue}
+function newBubble(rng, w, h, difficulty) {
+  const r = 22 + rng() * 26;                    // 22..48 px
+  const type = pickType(rng, difficulty);
+  const speedScale = 1.35 - (r - 22) / 26 * 0.7; // small bubbles rise faster
+  return {
+    x: r + rng() * Math.max(1, w - 2 * r),
+    y: h + r + rng() * 60,
+    r: r,
+    vy: bubbleSpeedPx(difficulty) * speedScale * (0.85 + rng() * 0.3),
+    wobbleAmp: 8 + rng() * 22,
+    wobbleFreq: 1 + rng() * 2.5,
+    phase: rng() * Math.PI * 2,
+    type: type,
+    hue: Math.floor(rng() * 360)
+  };
+}
+
+// Combo multiplier: +1 per 8 chained pops, capped at x5
+function comboMultiplier(combo) {
+  return Math.min(5, 1 + Math.floor(combo / 8));
+}
+
+// Points for popping a bubble; returns {points, newCombo}
+function popScore(type, combo) {
+  if (type === 'bomb') {
+    return { points: -50, newCombo: 0 };
+  }
+  const newCombo = combo + 1;
+  const base = type === 'gold' ? 50 : 10;
+  return { points: base * comboMultiplier(newCombo), newCombo: newCombo };
+}
+
+// Points when a bubble escapes unpopped: combo resets, no points
+function missPenalty() {
+  return { points: 0, newCombo: 0 };
+}
+
+// Is point (px,py) inside bubble b (accounting wobble offset at time t)? wobbleX computed by caller.
+function hitTest(b, px, py, drawX) {
+  const dx = px - drawX, dy = py - b.y;
+  return dx * dx + dy * dy <= b.r * b.r;
+}
+//LOGIC-END
+// ============================================================
+
+// ---------- Browser shell ----------
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * DPR; canvas.height = H * DPR;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- Audio (tiny WebAudio blips) ----------
+let actx = null;
+function beep(freq, dur, type, vol) {
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.15, actx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(); o.stop(actx.currentTime + dur);
+  } catch (e) {}
+}
+function popSound(combo) { beep(420 + Math.min(combo, 24) * 28, 0.12, 'triangle', 0.18); }
+function goldSound() { beep(880, 0.2, 'sine', 0.2); setTimeout(() => beep(1320, 0.25, 'sine', 0.18), 70); }
+function bombSound() { beep(110, 0.35, 'sawtooth', 0.25); }
+
+// ---------- State ----------
+let running = false, bubbles = [], particles = [], floaters = [];
+let score = 0, combo = 0, bestCombo = 0, pops = 0, misses = 0, bombsHit = 0;
+let timeLeft = GAME_TIME, lastTs = 0, spawnAcc = 0, shake = 0;
+let best = parseInt(localStorage.getItem('bp_best') || '0', 10);
+document.getElementById('bestStart').textContent = best > 0 ? 'Best score: ' + best : '';
+
+function startGame() {
+  bubbles = []; particles = []; floaters = [];
+  score = 0; combo = 0; bestCombo = 0; pops = 0; misses = 0; bombsHit = 0;
+  timeLeft = GAME_TIME; spawnAcc = 0; shake = 0;
+  running = true; lastTs = performance.now();
+  document.getElementById('startScreen').style.display = 'none';
+  document.getElementById('endScreen').style.display = 'none';
+  if (actx && actx.state === 'suspended') actx.resume();
+}
+
+function endGame() {
+  running = false;
+  if (score > best) { best = score; localStorage.setItem('bp_best', String(best)); }
+  document.getElementById('score-line').textContent = 'Score: ' + score;
+  document.getElementById('finalStats').innerHTML =
+    'Pops: <b>' + pops + '</b> · Best combo: <b>' + bestCombo + '</b> · Bombs tapped: <b>' + bombsHit + '</b>';
+  document.getElementById('bestEnd').textContent = 'Best score: ' + best;
+  document.getElementById('endScreen').style.display = 'flex';
+}
+
+function addParticles(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 60 + Math.random() * 180;
+    particles.push({ x: x, y: y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 0.5 + Math.random() * 0.3, age: 0, color: color, r: 2 + Math.random() * 4 });
+  }
+}
+function addFloater(x, y, text, color) {
+  floaters.push({ x: x, y: y, text: text, color: color, age: 0, life: 0.9 });
+}
+
+function handleTap(px, py) {
+  if (!running) return;
+  // topmost bubble first
+  for (let i = bubbles.length - 1; i >= 0; i--) {
+    const b = bubbles[i];
+    const drawX = b.x + Math.sin(b.phase) * b.wobbleAmp;
+    if (hitTest(b, px, py, drawX)) {
+      bubbles.splice(i, 1);
+      const res = popScore(b.type, combo);
+      combo = res.newCombo;
+      bestCombo = Math.max(bestCombo, combo);
+      score = Math.max(0, score + res.points);
+      pops++;
+      if (b.type === 'bomb') {
+        bombsHit++; shake = 14; bombSound();
+        addParticles(drawX, b.y, '#ff5555', 22);
+        addFloater(drawX, b.y, '-50 💥', '#ff6b6b');
+        if (navigator.vibrate) navigator.vibrate(120);
+      } else {
+        const col = b.type === 'gold' ? '#ffd166' : 'hsl(' + b.hue + ',90%,65%)';
+        addParticles(drawX, b.y, col, 12);
+        addFloater(drawX, b.y, '+' + res.points + (comboMultiplier(combo) > 1 ? ' x' + comboMultiplier(combo) : ''), col);
+        if (b.type === 'gold') { goldSound(); } else { popSound(combo); }
+        if (navigator.vibrate && combo > 0 && combo % 8 === 0) navigator.vibrate(30);
+      }
+      return;
+    }
+  }
+}
+
+canvas.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  handleTap(e.clientX, e.clientY);
+});
+document.getElementById('startBtn').addEventListener('click', startGame);
+document.getElementById('againBtn').addEventListener('click', startGame);
+
+// ---------- Main loop ----------
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (ts - lastTs) / 1000 || 0.016);
+  lastTs = ts;
+
+  if (running) {
+    const elapsed = GAME_TIME - timeLeft;
+    const diff = Math.min(1, elapsed / GAME_TIME);
+    timeLeft -= dt;
+    if (timeLeft <= 0) { timeLeft = 0; endGame(); }
+
+    // spawn
+    spawnAcc += dt * 1000;
+    const iv = spawnIntervalMs(diff);
+    while (spawnAcc >= iv) {
+      spawnAcc -= iv;
+      bubbles.push(newBubble(Math.random, W, H, diff));
+    }
+
+    // move bubbles
+    for (let i = bubbles.length - 1; i >= 0; i--) {
+      const b = bubbles[i];
+      b.y -= b.vy * dt;
+      b.phase += b.wobbleFreq * dt;
+      if (b.y < -b.r - 10) {
+        bubbles.splice(i, 1);
+        if (b.type !== 'bomb') { combo = missPenalty().newCombo; misses++; }
+      }
+    }
+  }
+
+  // particles & floaters always animate
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i]; p.age += dt;
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt;
+    if (p.age >= p.life) particles.splice(i, 1);
+  }
+  for (let i = floaters.length - 1; i >= 0; i--) {
+    const f = floaters[i]; f.age += dt; f.y -= 60 * dt;
+    if (f.age >= f.life) floaters.splice(i, 1);
+  }
+  if (shake > 0) shake = Math.max(0, shake - dt * 40);
+
+  // ---------- draw ----------
+  ctx.save();
+  if (shake > 0) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+
+  // background
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#0a1030'); bg.addColorStop(1, '#101a4a');
+  ctx.fillStyle = bg; ctx.fillRect(-20, -20, W + 40, H + 40);
+
+  // bubbles
+  for (const b of bubbles) {
+    const drawX = b.x + Math.sin(b.phase) * b.wobbleAmp;
+    if (b.type === 'bomb') {
+      // spiky bomb
+      ctx.save(); ctx.translate(drawX, b.y);
+      ctx.fillStyle = '#1a1a22';
+      ctx.beginPath();
+      const spikes = 12;
+      for (let s = 0; s <= spikes * 2; s++) {
+        const ang = (s / (spikes * 2)) * Math.PI * 2;
+        const rr = s % 2 === 0 ? b.r : b.r * 0.78;
+        ctx.lineTo(Math.cos(ang) * rr, Math.sin(ang) * rr);
+      }
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#ff6b6b'; ctx.font = Math.round(b.r * 0.9) + 'px sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('💥', 0, 2);
+      ctx.restore();
+    } else {
+      const col = b.type === 'gold' ? '255,209,102' : '108,240,255';
+      const g = ctx.createRadialGradient(drawX - b.r * 0.3, b.y - b.r * 0.3, b.r * 0.1, drawX, b.y, b.r);
+      g.addColorStop(0, 'rgba(255,255,255,0.75)');
+      g.addColorStop(0.35, 'rgba(' + col + ',0.45)');
+      g.addColorStop(1, 'rgba(' + col + ',0.12)');
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(drawX, b.y, b.r, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = 'rgba(' + col + ',0.8)'; ctx.lineWidth = 2; ctx.stroke();
+      // shine
+      ctx.fillStyle = 'rgba(255,255,255,0.55)';
+      ctx.beginPath(); ctx.arc(drawX - b.r * 0.32, b.y - b.r * 0.36, b.r * 0.14, 0, Math.PI * 2); ctx.fill();
+      if (b.type === 'gold') {
+        ctx.fillStyle = '#7a5b00'; ctx.font = 'bold ' + Math.round(b.r * 0.7) + 'px sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText('★', drawX, b.y + 1);
+      }
+    }
+  }
+
+  // particles
+  for (const p of particles) {
+    ctx.globalAlpha = 1 - p.age / p.life;
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // floaters
+  ctx.textAlign = 'center';
+  for (const f of floaters) {
+    ctx.globalAlpha = 1 - f.age / f.life;
+    ctx.fillStyle = f.color; ctx.font = 'bold 20px sans-serif';
+    ctx.fillText(f.text, f.x, f.y);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore();
+
+  // HUD
+  if (running) {
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(0, 0, W, 64);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.font = 'bold 22px sans-serif';
+    ctx.fillText('⭐ ' + score, 14, 28);
+    ctx.fillStyle = combo >= 8 ? '#ffd166' : '#8b95c9'; ctx.font = 'bold 16px sans-serif';
+    ctx.fillText(combo >= 2 ? 'COMBO ' + combo + ' (x' + comboMultiplier(combo) + ')' : 'combo --', 14, 50);
+    const t = Math.ceil(timeLeft);
+    ctx.fillStyle = t <= 10 ? '#ff6b6b' : '#fff'; ctx.textAlign = 'right'; ctx.font = 'bold 26px sans-serif';
+    ctx.fillText('⏱ ' + t, W - 14, 34);
+  }
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
