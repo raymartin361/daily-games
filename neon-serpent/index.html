@@ -1,1 +1,288 @@
-<!-- placeholder: Neon Serpent game file will replace this via upload -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Serpent — Daily Game</title>
+<meta name="description" content="Neon Serpent: 60 seconds of speed-ramping snake action. Gobble orbs, chain combos, dodge the red ones.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;background:#05070f}
+body{font-family:'Segoe UI',system-ui,sans-serif;color:#e8f6ff;display:flex;flex-direction:column;align-items:center;user-select:none;-webkit-user-select:none}
+#hud{width:100%;max-width:460px;display:flex;justify-content:space-between;align-items:center;padding:10px 14px;font-weight:700}
+#hud .box{background:#0d1428;border:1px solid #1e2c52;border-radius:10px;padding:6px 12px;font-size:15px;min-width:78px;text-align:center}
+#hud .lbl{font-size:10px;color:#5f6fa3;letter-spacing:1px;font-weight:600}
+#score{color:#7CFC90}#time{color:#ffd76c}#time.low{color:#ff5d5d;animation:blink .5s steps(2) infinite}
+@keyframes blink{50%{opacity:.35}}
+#wrap{position:relative;width:100%;max-width:460px;flex:1;display:flex;align-items:center;justify-content:center}
+canvas{display:block;background:#070b18;border-radius:12px;box-shadow:0 0 40px rgba(0,229,255,.12),inset 0 0 60px rgba(0,60,120,.15);touch-action:none}
+#overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(4,7,16,.82);border-radius:12px;text-align:center;padding:20px;z-index:5}
+#overlay h1{font-size:clamp(28px,7vw,44px);background:linear-gradient(90deg,#00e5ff,#7CFC90,#ffd76c);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:8px}
+#overlay p{color:#aebadd;margin:6px 0;line-height:1.5;font-size:15px}
+#overlay .big{font-size:52px;font-weight:900;color:#7CFC90}
+#btn{margin-top:14px;background:linear-gradient(90deg,#00c8e5,#7CFC90);border:none;border-radius:999px;padding:14px 42px;font-size:18px;font-weight:800;color:#04222b;cursor:pointer}
+#btn:active{transform:scale(.96)}
+#hint{color:#5f6fa3;font-size:12px;padding:8px 0 12px;text-align:center}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin:0 4px;vertical-align:baseline}
+.g{background:#7CFC90;box-shadow:0 0 8px #7CFC90}.y{background:#ffd76c;box-shadow:0 0 8px #ffd76c}.r{background:#ff5d5d;box-shadow:0 0 8px #ff5d5d}
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="box"><div class="lbl">SCORE</div><div id="score">0</div></div>
+  <div class="box"><div class="lbl">TIME</div><div id="time">60</div></div>
+  <div class="box"><div class="lbl">BEST</div><div id="best">0</div></div>
+</div>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="overlay">
+    <h1>🐍 NEON SERPENT</h1>
+    <p>Swipe or use arrow keys.<br>
+    <span class="dot g"></span> green +10 &nbsp;<span class="dot y"></span> gold +50<br>
+    <span class="dot r"></span> red −25 &amp; breaks your combo<br>
+    Every 5 chained eats → combo × up to ×5.<br>Speed ramps up. Walls kill.</p>
+    <p><b>Survive 60 seconds. Eat everything.</b></p>
+    <button id="btn">▶ PLAY</button>
+  </div>
+</div>
+<div id="hint">swipe / arrows / WASD to steer</div>
+<script>
+'use strict';
+//LOGIC-START
+var COLS = 17, ROWS = 21, GAME_LEN = 60;
+function makeRng(seed){ var s = seed >>> 0 || 1; return function(){ s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function createState(rng){
+  var cx = (COLS/2)|0, cy = (ROWS/2)|0;
+  return { snake: [{x:cx,y:cy},{x:cx-1,y:cy},{x:cx-2,y:cy},{x:cx-3,y:cy}],
+    dir: {x:1,y:0}, pending: null, orbs: [], score: 0, streak: 0,
+    elapsed: 0, acc: 0, alive: true, timedOut: false, rng: rng };
+}
+function setDir(st, dx, dy){
+  var d = st.dir;
+  if (dx === -d.x && dy === -d.y) return false;   // no 180° turn
+  if (dx === d.x && dy === d.y) return false;
+  st.pending = {x:dx,y:dy}; return true;
+}
+function speedFor(elapsed){ return 7 + Math.min(1, elapsed / GAME_LEN) * 5; } // 7 → 12 moves/s
+function comboMultiplier(streak){ return Math.min(5, 1 + ((streak / 5) | 0)); }
+function pointsFor(type, streak){
+  var m = comboMultiplier(streak);
+  if (type === 'gold') return 50 * m;
+  if (type === 'norm') return 10 * m;
+  return 0;
+}
+function freeCells(st){
+  var occ = {}, i, o;
+  for (i = 0; i < st.snake.length; i++) occ[st.snake[i].x + ',' + st.snake[i].y] = 1;
+  var cells = [];
+  for (var y = 0; y < ROWS; y++) for (var x = 0; x < COLS; x++)
+    if (!occ[x + ',' + y]) cells.push({x:x,y:y});
+  return cells;
+}
+function spawnOrb(st){
+  var cells = freeCells(st);
+  if (!cells.length) return null;
+  var hasGold = false, hasPoison = false, i;
+  for (i = 0; i < st.orbs.length; i++){ if (st.orbs[i].type === 'gold') hasGold = true; if (st.orbs[i].type === 'poison') hasPoison = true; }
+  var r = st.rng(), type = 'norm';
+  if (r < 0.12 && !hasGold) type = 'gold';
+  else if (r < 0.27 && !hasPoison) type = 'poison';
+  var cell = cells[(st.rng() * cells.length) | 0];
+  var orb = {x: cell.x, y: cell.y, type: type};
+  st.orbs.push(orb);
+  return orb;
+}
+// Advance one grid step. Returns {died:false, ate:null|'norm'|'gold'|'poison'}.
+function stepLogic(st){
+  if (st.pending){ st.dir = st.pending; st.pending = null; }
+  var head = {x: st.snake[0].x + st.dir.x, y: st.snake[0].y + st.dir.y};
+  if (head.x < 0 || head.y < 0 || head.x >= COLS || head.y >= ROWS) return {died: true, ate: null};
+  for (var i = 0; i < st.snake.length - 1; i++)
+    if (st.snake[i].x === head.x && st.snake[i].y === head.y) return {died: true, ate: null};
+  var ate = null, grow = false;
+  for (i = 0; i < st.orbs.length; i++){
+    var o = st.orbs[i];
+    if (o.x === head.x && o.y === head.y){
+      ate = o.type; st.orbs.splice(i, 1);
+      if (ate === 'norm' || ate === 'gold'){ st.score += pointsFor(ate, st.streak); st.streak++; grow = true; }
+      else { st.score = Math.max(0, st.score - 25); st.streak = 0; grow = false; }
+      break;
+    }
+  }
+  st.snake.unshift(head);
+  if (!grow) st.snake.pop();
+  return {died: false, ate: ate};
+}
+//LOGIC-END
+</script>
+<script>
+'use strict';
+(function(){
+var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+var scoreEl = document.getElementById('score'), timeEl = document.getElementById('time'),
+    bestEl = document.getElementById('best'), overlay = document.getElementById('overlay'),
+    btn = document.getElementById('btn');
+var BEST_KEY = 'neon_serpent_best';
+var best = 0; try { best = parseInt(localStorage.getItem(BEST_KEY) || '0', 10) || 0; } catch(e){}
+bestEl.textContent = best;
+
+function sizeCanvas(){
+  var wrap = document.getElementById('wrap');
+  var w = Math.min(wrap.clientWidth - 16, 460), h = wrap.clientHeight - 8;
+  var cell = Math.floor(Math.min(w / COLS, h / ROWS));
+  cv.width = cell * COLS; cv.height = cell * ROWS;
+  cv.style.width = cv.width + 'px'; cv.style.height = cv.height + 'px';
+  return cell;
+}
+var cell = sizeCanvas();
+window.addEventListener('resize', function(){ cell = sizeCanvas(); draw(); });
+
+var AC = null;
+function audio(){ if (!AC){ try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){} } return AC; }
+function beep(freq, dur, type, vol, slideTo){
+  var ac = audio(); if (!ac) return;
+  var o = ac.createOscillator(), g = ac.createGain();
+  o.type = type || 'square'; o.frequency.value = freq;
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, ac.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.08, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+  o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + dur);
+}
+function sfx(name, streak){
+  try {
+    if (name === 'eat') beep(440 + Math.min(streak, 20) * 30, 0.08, 'square', 0.06);
+    else if (name === 'gold') { beep(880, 0.1, 'sine', 0.08); setTimeout(function(){ beep(1320, 0.15, 'sine', 0.08); }, 80); }
+    else if (name === 'poison') beep(160, 0.25, 'sawtooth', 0.09, 80);
+    else if (name === 'die') beep(300, 0.5, 'sawtooth', 0.1, 50);
+    else if (name === 'tick') beep(1000, 0.05, 'square', 0.04);
+    else if (name === 'win') { [523,659,784,1047].forEach(function(f, i){ setTimeout(function(){ beep(f, 0.15, 'sine', 0.08); }, i * 120); }); }
+  } catch(e){}
+}
+function buzz(p){ try { if (navigator.vibrate) navigator.vibrate(p); } catch(e){} }
+
+var st = null, running = false, lastT = 0;
+
+function reset(){
+  st = createState(makeRng((Date.now() ^ (Math.random() * 1e9)) >>> 0));
+  st.orbs = [];
+  spawnOrb(st); spawnOrb(st); spawnOrb(st);
+  running = true; lastT = performance.now();
+  overlay.style.display = 'none';
+  timeEl.classList.remove('low');
+}
+
+function endGame(timedOut){
+  running = false;
+  st.alive = false; st.timedOut = !!timedOut;
+  if (st.score > best){ best = st.score; try { localStorage.setItem(BEST_KEY, String(best)); } catch(e){} bestEl.textContent = best; }
+  var isBest = st.score >= best && st.score > 0;
+  overlay.innerHTML =
+    '<h1>' + (timedOut ? '⏱ TIME!' : '💀 CRASHED') + '</h1>' +
+    '<div class="big">' + st.score + '</div>' +
+    '<p>' + (timedOut ? 'You survived the full 60 seconds!' : 'The walls (or your own tail) got you.') +
+    (isBest ? '<br>🏆 <b>New best score!</b>' : '<br>Best: ' + best) + '</p>' +
+    '<button id="btn">↻ PLAY AGAIN</button>';
+  overlay.style.display = 'flex';
+  document.getElementById('btn').addEventListener('click', reset);
+  if (timedOut){ sfx('win'); buzz(60); } else { sfx('die'); buzz([80, 40, 80]); }
+}
+
+function loop(t){
+  if (!running) return;
+  var dt = Math.min(0.1, (t - lastT) / 1000); lastT = t;
+  st.elapsed += dt;
+  var remain = Math.max(0, GAME_LEN - st.elapsed);
+  if (remain <= 5.5) timeEl.classList.add('low');
+  if (remain !== +timeEl.textContent){ timeEl.textContent = Math.ceil(remain); if (remain <= 5 && remain > 0) sfx('tick'); }
+  if (st.elapsed >= GAME_LEN){ draw(); endGame(true); return; }
+  st.acc += dt;
+  var stepT = 1 / speedFor(st.elapsed);
+  while (st.acc >= stepT){
+    st.acc -= stepT;
+    var r = stepLogic(st);
+    if (r.died){ draw(); endGame(false); return; }
+    if (r.ate){
+      if (r.ate === 'gold'){ sfx('gold'); buzz(40); }
+      else if (r.ate === 'poison'){ sfx('poison'); buzz([50, 30, 50]); }
+      else { sfx('eat', st.streak); buzz(15); }
+      scoreEl.textContent = st.score;
+      while (st.orbs.length < 3) spawnOrb(st);
+    }
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function draw(){
+  if (!st) return;
+  var W = cv.width, H = cv.height;
+  ctx.fillStyle = '#070b18'; ctx.fillRect(0, 0, W, H);
+  // grid dots
+  ctx.fillStyle = 'rgba(0,229,255,0.05)';
+  for (var y = 0; y < ROWS; y++) for (var x = 0; x < COLS; x++)
+    if ((x + y) % 2 === 0) ctx.fillRect(x * cell, y * cell, cell, cell);
+  var t = performance.now() / 300;
+  // orbs
+  st.orbs.forEach(function(o){
+    var cx = o.x * cell + cell / 2, cy = o.y * cell + cell / 2, r = cell * 0.32 + Math.sin(t + o.x) * 1.5;
+    var col = o.type === 'gold' ? '#ffd76c' : o.type === 'poison' ? '#ff5d5d' : '#7CFC90';
+    ctx.shadowColor = col; ctx.shadowBlur = 12; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, r), 0, 7); ctx.fill();
+    ctx.shadowBlur = 0;
+    if (o.type === 'poison'){ ctx.fillStyle = '#05070f'; ctx.font = (cell * 0.5) + 'px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('✕', cx, cy + 1); }
+  });
+  // snake
+  var n = st.snake.length;
+  for (var i = n - 1; i >= 0; i--){
+    var s = st.snake[i], frac = i / Math.max(1, n - 1);
+    var hue = 160 - frac * 60; // green → cyan tail
+    ctx.shadowColor = 'hsl(' + hue + ',100%,60%)'; ctx.shadowBlur = i === 0 ? 16 : 8;
+    ctx.fillStyle = 'hsl(' + hue + ',100%,' + (i === 0 ? 65 : 55 - frac * 15) + '%)';
+    var pad = i === 0 ? cell * 0.06 : cell * 0.14;
+    roundRect(s.x * cell + pad, s.y * cell + pad, cell - pad * 2, cell - pad * 2, cell * 0.3);
+    ctx.fill(); ctx.shadowBlur = 0;
+  }
+  // head eyes
+  var h = st.snake[0], d = st.dir, ex = h.x * cell + cell / 2, ey = h.y * cell + cell / 2;
+  ctx.fillStyle = '#04121a';
+  var eoff = cell * 0.18, foff = cell * 0.12;
+  ctx.beginPath(); ctx.arc(ex + d.x * foff - d.y * eoff, ey + d.y * foff + d.x * eoff, cell * 0.09, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex + d.x * foff + d.y * eoff, ey + d.y * foff - d.x * eoff, cell * 0.09, 0, 7); ctx.fill();
+  // combo badge
+  if (st.streak >= 5){
+    ctx.fillStyle = '#ffd76c'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText('🔥 ×' + comboMultiplier(st.streak), 8, 8);
+  }
+}
+function roundRect(x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+// input
+var KEYS = { ArrowUp: [0,-1], KeyW: [0,-1], ArrowDown: [0,1], KeyS: [0,1], ArrowLeft: [-1,0], KeyA: [-1,0], ArrowRight: [1,0], KeyD: [1,0] };
+document.addEventListener('keydown', function(e){
+  var k = KEYS[e.code];
+  if (k){ e.preventDefault(); if (st && running) setDir(st, k[0], k[1]); }
+  if ((e.code === 'Enter' || e.code === 'Space') && !running) reset();
+});
+var tsx = 0, tsy = 0;
+cv.addEventListener('touchstart', function(e){ e.preventDefault(); var t = e.changedTouches[0]; tsx = t.clientX; tsy = t.clientY; }, {passive: false});
+cv.addEventListener('touchend', function(e){
+  e.preventDefault();
+  var t = e.changedTouches[0], dx = t.clientX - tsx, dy = t.clientY - tsy;
+  if (Math.abs(dx) < 12 && Math.abs(dy) < 12) return;
+  if (st && running){
+    if (Math.abs(dx) > Math.abs(dy)) setDir(st, dx > 0 ? 1 : -1, 0);
+    else setDir(st, 0, dy > 0 ? 1 : -1);
+  }
+}, {passive: false});
+btn.addEventListener('click', function(){ audio(); reset(); requestAnimationFrame(loop); });
+document.addEventListener('visibilitychange', function(){ if (document.hidden && running){ running = false; overlay.innerHTML = '<h1>⏸ PAUSED</h1><p>Tab hidden — tap to resume.</p><button id="btn">▶ RESUME</button>'; overlay.style.display = 'flex'; document.getElementById('btn').addEventListener('click', function(){ overlay.style.display = 'none'; running = true; lastT = performance.now(); requestAnimationFrame(loop); }); } });
+draw();
+})();
+</script>
+</body>
+</html>
