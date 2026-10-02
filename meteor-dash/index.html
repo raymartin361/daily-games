@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Meteor Dash — Daily Game</title>
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#080812;
+               font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+               -webkit-user-select:none; user-select:none; }
+  #game { display:block; touch-action:none; }
+  #muteBtn { position:fixed; right:14px; bottom:14px; z-index:10; width:52px; height:52px;
+             font-size:24px; border:none; border-radius:50%;
+             background:rgba(255,255,255,.10); color:#fff; cursor:pointer; }
+  #muteBtn:active { background:rgba(255,255,255,.25); }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<button id="muteBtn" aria-label="toggle sound">🔊</button>
+
+<!-- Pure game-logic functions. No browser globals here so smoke-test.js can
+     extract this block and eval it in plain node to test the real code. -->
+<script id="logic">
+'use strict';
+
+/* Difficulty ramp. elapsed = seconds since the run started (0..60).
+   Meteor fall speed ramps 180 -> 420 px/s, spawn interval 0.55s -> 0.22s,
+   star interval stays ~3s. Values clamp so over/under-run times can't break
+   the game. */
+function ramp(elapsed) {
+  const t = Math.max(0, Math.min(1, elapsed / 60));
+  return {
+    meteorSpeed: 180 + 240 * t,
+    spawnInterval: 0.55 - 0.33 * t,
+    starInterval: 3.0
+  };
+}
+
+/* Combo multiplier from the chained-star streak (stars collected without
+   taking a hit). Every 5 raises it by 1, capped at x5. */
+function comboFor(streak) {
+  return Math.min(5, 1 + Math.floor(streak / 5));
+}
+
+/* Spawn a meteor above the top edge of a w x h board. rand is injectable.
+   Returns {x, y, r, vy, vx, scored} — scored marks near-miss already counted. */
+function spawnMeteor(w, h, elapsed, rand) {
+  const r = 14 + rand() * 22;            // radius 14..36
+  const diff = ramp(elapsed);
+  const speed = diff.meteorSpeed * (0.8 + rand() * 0.5);
+  return {
+    x: r + rand() * (w - 2 * r),
+    y: -r - 4,
+    r: r,
+    vy: speed,
+    vx: (rand() - 0.5) * 60,            // slight sideways drift
+    scored: false
+  };
+}
+
+/* Spawn a collectible star just above the top edge. */
+function spawnStar(w, h, rand) {
+  const r = 10 + rand() * 6;
+  return { x: r + rand() * (w - 2 * r), y: -r - 4, r: r, vy: 120 + rand() * 80 };
+}
+
+/* Move the ship by (dx, dy) px/sec for dt seconds, clamped inside the board
+   with a margin of the ship radius. ship = {x, y, r}. Returns the ship. */
+function moveShip(ship, dx, dy, dt, w, h) {
+  ship.x = Math.max(ship.r, Math.min(w - ship.r, ship.x + dx * dt));
+  ship.y = Math.max(ship.r, Math.min(h - ship.r, ship.y + dy * dt));
+  return ship;
+}
+
+/* Circle-vs-circle collision test. */
+function circleHit(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y;
+  return dx * dx + dy * dy < (a.r + b.r) * (a.r + b.r);
+}
+
+/* Apply a meteor hit to the player state {shields, streak, combo}.
+   Returns {shields, streak, combo, dead}. A hit resets the star streak. */
+function applyHit(state) {
+  const shields = state.shields - 1;
+  return { shields: shields, streak: 0, combo: 1, dead: shields <= 0 };
+}
+
+/* Apply collecting a star. state = {score, streak, combo}.
+   Star is worth 100 x current combo; the streak rises and may raise the
+   combo for the NEXT star. Returns {score, streak, combo, points}. */
+function applyStar(state) {
+  const points = 100 * state.combo;
+  const streak = state.streak + 1;
+  return { score: state.score + points, streak: streak,
+           combo: comboFor(streak), points: points };
+}
+
+/* Near-miss bonus: meteor passed close but never touched.
+   25 x current combo. */
+function nearMissBonus(combo) {
+  return 25 * combo;
+}
+
+/* Points earned per second of survival (accumulates with fractional dt). */
+function survivalRate() { return 10; }
+
+/* Time bonus for surviving the full 60 seconds. */
+function winBonus() { return 500; }
+</script>
+
+<script>
+'use strict';
+/* Meteor Dash — 60-second survival dodger. Canvas renderer + WebAudio SFX.
+   Uses the pure logic functions from the <script id="logic"> block above. */
+(function () {
+  var canvas = document.getElementById('game');
+  var ctx = canvas.getContext('2d');
+  var W = 0, H = 0;
+
+  function resize() {
+    var DPR = Math.min(2, window.devicePixelRatio || 1);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.floor(W * DPR); canvas.height = Math.floor(H * DPR);
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* ---------- audio ---------- */
+  var audioCtx = null, muted = false;
+  function ac() {
+    if (!audioCtx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      audioCtx = new AC();
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  }
+  function beep(freq, dur, type, vol, delay) {
+    if (muted) return;
+    try {
+      var c = ac(); if (!c) return;
+      var o = c.createOscillator(), g = c.createGain();
+      o.type = type || 'sine';
+      o.frequency.value = freq;
+      var t = c.currentTime + (delay || 0);
+      g.gain.setValueAtTime(vol || 0.15, t);
+      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      o.connect(g); g.connect(c.destination);
+      o.start(t); o.stop(t + dur + 0.02);
+    } catch (e) { /* audio unavailable: stay silent */ }
+  }
+  function sfxStar(combo)   { beep(660 * Math.pow(1.1, combo), 0.12, 'sine', 0.18); beep(1320, 0.1, 'sine', 0.1, 0.05); }
+  function sfxNear()        { beep(1500, 0.08, 'square', 0.07); }
+  function sfxHit()         { beep(140, 0.3, 'sawtooth', 0.22); beep(90, 0.35, 'triangle', 0.18, 0.05); }
+  function sfxTick()        { beep(1000, 0.07, 'square', 0.08); }
+  function sfxWin()         { [523, 659, 784, 1046, 1318].forEach(function (f, i) { beep(f, 0.25, 'triangle', 0.18, i * 0.12); }); }
+  function sfxOver()        { [392, 311, 262, 196].forEach(function (f, i) { beep(f, 0.3, 'sawtooth', 0.15, i * 0.16); }); }
+  function buzz(ms) {
+    try { if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') navigator.vibrate(ms); }
+    catch (e) { /* no haptics */ }
+  }
+
+  var muteBtn = document.getElementById('muteBtn');
+  muteBtn.addEventListener('click', function (e) {
+    e.stopPropagation();
+    muted = !muted;
+    muteBtn.textContent = muted ? '🔇' : '🔊';
+  });
+
+  /* ---------- state ---------- */
+  var DURATION = 60;
+  var BEST_KEY = 'meteor_dash_best';
+  var SHIP_SPEED = 520;            // keyboard px/sec
+  var INVULN_TIME = 1.2;
+  var NEAR_DIST = 34;              // px beyond combined radii for a near-miss
+
+  var state = 'menu';              // menu | playing | paused | over
+  var meteors = [], stars = [], pops = [], floaters = [];
+  var ship = { x: 0, y: 0, r: 16 };
+  var score = 0, streak = 0, combo = 1, shields = 3, best = 0;
+  var startTime = 0, nextMeteor = 0, nextStar = 0, invulnUntil = 0, lastSecond = -1, pausedAt = 0;
+  var won = false;
+
+  try { best = parseInt(localStorage.getItem(BEST_KEY) || '0', 10) || 0; }
+  catch (e) { best = 0; }
+
+  function now() { return performance.now() / 1000 - startTime; }
+
+  function startGame() {
+    meteors = []; stars = []; pops = []; floaters = [];
+    ship = { x: W / 2, y: H * 0.72, r: 16 };
+    score = 0; streak = 0; combo = 1; shields = 3;
+    won = false;
+    startTime = performance.now() / 1000;
+    nextMeteor = 0.4; nextStar = 2.0; invulnUntil = -1; lastSecond = -1;
+    keys = {};
+    state = 'playing';
+  }
+
+  function endGame(victory) {
+    state = 'over';
+    won = victory;
+    if (victory) score += winBonus();
+    meteors = [];
+    var isBest = score > best;
+    if (isBest) {
+      best = score;
+      try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) {}
+    }
+    endGame._isBest = isBest;
+    if (victory) { sfxWin(); buzz([40, 60, 40]); } else { sfxOver(); buzz(120); }
+  }
+
+  /* ---------- input: drag-to-move (relative, ship floats above finger) ---------- */
+  var dragging = false, lastPX = 0, lastPY = 0;
+  var DRAG_GAIN = 1.6;
+
+  canvas.addEventListener('pointerdown', function (e) {
+    if (state === 'menu' || state === 'over') { startGame(); return; }
+    if (state !== 'playing') return;
+    dragging = true; lastPX = e.clientX; lastPY = e.clientY;
+    canvas.setPointerCapture && canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener('pointermove', function (e) {
+    if (!dragging || state !== 'playing') return;
+    var dx = (e.clientX - lastPX) * DRAG_GAIN;
+    var dy = (e.clientY - lastPY) * DRAG_GAIN;
+    lastPX = e.clientX; lastPY = e.clientY;
+    moveShip(ship, dx * 60, dy * 60, 1 / 60, W, H);
+  });
+  function stopDrag() { dragging = false; }
+  canvas.addEventListener('pointerup', stopDrag);
+  canvas.addEventListener('pointercancel', stopDrag);
+
+  /* ---------- input: keyboard ---------- */
+  var keys = {};
+  window.addEventListener('keydown', function (e) {
+    if (state === 'menu' || state === 'over') {
+      if (e.key === ' ' || e.key === 'Enter') { startGame(); e.preventDefault(); }
+      return;
+    }
+    keys[e.key.toLowerCase()] = true;
+    if (['arrowup','arrowdown','arrowleft','arrowright',' '].indexOf(e.key.toLowerCase()) >= 0) e.preventDefault();
+  });
+  window.addEventListener('keyup', function (e) { keys[e.key.toLowerCase()] = false; });
+
+  function keyboardMove(dt) {
+    var dx = 0, dy = 0;
+    if (keys['arrowleft'] || keys['a']) dx -= 1;
+    if (keys['arrowright'] || keys['d']) dx += 1;
+    if (keys['arrowup'] || keys['w']) dy -= 1;
+    if (keys['arrowdown'] || keys['s']) dy += 1;
+    if (dx || dy) {
+      var n = Math.hypot(dx, dy);
+      moveShip(ship, dx / n * SHIP_SPEED, dy / n * SHIP_SPEED, dt, W, H);
+    }
+  }
+
+  /* Pause when the tab is hidden; on return, shift the clock so the game
+     resumes exactly where it left off. */
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden && state === 'playing') {
+      pausedAt = performance.now() / 1000;
+      state = 'paused';
+      dragging = false;
+    } else if (!document.hidden && state === 'paused') {
+      startTime += (performance.now() / 1000 - pausedAt);
+      state = 'playing';
+    }
+  });
+
+  function invuln() { return now() < invulnUntil; }
+
+  function hitShip() {
+    var res = applyHit({ shields: shields, streak: streak, combo: combo });
+    shields = res.shields; streak = res.streak; combo = res.combo;
+    invulnUntil = now() + INVULN_TIME;
+    pops.push({ x: ship.x, y: ship.y, t: 0, kind: 'hit', r: ship.r });
+    floaters.push({ x: ship.x, y: ship.y - 30, t: 0, text: shields > 0 ? 'OUCH! ' + shields + ' left' : '💥',
+                    color: '#f87171' });
+    sfxHit(); buzz(120);
+    if (res.dead) endGame(false);
+  }
+
+  function update(dt) {
+    var t = now();
+    var diff = ramp(t);
+
+    keyboardMove(dt);
+
+    // survival points
+    score += survivalRate() * dt;
+
+    // spawn meteors
+    if (t >= nextMeteor) {
+      meteors.push(spawnMeteor(W, H, t, Math.random));
+      nextMeteor = t + diff.spawnInterval * (0.7 + Math.random() * 0.6);
+    }
+    // spawn stars
+    if (t >= nextStar) {
+      stars.push(spawnStar(W, H, Math.random));
+      nextStar = t + diff.starInterval * (0.8 + Math.random() * 0.5);
+    }
+
+    // move + collide meteors
+    var i, m;
+    for (i = meteors.length - 1; i >= 0; i--) {
+      m = meteors[i];
+      m.x += m.vx * dt; m.y += m.vy * dt;
+      if (m.x < -m.r) m.x = -m.r; else if (m.x > W + m.r) m.x = W + m.r;
+      if (m.y > H + m.r + 20) { meteors.splice(i, 1); continue; }
+      if (!invuln() && circleHit(ship, m)) {
+        meteors.splice(i, 1);
+        hitShip();
+        if (state !== 'playing') return;
+        continue;
+      }
+      // near-miss: meteor passed below the ship, close but untouched
+      if (!m.scored && !invuln() && m.y - m.r > ship.y + ship.r &&
+          Math.abs(m.x - ship.x) < m.r + ship.r + NEAR_DIST) {
+        m.scored = true;
+        var bonus = nearMissBonus(combo);
+        score += bonus;
+        floaters.push({ x: ship.x, y: ship.y - 30, t: 0, text: 'CLOSE! +' + bonus, color: '#a5f3fc' });
+        sfxNear();
+      }
+    }
+
+    // move + collect stars
+    var s;
+    for (i = stars.length - 1; i >= 0; i--) {
+      s = stars[i];
+      s.y += s.vy * dt;
+      if (s.y > H + s.r + 20) { stars.splice(i, 1); continue; }
+      if (circleHit(ship, s)) {
+        var res = applyStar({ score: score, streak: streak, combo: combo });
+        score = res.score; streak = res.streak; combo = res.combo;
+        pops.push({ x: s.x, y: s.y, t: 0, kind: 'star', r: s.r });
+        floaters.push({ x: s.x, y: s.y - 18, t: 0, text: '+' + res.points, color: '#fbbf24' });
+        sfxStar(combo); buzz(25);
+        stars.splice(i, 1);
+      }
+    }
+
+    // countdown ticks for the last 5 seconds
+    var remaining = DURATION - t;
+    var sec = Math.ceil(remaining);
+    if (sec <= 5 && sec >= 1 && sec !== lastSecond) { lastSecond = sec; sfxTick(); }
+    if (remaining <= 0) endGame(true);
+  }
+
+  function updateFx(dt) {
+    var i;
+    for (i = pops.length - 1; i >= 0; i--) {
+      pops[i].t += dt * 2.2;
+      if (pops[i].t >= 1) pops.splice(i, 1);
+    }
+    for (i = floaters.length - 1; i >= 0; i--) {
+      floaters[i].t += dt * 1.1;
+      if (floaters[i].t >= 1) floaters.splice(i, 1);
+    }
+  }
+
+  /* ---------- drawing ---------- */
+  function drawShip() {
+    var blink = invuln() && Math.floor(now() * 12) % 2 === 0;
+    ctx.save();
+    if (blink) ctx.globalAlpha = 0.25;
+    ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 16;
+    // little rocket: triangle body + flame
+    ctx.translate(ship.x, ship.y);
+    ctx.fillStyle = '#22d3ee';
+    ctx.beginPath();
+    ctx.moveTo(0, -ship.r); ctx.lineTo(ship.r * 0.75, ship.r * 0.7);
+    ctx.lineTo(-ship.r * 0.75, ship.r * 0.7);
+    ctx.closePath(); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#fbbf24';
+    ctx.beginPath();
+    ctx.moveTo(0, ship.r * 0.7);
+    ctx.lineTo(ship.r * 0.35, ship.r * 0.7 + 8 + Math.random() * 8);
+    ctx.lineTo(-ship.r * 0.35, ship.r * 0.7 + 8 + Math.random() * 8);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawMeteor(m) {
+    ctx.save();
+    ctx.translate(m.x, m.y);
+    var g = ctx.createRadialGradient(-m.r * 0.3, -m.r * 0.3, m.r * 0.2, 0, 0, m.r);
+    g.addColorStop(0, '#b45309'); g.addColorStop(0.55, '#7c2d12'); g.addColorStop(1, '#431407');
+    ctx.fillStyle = g;
+    ctx.shadowColor = '#f97316'; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(0, 0, m.r, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.beginPath(); ctx.arc(-m.r * 0.3, -m.r * 0.35, m.r * 0.32, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawStar(s) {
+    ctx.save();
+    ctx.translate(s.x, s.y);
+    ctx.rotate(s.y / 60);
+    ctx.shadowColor = '#fbbf24'; ctx.shadowBlur = 14;
+    ctx.fillStyle = '#fde68a';
+    ctx.beginPath();
+    for (var k = 0; k < 10; k++) {
+      var rr = (k % 2 === 0) ? s.r : s.r * 0.45;
+      var a = -Math.PI / 2 + k * Math.PI / 5;
+      ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawFx() {
+    var i, p, f;
+    for (i = 0; i < pops.length; i++) {
+      p = pops[i];
+      ctx.save();
+      ctx.globalAlpha = 1 - p.t;
+      ctx.strokeStyle = p.kind === 'star' ? '#fbbf24' : '#f87171';
+      ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r * (1 + p.t * 1.6), 0, Math.PI * 2); ctx.stroke();
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 20px -apple-system, "Segoe UI", Roboto, sans-serif';
+    for (i = 0; i < floaters.length; i++) {
+      f = floaters[i];
+      ctx.globalAlpha = 1 - f.t;
+      ctx.fillStyle = f.color;
+      ctx.fillText(f.text, f.x, f.y - f.t * 48);
+    }
+    ctx.restore();
+  }
+
+  function drawHUD() {
+    var t = Math.max(0, DURATION - (state === 'playing' || state === 'paused' ? now() : 0));
+    ctx.save();
+    ctx.textBaseline = 'top';
+    ctx.font = 'bold 22px -apple-system, "Segoe UI", Roboto, sans-serif';
+    ctx.fillStyle = t <= 5 ? '#f87171' : '#e2e8f0';
+    ctx.textAlign = 'left';
+    ctx.fillText('⏱ ' + Math.ceil(t), 14, 12);
+    ctx.textAlign = 'right';
+    ctx.fillText(String(Math.floor(score)), W - 14, 12);
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 20px -apple-system, "Segoe UI", Roboto, sans-serif';
+    ctx.fillStyle = '#f87171';
+    ctx.fillText('🛡'.repeat(Math.max(0, shields)), W / 2, 12);
+    if (combo > 1) {
+      ctx.fillStyle = combo >= 4 ? '#fbbf24' : '#a5f3fc';
+      ctx.font = 'bold 22px -apple-system, "Segoe UI", Roboto, sans-serif';
+      ctx.fillText('COMBO ×' + combo, W / 2, 38);
+    }
+    ctx.restore();
+  }
+
+  function centerText(lines, y0) {
+    ctx.save();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    lines.forEach(function (ln, i) {
+      ctx.font = ln.font; ctx.fillStyle = ln.color;
+      ctx.fillText(ln.text, W / 2, y0 + i * ln.gap);
+    });
+    ctx.restore();
+  }
+  function F(text, size, color, gap) {
+    return { text: text, font: 'bold ' + size + 'px -apple-system, "Segoe UI", Roboto, sans-serif', color: color, gap: gap || size * 1.5 };
+  }
+  function Fn(text, size, color, gap) {
+    return { text: text, font: size + 'px -apple-system, "Segoe UI", Roboto, sans-serif', color: color, gap: gap || size * 1.6 };
+  }
+
+  function drawMenu() {
+    centerText([
+      F('☄️ METEOR DASH', 44, '#22d3ee', 60),
+      Fn('Dodge the meteor storm for 60 seconds.', 17, '#cbd5e1'),
+      Fn('👆 drag to fly · ⬆️⬇️⬅️➡️ or WASD also work', 15, '#94a3b8'),
+      Fn('⭐ stars = +100 ×combo (5 streak → combo up)', 15, '#94a3b8'),
+      Fn('😱 near misses earn bonus points · 3 shields', 15, '#94a3b8'),
+      F('BEST  ' + best, 20, '#fbbf24', 52),
+      F('TAP TO START', 26, '#4ade80', 40)
+    ], H / 2 - 150);
+  }
+
+  function drawOver() {
+    var fs = Math.floor(score);
+    centerText([
+      F(won ? '🏆 YOU SURVIVED!' : '💥 SHIP DOWN', 40, won ? '#4ade80' : '#f87171', 58),
+      F(String(fs), 56, '#ffffff', 70),
+      Fn(endGame._isBest ? '🎉 NEW BEST!' : 'best  ' + best, 20, '#fbbf24', 48),
+      F('TAP TO FLY AGAIN', 24, '#4ade80', 40)
+    ], H / 2 - 110);
+  }
+
+  function drawPaused() {
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+    centerText([F('⏸ PAUSED', 40, '#e2e8f0', 50)], H / 2 - 20);
+  }
+
+  function drawStars() {
+    ctx.save();
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    for (var i = 0; i < 70; i++) {
+      var x = (i * 173) % W, y = (i * 311) % H;
+      var s = 1 + (i % 3) * 0.6;
+      ctx.fillRect(x, y, s, s);
+    }
+    ctx.restore();
+  }
+
+  function draw() {
+    var g = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, Math.max(W, H) * 0.75);
+    g.addColorStop(0, '#12122e'); g.addColorStop(1, '#080812');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    drawStars();
+
+    if (state === 'menu') { drawMenu(); return; }
+    if (state === 'over') { drawFx(); drawOver(); return; }
+
+    var i;
+    for (i = 0; i < stars.length; i++) drawStar(stars[i]);
+    for (i = 0; i < meteors.length; i++) drawMeteor(meteors[i]);
+    drawShip();
+    drawFx();
+    drawHUD();
+    if (state === 'paused') drawPaused();
+  }
+
+  var lastFrame = performance.now();
+  function frame() {
+    var pnow = performance.now();
+    var dt = Math.min(0.05, (pnow - lastFrame) / 1000);
+    lastFrame = pnow;
+    if (state === 'playing') update(dt);
+    updateFx(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+  frame();
+})();
+</script>
+</body>
+</html>
