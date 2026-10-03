@@ -1,1 +1,395 @@
-<!-- placeholder, replaced by upload -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Gravity Flip — Daily Game #9</title>
+<meta name="description" content="60 seconds of one-button gravity-flipping! Tap to flip between floor and ceiling, dodge the spikes, and chain orb combos.">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;background:#070b1d;font-family:'Segoe UI',system-ui,sans-serif;
+  color:#eaf0ff;touch-action:none;user-select:none;-webkit-user-select:none}
+#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:
+  radial-gradient(1200px 600px at 50% -10%,#182258 0%,#070b1d 60%)}
+canvas{display:block;border-radius:8px;box-shadow:0 0 60px rgba(80,140,255,.25)}
+#muteBtn{position:fixed;top:10px;right:12px;z-index:20;background:rgba(20,28,70,.8);color:#fff;
+  border:1px solid #3a4a9a;border-radius:10px;font-size:20px;width:44px;height:44px;cursor:pointer}
+.overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  text-align:center;background:rgba(5,8,25,.82);z-index:10;padding:24px;border-radius:8px}
+.overlay h1{font-size:clamp(30px,8vw,52px);margin-bottom:6px;
+  background:linear-gradient(90deg,#6cf0ff,#b18cff,#ff8cd1);-webkit-background-clip:text;background-clip:text;color:transparent}
+.overlay p{color:#aab4e8;margin:6px 0 16px;font-size:15px;line-height:1.5;max-width:340px}
+.overlay .big{font-size:22px;color:#fff;font-weight:800}
+.btn{background:linear-gradient(90deg,#4c7dff,#9b5cff);border:none;color:#fff;font-weight:800;font-size:20px;
+  padding:14px 44px;border-radius:999px;cursor:pointer;letter-spacing:1px;
+  box-shadow:0 6px 24px rgba(76,120,255,.5)}
+.btn:active{transform:scale(.96)}
+.hidden{display:none!important}
+kbd{background:#232c63;border:1px solid #4a5aa8;border-radius:6px;padding:2px 8px;font-size:13px}
+</style>
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="480" height="720"></canvas>
+  <div class="overlay" id="startOv">
+    <h1>GRAVITY FLIP</h1>
+    <p class="big">60 seconds. One button.<br>Two gravities.</p>
+    <p>Tap anywhere (or press <kbd>SPACE</kbd>) to flip gravity between the
+    <b>floor</b> and the <b>ceiling</b>. Dodge the red spikes, grab the golden orbs,
+    and chain pickups for combo multipliers. You have 3 shields — survive the full minute for a +500 bonus!</p>
+    <button class="btn" id="startBtn">▶ PLAY</button>
+  </div>
+  <div class="overlay hidden" id="overOv">
+    <h1 id="overTitle">TIME UP!</h1>
+    <p class="big" id="finalScore">0</p>
+    <p id="bestLine">Best: 0</p>
+    <p id="overSub"></p>
+    <button class="btn" id="againBtn">↻ FLIP AGAIN</button>
+  </div>
+</div>
+<button id="muteBtn" title="Mute (M)">🔊</button>
+<script id="logic">
+'use strict';
+/* Pure game logic — no DOM. Smoke-tested from Node via vm. */
+const GAME_LEN = 60;
+const W = 480, H = 720;
+const FLOOR_Y = H - 56;      // y of floor surface
+const CEIL_Y = 56;           // y of ceiling surface
+const PLAYER_R = 14;
+
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Difficulty ramp over the 60s run. Returns pixels/sec scroll speed and spawn intervals.
+function ramp(elapsed) {
+  const t = clamp(elapsed, 0, GAME_LEN) / GAME_LEN;
+  return {
+    speed: 230 + 270 * t,            // 230 -> 500 px/s
+    spawnInterval: 1.35 - 0.75 * t,  // 1.35s -> 0.6s between spikes
+    orbInterval: 0.85                // orbs spawn a bit faster than spikes
+  };
+}
+
+// Combo multiplier ladder from consecutive orb pickups (no hits between).
+function comboFor(streak) {
+  if (streak >= 20) return 5;
+  if (streak >= 15) return 4;
+  if (streak >= 10) return 3;
+  if (streak >= 5) return 2;
+  return 1;
+}
+
+// Flip gravity: +1 means pulled toward floor, -1 toward ceiling.
+function flipDir(d) { return -d; }
+
+// y-coordinate of the surface the player is pulled toward.
+function surfaceY(d) { return d > 0 ? FLOOR_Y : CEIL_Y; }
+
+// Spawn a spike obstacle at the right edge. Alternation guard keeps the run
+// fair: never more than 2 spikes in a row on the same surface.
+function spawnObstacle(width, lastSurf, rand) {
+  let surf;
+  const r = rand();
+  if (lastSurf.count >= 2) surf = -lastSurf.surf;              // forced switch
+  else surf = r < 0.5 ? lastSurf.surf : -lastSurf.surf;         // else random
+  const w = 26, h = 40;
+  return {
+    x: width + 40, w: w, h: h, surf: surf,
+    y: surf > 0 ? FLOOR_Y - h : CEIL_Y,   // sits ON the surface it guards
+    passed: false
+  };
+}
+
+// Spawn a golden orb; floats mid-lane near the player's current surface so it
+// rewards staying on the move rather than camping.
+function spawnOrb(width, dir, rand) {
+  const lane = dir > 0 ? FLOOR_Y - 130 - rand() * 120 : CEIL_Y + 130 + rand() * 120;
+  return { x: width + 40, y: clamp(lane, CEIL_Y + 24, FLOOR_Y - 24), r: 11, taken: false };
+}
+
+// AABB overlap (player box vs obstacle box).
+function aabbHit(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// Circle (orb) vs AABB (player) overlap.
+function circleRectHit(cx, cy, cr, rx, ry, rw, rh) {
+  const nx = clamp(cx, rx, rx + rw), ny = clamp(cy, ry, ry + rh);
+  const dx = cx - nx, dy = cy - ny;
+  return dx * dx + dy * dy <= cr * cr;
+}
+
+// Apply an orb pickup. Returns points gained.
+function applyOrb(st) {
+  st.orbs++; st.streak++;
+  const gained = 25 * comboFor(st.streak);
+  st.score += gained;
+  return gained;
+}
+
+// Apply a spike hit. Returns 'invuln' | 'hit' | 'dead'.
+function applySpike(st) {
+  if (st.invuln > 0) return 'invuln';
+  st.shields--; st.streak = 0; st.invuln = 1.2;
+  if (st.shields <= 0) { st.shields = 0; return 'dead'; }
+  return 'hit';
+}
+
+// Advance the player one physics step. p = {y, vy} (center coords).
+// Gravity pulls toward the active surface; flipDir + vy kick launches the player.
+function stepPlayer(p, dir, dt, height) {
+  const g = 2600;                                   // px/s^2
+  p.vy += dir * g * dt;
+  p.y += p.vy * dt;
+  const top = CEIL_Y + PLAYER_R, bot = FLOOR_Y - PLAYER_R;
+  if (p.y < top) { p.y = top; p.vy = Math.max(p.vy, 0); }
+  if (p.y > bot) { p.y = bot; p.vy = Math.min(p.vy, 0); }
+  return p;
+}
+
+// Points trickle in for distance travelled.
+function distanceScore(speed, dt) { return speed * dt / 25; }
+
+// Player's axis-aligned box from center coords.
+function playerBox(px, py) {
+  return { x: px - PLAYER_R, y: py - PLAYER_R, w: PLAYER_R * 2, h: PLAYER_R * 2 };
+}
+</script>
+<script>
+'use strict';
+/* UI + render loop. Wires the pure logic above to canvas. */
+(function () {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const startOv = document.getElementById('startOv');
+  const overOv = document.getElementById('overOv');
+  const muteBtn = document.getElementById('muteBtn');
+
+  // Responsive fit: logical 480x720 scaled to the window, crisp on hidpi.
+  function fit() {
+    const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+    canvas.style.width = (W * s) + 'px';
+    canvas.style.height = (H * s) + 'px';
+  }
+  window.addEventListener('resize', fit); fit();
+
+  // ---- sound (WebAudio, no assets) ----
+  let AC = null, muted = (localStorage.getItem('gf_mute') === '1');
+  function ac() { if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} } return AC; }
+  function beep(f, dur, type, vol) {
+    if (muted) return; const a = ac(); if (!a) return;
+    const o = a.createOscillator(), g = a.createGain();
+    o.type = type || 'square'; o.frequency.value = f;
+    g.gain.setValueAtTime(vol || 0.08, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(pat) { try { if (navigator.vibrate) navigator.vibrate(pat); } catch (e) {} }
+  function setMute(m) { muted = m; localStorage.setItem('gf_mute', m ? '1' : '0'); muteBtn.textContent = m ? '🔇' : '🔊'; }
+  muteBtn.addEventListener('click', function (e) { e.stopPropagation(); setMute(!muted); });
+  window.addEventListener('keydown', function (e) { if (e.code === 'KeyM') setMute(!muted); });
+  setMute(muted);
+
+  // ---- game state ----
+  const PX = 130;                       // player x (center)
+  let dir, py, vy, obs, orbs, st, elapsed, last, running, raf, invFlash;
+  let stars = [];
+  for (let i = 0; i < 90; i++) stars.push({ x: Math.random() * W, y: Math.random() * H, s: Math.random() * 1.6 + 0.4, v: 20 + Math.random() * 60 });
+
+  let spawnT, orbT, lastSurf;
+  let player = { y: FLOOR_Y - PLAYER_R, vy: 0 };
+  let floaters = [];
+
+  function reset() {
+    dir = 1;
+    player = { y: FLOOR_Y - PLAYER_R, vy: 0 };
+    py = player.y; vy = player.vy;
+    obs = []; orbs = []; floaters = [];
+
+  function start() {
+    reset(); running = true;
+    startOv.classList.add('hidden'); overOv.classList.add('hidden');
+    ac(); last = performance.now();
+    raf = requestAnimationFrame(tick);
+  }
+
+  function gameOver(win) {
+    running = false; cancelAnimationFrame(raf);
+    let bonus = 0;
+    if (win) { bonus = 500; st.score += bonus; beep(660, 0.5, 'sine', 0.12); beep(880, 0.6, 'sine', 0.12); }
+    else { beep(140, 0.6, 'sawtooth', 0.1); buzz([120, 60, 120]); }
+    const total = Math.floor(st.score);
+    const best = Math.max(total, +(localStorage.getItem('gf_best') || 0));
+    localStorage.setItem('gf_best', best);
+    document.getElementById('overTitle').textContent = win ? 'YOU SURVIVED! 🎉' : 'GAME OVER';
+    document.getElementById('finalScore').textContent = total.toLocaleString() + ' pts';
+    document.getElementById('bestLine').textContent = 'Best: ' + best.toLocaleString() + ' pts';
+    document.getElementById('overSub').innerHTML =
+      (win ? 'Full 60 seconds + 500 survival bonus!' : 'The spikes got you at ' + Math.floor(elapsed) + 's.') +
+      '<br>' + st.orbs + ' orbs grabbed · best streak x' + comboFor(st.streak);
+    overOv.classList.remove('hidden');
+  }
+
+  function doFlip() {
+    if (!running) return;
+    dir = flipDir(dir);
+    player.vy = -dir * 620;               // launch away from the new pull surface
+    beep(dir > 0 ? 520 : 340, 0.09, 'triangle', 0.07);
+    buzz(15);
+  }
+  window.addEventListener('keydown', function (e) {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') { e.preventDefault(); doFlip(); }
+  });
+  canvas.addEventListener('pointerdown', function (e) { e.preventDefault(); doFlip(); });
+  document.getElementById('startBtn').addEventListener('click', start);
+  document.getElementById('againBtn').addEventListener('click', start);
+
+  function tick(now) {
+    const dt = Math.min((now - last) / 1000, 0.05); last = now;
+    elapsed += dt;
+    const r = ramp(elapsed);
+    if (st.invuln > 0) st.invuln -= dt;
+    if (invFlash > 0) invFlash -= dt;
+
+    // spawns
+    spawnT -= dt;
+    if (spawnT <= 0) {
+      const o = spawnObstacle(W, lastSurf, Math.random);
+      if (o.surf === lastSurf.surf) lastSurf.count++; else lastSurf = { surf: o.surf, count: 1 };
+      obs.push(o); spawnT = r.spawnInterval * (0.85 + Math.random() * 0.3);
+    }
+    orbT -= dt;
+    if (orbT <= 0) { orbs.push(spawnOrb(W, dir, Math.random)); orbT = r.orbInterval; }
+
+    // player physics handled in render()
+    render(dt, r);
+    raf = requestAnimationFrame(tick);
+  }
+
+  // (player object holds physics state; render() steps it each frame)
+
+  function render(dt, r) {
+    // scroll world
+    for (const o of obs) o.x -= r.speed * dt;
+    for (const o of orbs) o.x -= r.speed * dt;
+    for (const s of stars) { s.x -= (s.v + r.speed * 0.15) * dt; if (s.x < 0) { s.x = W; s.y = Math.random() * H; } }
+    obs = obs.filter(o => o.x + o.w > -60);
+    orbs = orbs.filter(o => o.x > -40 && !o.taken);
+
+    stepPlayer(player, dir, dt, H);
+    py = player.y;
+
+    const box = playerBox(PX, py);
+    // collisions
+    if (st.invuln <= 0) {
+      for (const o of obs) {
+        if (!o.passed && o.x + o.w < PX - PLAYER_R) o.passed = true; // purely cosmetic now
+        if (aabbHit(box, o)) {
+          const res = applySpike(st);
+          invFlash = 0.35;
+          if (res === 'dead') { beep(110, 0.5, 'sawtooth', 0.12); buzz([200]); draw(); gameOver(false); return; }
+          beep(180, 0.25, 'sawtooth', 0.1); buzz(60);
+          break;
+        }
+      }
+    }
+    for (const o of orbs) {
+      if (!o.taken && circleRectHit(o.x, o.y, o.r, box.x, box.y, box.w, box.h)) {
+        o.taken = true; const g = applyOrb(st);
+        beep(700 + comboFor(st.streak) * 120, 0.12, 'sine', 0.09);
+        floaters.push({ x: o.x, y: o.y, t: 0.8, txt: '+' + g });
+      }
+    }
+    st.score += distanceScore(r.speed, dt);
+
+    if (elapsed >= GAME_LEN) { draw(); gameOver(true); return; }
+
+    draw();
+  }
+
+  function draw() {
+    // bg
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#0b1030'); g.addColorStop(0.5, '#0a0d24'); g.addColorStop(1, '#0b1030');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(255,255,255,.7)';
+    for (const s of stars) ctx.fillRect(s.x, s.y, s.s, s.s);
+
+    // surfaces
+    ctx.fillStyle = '#1c2450'; ctx.fillRect(0, 0, W, CEIL_Y); ctx.fillRect(0, FLOOR_Y, W, H - FLOOR_Y);
+    ctx.fillStyle = dir > 0 ? '#4c7dff' : '#2b3572'; ctx.fillRect(0, FLOOR_Y - 4, W, 4);
+    ctx.fillStyle = dir < 0 ? '#4c7dff' : '#2b3572'; ctx.fillRect(0, CEIL_Y, W, 4);
+
+    // orbs
+    for (const o of orbs) {
+      const pulse = 1 + 0.15 * Math.sin(performance.now() / 180 + o.x);
+      ctx.save(); ctx.shadowColor = '#ffd54c'; ctx.shadowBlur = 14;
+      ctx.fillStyle = '#ffd54c';
+      ctx.beginPath(); ctx.arc(o.x, o.y, o.r * pulse, 0, 7); ctx.fill(); ctx.restore();
+      ctx.fillStyle = '#fff8'; ctx.beginPath(); ctx.arc(o.x - 3, o.y - 3, 3.4, 0, 7); ctx.fill();
+    }
+
+    // spikes
+    for (const o of obs) {
+      ctx.save(); ctx.shadowColor = '#ff4c5e'; ctx.shadowBlur = 10;
+      ctx.fillStyle = '#ff4c5e';
+      ctx.beginPath();
+      if (o.surf > 0) { ctx.moveTo(o.x, FLOOR_Y); ctx.lineTo(o.x + o.w / 2, o.y); ctx.lineTo(o.x + o.w, FLOOR_Y); }
+      else { ctx.moveTo(o.x, CEIL_Y); ctx.lineTo(o.x + o.w / 2, o.y + o.h); ctx.lineTo(o.x + o.w, CEIL_Y); }
+      ctx.closePath(); ctx.fill(); ctx.restore();
+      ctx.fillStyle = '#ff9aa5';
+      ctx.beginPath();
+      if (o.surf > 0) { ctx.moveTo(o.x + o.w * 0.32, FLOOR_Y); ctx.lineTo(o.x + o.w / 2, o.y + 10); ctx.lineTo(o.x + o.w * 0.68, FLOOR_Y); }
+      else { ctx.moveTo(o.x + o.w * 0.32, CEIL_Y); ctx.lineTo(o.x + o.w / 2, o.y + o.h - 10); ctx.lineTo(o.x + o.w * 0.68, CEIL_Y); }
+      ctx.closePath(); ctx.fill();
+    }
+
+    // player (glowing flipper)
+    const blink = st.invuln > 0 && Math.floor(performance.now() / 90) % 2 === 0;
+    if (!blink) {
+      ctx.save();
+      ctx.shadowColor = dir > 0 ? '#4cc9ff' : '#c44cff'; ctx.shadowBlur = 22;
+      const tilt = dir > 0 ? 0.25 : -0.25;
+      ctx.translate(PX, py); ctx.rotate(tilt);
+      const pg = ctx.createLinearGradient(-PLAYER_R, -PLAYER_R, PLAYER_R, PLAYER_R);
+      pg.addColorStop(0, dir > 0 ? '#7fe7ff' : '#e7a6ff'); pg.addColorStop(1, dir > 0 ? '#2b8fff' : '#8b2bff');
+      ctx.fillStyle = pg;
+      const rr = 7, s2 = PLAYER_R;
+      ctx.beginPath();
+      ctx.moveTo(-s2 + rr, -s2); ctx.arcTo(s2, -s2, s2, s2, rr); ctx.arcTo(s2, s2, -s2, s2, rr);
+      ctx.arcTo(-s2, s2, -s2, -s2, rr); ctx.arcTo(-s2, -s2, s2, -s2, rr); ctx.closePath(); ctx.fill();
+      ctx.restore();
+      // direction arrow
+      ctx.fillStyle = '#fff'; ctx.globalAlpha = 0.85; ctx.font = 'bold 16px sans-serif';
+      ctx.textAlign = 'center'; ctx.fillText(dir > 0 ? '▼' : '▲', PX, py + 6); ctx.globalAlpha = 1;
+    }
+
+    // floaters
+    ctx.font = 'bold 15px sans-serif'; ctx.textAlign = 'center';
+    for (let i = floaters.length - 1; i >= 0; i--) {
+      const f = floaters[i]; f.t -= 1 / 60; f.y -= 34 / 60;
+      if (f.t <= 0) { floaters.splice(i, 1); continue; }
+      ctx.globalAlpha = Math.min(1, f.t * 2); ctx.fillStyle = '#ffe27a';
+      ctx.fillText(f.txt, f.x, f.y); ctx.globalAlpha = 1;
+    }
+
+    // HUD
+    ctx.fillStyle = 'rgba(6,9,28,.55)'; ctx.fillRect(0, 0, W, 52);
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 20px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText(Math.floor(st.score).toLocaleString(), 14, 33);
+    const left = Math.max(0, GAME_LEN - elapsed);
+    ctx.textAlign = 'right'; ctx.fillStyle = left < 10 ? '#ff8c9a' : '#aab4e8';
+    ctx.fillText(left.toFixed(1) + 's', W - 14, 33);
+    ctx.textAlign = 'left'; ctx.fillStyle = '#ffd54c'; ctx.font = 'bold 15px sans-serif';
+    const cm = comboFor(st.streak);
+    if (cm > 1) ctx.fillText('COMBO x' + cm, 14, 50 + 0 * 1);
+    // shields
+    ctx.font = '18px sans-serif';
+    for (let i = 0; i < 3; i++) ctx.fillText(i < st.shields ? '🛡' : '▫', 200 + i * 24, 32);
+    if (invFlash > 0) { ctx.fillStyle = 'rgba(255,60,80,' + (invFlash * 1.4) + ')'; ctx.fillRect(0, 0, W, H); }
+  }
+
+})();
+</script>
+</body>
+</html>
