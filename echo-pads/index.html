@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Echo Pads — Daily Game #11</title>
+<meta name="description" content="60 seconds of pure memory! Watch the glowing pads, repeat the sequence, chain combos — golden pads pay big. How deep can your memory go?">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;background:#070512;font-family:'Segoe UI',system-ui,sans-serif;
+  color:#eaf0ff;touch-action:none;user-select:none;-webkit-user-select:none}
+#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:
+  radial-gradient(1200px 600px at 50% -10%,#2a1458 0%,#070512 60%)}
+canvas{display:block;border-radius:8px;box-shadow:0 0 60px rgba(140,80,255,.25)}
+#muteBtn{position:fixed;top:10px;right:12px;z-index:20;background:rgba(40,20,80,.8);color:#fff;
+  border:1px solid #6a4aa8;border-radius:10px;font-size:20px;width:44px;height:44px;cursor:pointer}
+.overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  text-align:center;background:rgba(7,5,18,.88);z-index:10;padding:24px;border-radius:8px}
+.overlay h1{font-size:clamp(34px,9vw,56px);margin-bottom:6px;
+  background:linear-gradient(90deg,#ff5c7a,#ffd24d,#4dff88,#4dc3ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.overlay p{color:#c9c2ec;margin:6px 0 16px;font-size:15px;line-height:1.5;max-width:360px}
+.overlay .big{font-size:22px;color:#fff;font-weight:800}
+.btn{background:linear-gradient(90deg,#8c4dff,#4dc3ff);border:none;color:#fff;font-weight:800;font-size:20px;
+  padding:14px 44px;border-radius:999px;cursor:pointer;letter-spacing:1px;
+  box-shadow:0 6px 24px rgba(140,77,255,.5)}
+.btn:active{transform:scale(.96)}
+.hidden{display:none!important}
+kbd{background:#2b2158;border:1px solid #5a4aa8;border-radius:6px;padding:2px 8px;font-size:13px}
+</style>
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="480" height="720"></canvas>
+  <div class="overlay" id="startOv">
+    <h1>ECHO PADS</h1>
+    <p class="big">60 seconds. 4 pads.<br>How deep does your memory go?</p>
+    <p>Watch the pads light up, then repeat the sequence by tapping them
+    (or press <kbd>1</kbd>–<kbd>4</kbd>). Every round adds one more step —
+    and the playback gets faster. Chain correct taps to raise your combo up
+    to <b>×5</b>. ✨ <b>Golden pads pay 5× points!</b> A wrong tap costs a
+    heart — you have 3.</p>
+    <button class="btn" id="startBtn">▶ TEST MY MEMORY</button>
+  </div>
+  <div class="overlay hidden" id="overOv">
+    <h1 id="overTitle">TIME UP!</h1>
+    <p class="big" id="finalScore">0</p>
+    <p id="bestLine">Best: 0</p>
+    <p id="overSub"></p>
+    <button class="btn" id="againBtn">↻ REPLAY</button>
+  </div>
+  <div class="overlay hidden" id="pauseOv">
+    <h1>PAUSED</h1>
+    <p>Take a breath. The sequence will replay when you resume.</p>
+    <button class="btn" id="resumeBtn">▶ RESUME</button>
+  </div>
+</div>
+<button id="muteBtn" title="Mute (M)">🔊</button>
+<script id="logic">
+'use strict';
+/* Pure game logic — no DOM. Smoke-tested from Node via vm. */
+const GAME_LEN = 60;
+const W = 480, H = 720;
+const PAD_COUNT = 4;
+const START_LEN = 3;        // round 1 sequence length; +1 per round
+const GOLD_P = 0.14;        // chance a step is golden
+const MAX_HEARTS = 3;
+const MIN_INTERVAL = 260;   // fastest playback step, ms
+const START_INTERVAL = 620; // round-1 playback step, ms
+const INTERVAL_STEP = 20;   // ms faster per round
+
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Combo multiplier ladder from consecutive correct taps (no mistake).
+function comboFor(streak) {
+  if (streak >= 32) return 5;
+  if (streak >= 24) return 4;
+  if (streak >= 16) return 3;
+  if (streak >= 8) return 2;
+  return 1;
+}
+
+function pointsFor(gold, combo) {
+  return (gold ? 50 : 10) * combo;
+}
+
+function seqLen(round) { return START_LEN + (round - 1); }
+
+// Sequence for a round: no immediate pad repeats, gold steps never adjacent
+// and never the first step (fair start).
+function genSequence(seed, round) {
+  const rnd = mulberry32(seed);
+  const len = seqLen(round);
+  const seq = [];
+  let last = -1;
+  for (let i = 0; i < len; i++) {
+    let p = Math.floor(rnd() * PAD_COUNT);
+    if (p === last) p = (p + 1 + Math.floor(rnd() * (PAD_COUNT - 1))) % PAD_COUNT;
+    last = p;
+    const gold = seq.length > 0 && rnd() < GOLD_P && !seq[seq.length - 1].gold;
+    seq.push({ pad: p, gold: gold });
+  }
+  return seq;
+}
+
+function playInterval(round) {
+  return Math.max(MIN_INTERVAL, START_INTERVAL - INTERVAL_STEP * (round - 1));
+}
+
+function roundBonus(round, flawless) {
+  return 50 * round + (flawless ? 100 : 0);
+}
+
+// Result of tapping `pad` at position `pos` in the sequence.
+function stepResult(seq, pos, pad) {
+  if (pos < 0 || pos >= seq.length) return 'wrong';
+  if (seq[pos].pad !== pad) return 'wrong';
+  return pos === seq.length - 1 ? 'roundComplete' : 'correct';
+}
+</script>
+<script id="view">
+'use strict';
+/* Presentation + game flow. Not smoke-tested (DOM/canvas/audio). */
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+const startOv = document.getElementById('startOv');
+const overOv = document.getElementById('overOv');
+const pauseOv = document.getElementById('pauseOv');
+const overTitle = document.getElementById('overTitle');
+const finalScore = document.getElementById('finalScore');
+const bestLine = document.getElementById('bestLine');
+const overSub = document.getElementById('overSub');
+const muteBtn = document.getElementById('muteBtn');
+
+const PADS = [
+  { color: '#ff4d6d', glow: 'rgba(255,77,109,',  tone: 329.63, label: '1' },
+  { color: '#4dc3ff', glow: 'rgba(77,195,255,',  tone: 440.00, label: '2' },
+  { color: '#4dff88', glow: 'rgba(77,255,136,', tone: 554.37, label: '3' },
+  { color: '#ffd24d', glow: 'rgba(255,210,77,',  tone: 659.25, label: '4' },
+];
+const PAD = 200, GAP = 24, GX = (W - (PAD * 2 + GAP)) / 2, GY = 150;
+function padRect(i) {
+  return { x: GX + (i % 2) * (PAD + GAP), y: GY + Math.floor(i / 2) * (PAD + GAP), w: PAD, h: PAD };
+}
+
+const G = {
+  phase: 'idle', round: 0, seq: [], pos: 0,
+  score: 0, streak: 0, maxStreak: 0, hearts: MAX_HEARTS,
+  timeLeft: GAME_LEN, mistakes: 0, roundsCleared: 0,
+  timeouts: [], flashes: [-1, -1, -1, -1], flashGold: [false, false, false, false],
+  msg: '', msgUntil: 0, paused: false, lastTs: 0,
+  best: parseInt(localStorage.getItem('echo_pads_best') || '0', 10) || 0,
+  muted: localStorage.getItem('echo_pads_muted') === '1',
+};
+let actx = null;
+
+function vibrate(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+function setMsg(t, ms) { G.msg = t; G.msgUntil = performance.now() + ms; }
+
+function tone(freq, dur, type, when) {
+  if (G.muted) return;
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if (actx.state === 'suspended') actx.resume();
+    const t = actx.currentTime + (when || 0);
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.type = type || 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.35, t + 0.015);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(actx.destination);
+    o.start(t); o.stop(t + dur + 0.05);
+  } catch (e) {}
+}
+function padTone(i) { tone(PADS[i].tone, 0.28, 'sine'); if (G.seq[G.pos] && G.seq[G.pos].gold) tone(1318.5, 0.18, 'sine', 0.05); }
+function wrongBuzz() { tone(110, 0.3, 'sawtooth'); }
+function clearChime() { tone(523.25, 0.15, 'sine'); tone(659.25, 0.15, 'sine', 0.09); tone(783.99, 0.22, 'sine', 0.18); }
+
+function later(ms, fn) {
+  const id = setTimeout(() => { G.timeouts = G.timeouts.filter(x => x !== id); fn(); }, ms);
+  G.timeouts.push(id);
+}
+function clearLater() { G.timeouts.forEach(clearTimeout); G.timeouts = []; }
+
+function flashPad(i, ms, gold) {
+  G.flashes[i] = performance.now() + ms;
+  G.flashGold[i] = !!gold;
+}
+
+function startGame() {
+  try { if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+  G.phase = 'watch'; G.round = 1; G.score = 0; G.streak = 0; G.maxStreak = 0;
+  G.hearts = MAX_HEARTS; G.timeLeft = GAME_LEN; G.roundsCleared = 0; G.paused = false;
+  startOv.classList.add('hidden'); overOv.classList.add('hidden'); pauseOv.classList.add('hidden');
+  startRound();
+}
+
+function startRound() {
+  clearLater();
+  G.seq = genSequence((Date.now() + G.round * 100003) >>> 0, G.round);
+  G.pos = 0; G.mistakes = 0;
+  G.phase = 'watch';
+  setMsg('👀 ROUND ' + G.round + ' — WATCH…', 4000);
+  playWatch();
+}
+
+function playWatch() {
+  clearLater();
+  G.phase = 'watch';
+  const iv = playInterval(G.round);
+  G.seq.forEach((step, i) => {
+    later(i * iv + 350, () => {
+      if (G.phase !== 'watch' || G.paused) return;
+      flashPad(step.pad, iv * 0.62, step.gold);
+      tone(PADS[step.pad].tone, 0.25, 'sine');
+      if (step.gold) tone(1318.5, 0.15, 'sine', 0.04);
+    });
+  });
+  later(G.seq.length * iv + 550, () => {
+    if (G.phase !== 'watch' || G.paused) return;
+    G.phase = 'input'; G.pos = 0;
+    setMsg('👆 YOUR TURN — repeat it!', 3000);
+  });
+}
+
+function onPad(i) {
+  if (G.phase !== 'input' || G.paused) return;
+  const step = G.seq[G.pos];
+  const r = stepResult(G.seq, G.pos, i);
+  if (r === 'wrong') {
+    G.mistakes++; G.streak = 0; G.hearts--;
+    wrongBuzz(); vibrate([80, 50, 80]);
+    if (G.hearts <= 0) { gameOver('hearts'); return; }
+    setMsg('❌ WRONG! −1 ♥ — watch again…', 1600);
+    G.phase = 'retry';
+    later(1000, () => { if (!G.paused) playWatch(); });
+    return;
+  }
+  const pts = pointsFor(step.gold, comboFor(G.streak));
+  G.score += pts; G.streak++; G.maxStreak = Math.max(G.maxStreak, G.streak);
+  flashPad(i, 200, step.gold);
+  tone(PADS[i].tone, 0.22, 'sine');
+  if (step.gold) { tone(1568, 0.2, 'sine', 0.05); vibrate([12, 40, 12]); setMsg('✨ GOLD! +' + pts, 900); }
+  else vibrate(12);
+  G.pos++;
+  if (r === 'roundComplete') roundClear();
+}
+
+function roundClear() {
+  G.phase = 'clear';
+  const flawless = G.mistakes === 0;
+  const bonus = roundBonus(G.round, flawless);
+  G.score += bonus;
+  G.roundsCleared++;
+  clearChime(); vibrate([20, 40, 20]);
+  setMsg('🎉 ROUND ' + G.round + ' CLEAR! +' + bonus + (flawless ? ' (flawless!)' : ''), 1600);
+  later(1200, () => { if (!G.paused) { G.round++; startRound(); } });
+}
+
+function gameOver(reason) {
+  clearLater();
+  G.phase = 'over';
+  const isBest = G.score > G.best;
+  if (isBest) { G.best = G.score; localStorage.setItem('echo_pads_best', String(G.best)); }
+  overTitle.textContent = reason === 'hearts' ? 'OUT OF HEARTS!' : 'TIME UP!';
+  finalScore.textContent = G.score.toLocaleString() + (isBest ? ' 🏆 NEW BEST!' : '');
+  bestLine.textContent = 'Best: ' + G.best.toLocaleString();
+  overSub.textContent = 'Rounds cleared: ' + G.roundsCleared + ' · Longest streak: ' + G.maxStreak +
+    (reason === 'hearts' ? ' · Reached round ' + G.round : '');
+  overOv.classList.remove('hidden');
+  wrongBuzz(); vibrate([120, 60, 120]);
+}
+
+// ---- rendering ----
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function draw(now) {
+  ctx.clearRect(0, 0, W, H);
+  // HUD
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = '#8f98c8'; ctx.font = '13px sans-serif';
+  ctx.fillText('TIME', 24, 30);
+  const t = Math.max(0, Math.ceil(G.timeLeft));
+  ctx.fillStyle = t <= 10 && G.phase !== 'idle' ? '#ff5c5c' : '#fff';
+  ctx.font = '800 34px sans-serif';
+  ctx.fillText(t + 's', 24, 64);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#8f98c8'; ctx.font = '13px sans-serif';
+  ctx.fillText('SCORE', W / 2, 30);
+  ctx.fillStyle = '#fff'; ctx.font = '800 30px sans-serif';
+  ctx.fillText(G.score.toLocaleString(), W / 2, 62);
+  ctx.textAlign = 'right';
+  ctx.fillStyle = '#8f98c8'; ctx.font = '13px sans-serif';
+  ctx.fillText('BEST ' + G.best.toLocaleString(), W - 24, 30);
+  ctx.font = '22px sans-serif';
+  ctx.fillText('❤️'.repeat(G.hearts) + '🖤'.repeat(MAX_HEARTS - G.hearts), W - 24, 62);
+  // round + combo
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#b9a8ff'; ctx.font = '700 17px sans-serif';
+  ctx.fillText(G.phase === 'idle' ? 'MEMORY · 60s' : 'ROUND ' + G.round, W / 2, 108);
+  const c = comboFor(G.streak);
+  if (c > 1 && G.phase !== 'idle') {
+    ctx.fillStyle = '#ffd24d'; ctx.font = '800 17px sans-serif';
+    ctx.fillText('COMBO ×' + c, W / 2, 132);
+  }
+  // pads
+  for (let i = 0; i < 4; i++) {
+    const r = padRect(i);
+    const lit = G.flashes[i] > now;
+    const gold = lit && G.flashGold[i];
+    ctx.save();
+    if (lit) { ctx.shadowColor = gold ? '#ffd24d' : PADS[i].color; ctx.shadowBlur = 45; }
+    rr(r.x, r.y, r.w, r.h, 26);
+    ctx.fillStyle = lit ? (gold ? '#fff3c4' : PADS[i].color) : '#161a36';
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.lineWidth = lit ? 5 : 2;
+    ctx.strokeStyle = gold ? '#ffd24d' : (lit ? '#ffffff' : PADS[i].glow + '0.55)');
+    ctx.stroke();
+    ctx.restore();
+    // dim color wash when idle
+    if (!lit) {
+      rr(r.x, r.y, r.w, r.h, 26);
+      ctx.fillStyle = PADS[i].glow + '0.16)';
+      ctx.fill();
+    }
+    if (gold) {
+      ctx.fillStyle = '#8a6d00'; ctx.font = '800 22px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('✨', r.x + r.w / 2, r.y + r.h / 2 + 8);
+    }
+    ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.font = '700 15px sans-serif'; ctx.textAlign = 'left';
+    ctx.fillText(PADS[i].label, r.x + 14, r.y + 28);
+  }
+  // message line
+  if (G.msg && now < G.msgUntil) {
+    ctx.textAlign = 'center'; ctx.fillStyle = '#fff'; ctx.font = '700 19px sans-serif';
+    ctx.fillText(G.msg, W / 2, 622);
+  }
+  // progress dots during input
+  if (G.phase === 'input' || G.phase === 'retry' || G.phase === 'clear') {
+    let dots = '';
+    for (let i = 0; i < G.seq.length; i++) dots += i < G.pos ? '● ' : '○ ';
+    ctx.fillStyle = '#5a63a8'; ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(dots.trim(), W / 2, 662);
+  }
+  ctx.fillStyle = '#3d4480'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('tap pads or press 1–4 · M mute', W / 2, 700);
+}
+
+function loop(ts) {
+  const dt = Math.min(0.1, (ts - G.lastTs) / 1000 || 0);
+  G.lastTs = ts;
+  if (!G.paused && (G.phase === 'watch' || G.phase === 'input' || G.phase === 'retry' || G.phase === 'clear')) {
+    G.timeLeft -= dt;
+    if (G.timeLeft <= 0) { G.timeLeft = 0; gameOver('time'); }
+  }
+  draw(ts);
+  requestAnimationFrame(loop);
+}
+
+function canvasTap(e) {
+  const rect = cv.getBoundingClientRect();
+  const sx = W / rect.width, sy = H / rect.height;
+  const x = ((e.clientX - rect.clientX) * sx), y = ((e.clientY - rect.clientY) * sy);
+  for (let i = 0; i < 4; i++) {
+    const r = padRect(i);
+    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) { onPad(i); return; }
+  }
+}
+cv.addEventListener('pointerdown', canvasTap);
+
+document.addEventListener('keydown', (e) => {
+  if (e.key >= '1' && e.key <= '4') onPad(parseInt(e.key, 10) - 1);
+  else if (e.key === 'm' || e.key === 'M') toggleMute();
+});
+
+function toggleMute() {
+  G.muted = !G.muted;
+  localStorage.setItem('echo_pads_muted', G.muted ? '1' : '0');
+  muteBtn.textContent = G.muted ? '🔇' : '🔊';
+}
+muteBtn.textContent = G.muted ? '🔇' : '🔊';
+muteBtn.addEventListener('click', toggleMute);
+
+document.getElementById('startBtn').addEventListener('click', startGame);
+document.getElementById('againBtn').addEventListener('click', startGame);
+document.getElementById('resumeBtn').addEventListener('click', () => {
+  G.paused = false;
+  pauseOv.classList.add('hidden');
+  playWatch(); // replay current round's sequence from the top
+});
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && (G.phase === 'watch' || G.phase === 'input' || G.phase === 'retry' || G.phase === 'clear')) {
+    G.paused = true;
+    clearLater();
+    pauseOv.classList.remove('hidden');
+  }
+});
+
+// fit canvas to viewport while keeping 480x720 aspect
+function fit() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H);
+  cv.style.width = Math.floor(W * s) + 'px';
+  cv.style.height = Math.floor(H * s) + 'px';
+}
+window.addEventListener('resize', fit);
+fit();
+requestAnimationFrame((ts) => { G.lastTs = ts; requestAnimationFrame(loop); });
+</script>
+</body>
+</html>
