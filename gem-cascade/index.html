@@ -424,15 +424,18 @@ window.GC = (function(){
   }
   function drawGem(gem, x, y, size, highlight){
     var s = size * (gem.sc || 1);
-    var grad = ctx.createLinearGradient(x - s / 2, y - s / 2, x + s / 2, y + s / 2);
+    ctx.save();
+    ctx.globalAlpha = gem.al == null ? 1 : gem.al;
+    ctx.translate(x, y); ctx.rotate(Math.PI / 4);
+    // NOTE: the gradient must be created AFTER the transform, in the gem's
+    // local coords — canvas gradients are painted through the CTM in effect
+    // at fill time, so pre-transform coords sample outside the gradient.
+    var grad = ctx.createLinearGradient(-s / 2, -s / 2, s / 2, s / 2);
     if (gem.g){
       grad.addColorStop(0, '#fff6c9'); grad.addColorStop(0.5, '#ffd93d'); grad.addColorStop(1, '#c78d0a');
     } else {
       grad.addColorStop(0, '#ffffff'); grad.addColorStop(0.25, GC.COLORS[gem.c]); grad.addColorStop(1, GC.DARK[gem.c]);
     }
-    ctx.save();
-    ctx.globalAlpha = gem.al == null ? 1 : gem.al;
-    ctx.translate(x, y); ctx.rotate(Math.PI / 4);
     ctx.fillStyle = grad;
     rr(-s / 2, -s / 2, s, s, s * 0.22); ctx.fill();
     ctx.strokeStyle = gem.g ? '#fff3b0' : 'rgba(255,255,255,0.55)';
