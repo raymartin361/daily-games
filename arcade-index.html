@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ray's Daily Arcade — a new tiny game every day</title>
+<meta name="description" content="One tiny free browser game published every day. Play them all free.">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0b1026;color:#e8ecff;font-family:'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:40px 20px}
+h1{font-size:clamp(28px,6vw,48px);background:linear-gradient(90deg,#6cf0ff,#b18cff,#ff8cd1);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:8px;text-align:center}
+.sub{color:#aab4e8;margin-bottom:32px;text-align:center}
+.games{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:20px;max-width:900px;width:100%}
+.card{background:#151c3f;border:1px solid #2b3572;border-radius:14px;overflow:hidden;text-decoration:none;color:inherit;transition:transform .15s,box-shadow .15s}
+.card:hover{transform:translateY(-4px);box-shadow:0 8px 30px rgba(76,120,255,.35)}
+.card img{width:100%;height:150px;object-fit:cover;display:block}
+.card .body{padding:14px}
+.card .title{font-weight:800;font-size:18px;margin-bottom:4px}
+.card .tag{font-size:12px;color:#7780b8;letter-spacing:1px;text-transform:uppercase}
+.card .desc{font-size:14px;color:#aab4e8;margin-top:6px;line-height:1.4}
+footer{margin-top:40px;color:#555fa0;font-size:13px}
+</style>
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+</head>
+<body>
+<h1>🎮 DAILY ARCADE</h1>
+<p class="sub">One tiny free browser game, published every day. No installs, no ads — just play.</p>
+<div class="games">
+  <a class="card" href="./starlight-pinball/">
+    <img src="./starlight-pinball/cover.png" alt="Starlight Pinball cover">
+    <div class="body">
+      <div class="tag">Day 15 · Pinball · Oct 9 2026</div>
+      <div class="title">Starlight Pinball</div>
+      <div class="desc">60 seconds on a neon pinball table! Charge the plunger, work the flippers, rack up bumper combos up to ×5 — golden star bumper pays 5×. Keep the ball alive!</div>
+    </div>
+  </a>
+  <a class="card" href="./gem-cascade/">
+    <img src="./gem-cascade/cover.png" alt="Gem Cascade cover">
+    <div class="body">
+      <div class="tag">Day 14 · Match-3 · Oct 8 2026</div>
+      <div class="title">Gem Cascade</div>
+      <div class="desc">60 seconds of gem-matching bliss! Swap adjacent gems to match 3+, chain cascades up to ×5 combo — golden gems pay 5×. How high can you score?</div>
+    </div>
+  </a>
+  <a class="card" href="./nebula-blaster/">
+    <img src="./nebula-blaster/cover.png" alt="Nebula Blaster cover">
+    <div class="body">
+      <div class="tag">Day 13 · Shooter · Oct 7 2026</div>
+      <div class="title">Nebula Blaster</div>
+      <div class="desc">60 seconds of neon space combat! Drag to steer your auto-firing starfighter, blast alien waves, chain kill-streaks up to ×5 — golden ships pay 5×. 3 shields. Survive the minute!</div>
+    </div>
+  </a>
+  <a class="card" href="./neon-breaker/">
+    <img src="./neon-breaker/cover.png" alt="Neon Breaker cover">
+    <div class="body">
+      <div class="tag">Day 12 · Breakout · Oct 6 2026</div>
+      <div class="title">Neon Breaker</div>
+      <div class="desc">60 seconds of neon breakout! Slide the paddle, smash the glowing brick wall, chain combos up to ×5 — golden bricks pay 5×. 3 balls, endless waves.</div>
+    </div>
+  </a>
+  <a class="card" href="./echo-pads/">
+    <img src="./echo-pads/cover.png" alt="Echo Pads cover">
+    <div class="body">
+      <div class="tag">Day 11 · Memory · Oct 5 2026</div>
+      <div class="title">Echo Pads</div>
+      <div class="desc">60 seconds of pure memory! Watch the glowing pads, repeat the sequence, chain combos up to ×5 — golden pads pay 5×. A wrong tap costs a heart; you have 3.</div>
+    </div>
+  </a>
+  <a class="card" href="./beat-drop/">
+    <img src="./beat-drop/cover.png" alt="Beat Drop cover">
+    <div class="body">
+      <div class="tag">Day 10 · Rhythm · Oct 4 2026</div>
+      <div class="title">Beat Drop</div>
+      <div class="desc">60 seconds of pure rhythm! Tap the falling notes the instant they cross the hit line — perfect timing chains combo multipliers up to ×5, golden notes pay big, and a flawless run earns +500.</div>
+    </div>
+  </a>
+  <a class="card" href="./gravity-flip/">
+    <img src="./gravity-flip/cover.png" alt="Gravity Flip cover">
+    <div class="body">
+      <div class="tag">Day 9 · Runner · Oct 3 2026</div>
+      <div class="title">Gravity Flip</div>
+      <div class="desc">60 seconds, one button, two gravities! Tap to flip between floor and ceiling, dodge red spikes, chain golden orbs for combo multipliers — 3 shields between you and the void.</div>
+    </div>
+  </a>
+  <a class="card" href="./meteor-dash/">
+    <img src="./meteor-dash/cover.png" alt="Meteor Dash cover">
+    <div class="body">
+      <div class="tag">Day 8 · Survival · Oct 2 2026</div>
+      <div class="title">Meteor Dash</div>
+      <div class="desc">60 seconds in a meteor storm! Drag your rocket through the falling rocks, grab golden stars for combo multipliers, and earn bonus points for near misses — 3 shields stand between you and space dust.</div>
+    </div>
+  </a>
+  <a class="card" href="./zap-rush/">
+    <img src="./zap-rush/cover.png" alt="Zap Rush cover">
+    <div class="body">
+      <div class="tag">Day 7 · Reflex · Oct 1 2026</div>
+      <div class="title">Zap Rush</div>
+      <div class="desc">60 seconds of pure reflex! Tap glowing targets before their rings shrink away — faster zaps score bigger, streaks build combos, and dark void targets punish greedy fingers.</div>
+    </div>
+  </a>
+  <a class="card" href="./neon-serpent/">
+    <img src="./neon-serpent/cover.png" alt="Neon Serpent cover">
+    <div class="body">
+      <div class="tag">Day 6 · Arcade · Sep 30 2026</div>
+      <div class="title">Neon Serpent</div>
+      <div class="desc">60 seconds of speed-ramping snake! Gobble glowing orbs to grow and chain combo multipliers — but the red ones burn. How long can you survive?</div>
+    </div>
+  </a>
+  <a class="card" href="./slingshot-stars/">
+    <img src="./slingshot-stars/cover.png" alt="Slingshot Stars cover">
+    <div class="body">
+      <div class="tag">Day 5 · Physics · Sep 29 2026</div>
+      <div class="title">Slingshot Stars</div>
+      <div class="desc">60 seconds of physics flinging fun! Pull back, aim, and smash stars out of the sky — chain hits for combo multipliers, hunt golden comets.</div>
+    </div>
+  </a>
+  <a class="card" href="./bubble-panic/">
+    <img src="./bubble-panic/cover.png" alt="Bubble Panic cover">
+    <div class="body">
+      <div class="tag">Day 4 · Tapper · Sep 28 2026</div>
+      <div class="title">Bubble Panic</div>
+      <div class="desc">60 seconds of pop-everything panic! Tap rising bubbles to chain combo multipliers — dodge the bombs, hunt the gold ones.</div>
+    </div>
+  </a>
+  <a class="card" href="./word-rush/">
+    <img src="./word-rush/cover.png" alt="Word Rush cover">
+    <div class="body">
+      <div class="tag">Day 3 · Word · Sep 27 2026</div>
+      <div class="title">Word Rush</div>
+      <div class="desc">60 seconds, 7 letters, as many words as you can. Tap tiles to spell — longer words score bigger, chained words boost your combo!</div>
+    </div>
+  </a>
+  <a class="card" href="./maze-sprint/">
+    <img src="./maze-sprint/cover.png" alt="Maze Sprint cover">
+    <div class="body">
+      <div class="tag">Day 2 · Maze · Sep 26 2026</div>
+      <div class="title">Maze Sprint</div>
+      <div class="desc">Outrun the clock through endless neon mazes. Swipe or use arrow keys — each maze you clear adds bonus time!</div>
+    </div>
+  </a>
+</div>
+<footer>Built with ❤ by Ray Martin · new game every day</footer>
+</body>
+</html>
