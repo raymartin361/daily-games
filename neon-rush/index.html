@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Fruit Frenzy — Daily Game</title>
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{margin:0;padding:0;height:100%;background:#0b1020;overflow:hidden;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+#wrap{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0b1020}
+canvas{display:block;background:#0b1020;touch-action:none}
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+'use strict';
+/* ============================================================
+   Fruit Frenzy — 60-second fruit slicer (Daily Game, Day 16)
+   Swipe/drag to slice flying fruit. Bombs are bad. Golden is good.
+   Pure game logic below is DOM-free and unit-tested (window.FF).
+   ============================================================ */
+const W0 = 480, H0 = 800, GRAV = 900, GAME_LEN = 60;
+
+const FRUITS = [
+  { emoji: '🍉', r: 34, pts: 12 },
+  { emoji: '🍎', r: 30, pts: 10 },
+  { emoji: '🍊', r: 28, pts: 10 },
+  { emoji: '🍋', r: 26, pts: 8  },
+  { emoji: '🍍', r: 36, pts: 14 },
+  { emoji: '🍇', r: 26, pts: 8  },
+];
+const BOMB = { emoji: '💣', r: 30 };
+const GOLD = { emoji: '🌟', r: 30, pts: 50 };
+
+function makeRng(seed) {
+  let s = (seed >>> 0) || 1;
+  return function () {
+    s ^= s << 13; s >>>= 0;
+    s ^= s >>> 17;
+    s ^= s << 5;  s >>>= 0;
+    return s / 4294967296;
+  };
+}
+function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+function irand(rng, n) { return Math.floor(rng() * n); }
+/* combo ladder: every 5 chained slices raises x1->x5 */
+function comboFor(chain) { return Math.min(5, Math.floor(chain / 5) + 1); }
+function fruitPoints(f, combo) { return f.pts * combo; }
+function bombChance(t) { return 0.08 + 0.14 * clamp(t / GAME_LEN, 0, 1); }
+function spawnInterval(t) { return 0.95 - 0.53 * clamp(t / GAME_LEN, 0, 1); }
+function pickType(rng, t) {
+  const r = rng();
+  if (r < bombChance(t)) return 'bomb';
+  if (r < bombChance(t) + 0.06) return 'gold';
+  return 'fruit';
+}
+/* spawn from the bottom; vy chosen so the apex lands mid-screen */
+function spawnFruit(rng, t, W, H) {
+  const kind = pickType(rng, t);
+  const x = 40 + rng() * (W - 80);
+  const y = H + 40;
+  const vx = (rng() * 2 - 1) * 140;
+  const apexH = H * (0.25 + rng() * 0.5);
+  const vy = -Math.sqrt(2 * GRAV * apexH);
+  let type;
+  if (kind === 'bomb') type = { kind: 'bomb', emoji: BOMB.emoji, r: BOMB.r, pts: 0 };
+  else if (kind === 'gold') type = { kind: 'gold', emoji: GOLD.emoji, r: GOLD.r, pts: GOLD.pts };
+  else { const f = FRUITS[irand(rng, FRUITS.length)]; type = { kind: 'fruit', emoji: f.emoji, r: f.r, pts: f.pts }; }
+  return { kind: type.kind, emoji: type.emoji, r: type.r, pts: type.pts,
+           x, y, vx, vy, rot: rng() * Math.PI * 2, vrot: (rng() * 2 - 1) * 6,
+           whole: true, missed: false };
+}
+/* blade segment (px,py)->(qx,qy) hits circle (cx,cy,r)? */
+function segHitsCircle(px, py, qx, qy, cx, cy, r) {
+  const dx = qx - px, dy = qy - py;
+  const len2 = dx * dx + dy * dy;
+  let tt = 0;
+  if (len2 > 1e-9) tt = clamp(((cx - px) * dx + (cy - py) * dy) / len2, 0, 1);
+  const nx = px + tt * dx - cx, ny = py + tt * dy - cy;
+  return nx * nx + ny * ny <= r * r;
+}
+function createState(W, H, seed) {
+  return {
+    W, H, rng: makeRng(seed), mode: 'menu',
+    score: 0, best: 0, chain: 0, combo: 1,
+    time: GAME_LEN, elapsed: 0,
+    fruits: [], halves: [], parts: [], trail: [], popups: [],
+    spawnT: 0.6, shakes: 0, flash: 0,
+    slices: 0, throws: 0, bombsHit: 0, gold: 0, auto: false,
+  };
+}
+/* returns points awarded (>=0 for fruit/gold, -150 for bomb, 0 if not whole) */
+function sliceFruit(s, f) {
+  if (!f.whole) return 0;
+  f.whole = false;
+  if (f.kind === 'bomb') {
+    s.bombsHit++;
+    s.score = Math.max(0, s.score - 150);
+    s.chain = 0; s.combo = 1;
+    s.flash = 0.5; s.shakes = 0.35;
+    s.popups.push({ x: f.x, y: f.y, txt: '-150', color: '#ff5b5b', life: 0.9 });
+    burst(s, f.x, f.y, '#ff6b6b', 26, 320);
+    return -150;
+  }
+  const pts = f.pts * s.combo;
+  s.score += pts; s.slices++; s.chain++;
+  if (f.kind === 'gold') s.gold++;
+  s.combo = comboFor(s.chain);
+  s.popups.push({ x: f.x, y: f.y, txt: '+' + pts, color: f.kind === 'gold' ? '#ffd34d' : '#c2ffb8', life: 0.8 });
+  burst(s, f.x, f.y, f.kind === 'gold' ? '#ffd34d' : '#ffffff', f.kind === 'gold' ? 18 : 8, 180);
+  /* two flying halves, split perpendicular to travel */
+  const ang = Math.atan2(f.vy, f.vx);
+  for (let i = 0; i < 2; i++) {
+    const side = i === 0 ? -1 : 1;
+    const hx = Math.cos(ang + Math.PI / 2) * side, hy = Math.sin(ang + Math.PI / 2) * side;
+    s.halves.push({
+      emoji: f.emoji, r: f.r, x: f.x, y: f.y,
+      vx: f.vx * 0.4 + hx * 170, vy: f.vy * 0.4 + hy * 170 - 60,
+      rot: f.rot, vrot: side * 8, half: i, life: 0.7, gold: f.kind === 'gold',
+    });
+  }
+  return pts;
+}
+/* fruit escaped past the bottom unsliced: chain breaks (bombs escaping are good) */
+function missFruit(s, f) {
+  if (!f.whole) return;
+  f.whole = false; f.missed = true;
+  if (f.kind !== 'bomb') { s.chain = 0; s.combo = 1; }
+}
+function burst(s, x, y, color, n, speed) {
+  for (let i = 0; i < n; i++) {
+    const a = s.rng() * Math.PI * 2, v = speed * (0.3 + s.rng() * 0.7);
+    s.parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - 80,
+                   color, r: 2 + s.rng() * 3.5, life: 0.45 + s.rng() * 0.35 });
+  }
+}
+window.FF = {
+  W0, H0, GRAV, GAME_LEN, FRUITS, BOMB, GOLD,
+  makeRng, clamp, irand, comboFor, fruitPoints, bombChance,
+  spawnInterval, pickType, spawnFruit, segHitsCircle,
+  createState, sliceFruit, missFruit, burst,
+};
+</script>
+<script>
+(function () {
+'use strict';
+var FF = window.FF;
+var canvas = document.getElementById('game');
+var ctx = canvas.getContext('2d');
+var state = FF.createState(FF.W0, FF.H0, (Date.now() % 2147483647) || 7);
+state.best = parseInt(localStorage.getItem('ff_best') || '0', 10) || 0;
+state.auto = typeof location !== 'undefined' && location.search.indexOf('auto=1') >= 0;
+var muted = localStorage.getItem('ff_mute') === '1';
+var paused = false;
+var overAt = 0;
+
+/* ---------- layout ---------- */
+var DPR = 1, viewW = FF.W0, viewH = FF.H0, offX = 0, offY = 0;
+var bgGrad = null, stars = [];
+(function initStars() {
+  var r = FF.makeRng(1234);
+  for (var i = 0; i < 90; i++) stars.push({ x: r() * FF.W0, y: r() * FF.H0, r: 0.6 + r() * 1.8, tw: r() * 6.28 });
+})();
+function resize() {
+  DPR = Math.min(2.5, window.devicePixelRatio || 1);
+  var vw = window.innerWidth, vh = window.innerHeight;
+  var s = Math.min(vw / FF.W0, vh / FF.H0);
+  viewW = Math.floor(FF.W0 * s); viewH = Math.floor(FF.H0 * s);
+  offX = Math.floor((vw - viewW) / 2); offY = Math.floor((vh - viewH) / 2);
+  canvas.style.width = viewW + 'px'; canvas.style.height = viewH + 'px';
+  canvas.width = Math.floor(viewW * DPR); canvas.height = Math.floor(viewH * DPR);
+  bgGrad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  bgGrad.addColorStop(0, '#141b3a'); bgGrad.addColorStop(0.6, '#0d1330'); bgGrad.addColorStop(1, '#0b1020');
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------- audio ---------- */
+var AC = null;
+function ac() {
+  try {
+    if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+    if (AC.state === 'suspended') AC.resume();
+  } catch (e) { AC = null; }
+  return AC;
+}
+function tone(f0, f1, dur, type, vol) {
+  if (muted) return;
+  var a = ac(); if (!a) return;
+  try {
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type; o.frequency.setValueAtTime(f0, a.currentTime);
+    o.frequency.exponentialRampToValueAtTime(Math.max(1, f1), a.currentTime + dur);
+    g.gain.setValueAtTime(vol, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + dur + 0.02);
+  } catch (e) {}
+}
+function noise(dur, cutoff, vol) {
+  if (muted) return;
+  var a = ac(); if (!a) return;
+  try {
+    var n = Math.floor(a.sampleRate * dur);
+    var buf = a.createBuffer(1, n, a.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    var src = a.createBufferSource(); src.buffer = buf;
+    var f = a.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = cutoff;
+    var g = a.createGain(); g.gain.value = vol;
+    src.connect(f); f.connect(g); g.connect(a.destination);
+    src.start();
+  } catch (e) {}
+}
+function sfx(name) {
+  if (muted) return;
+  try {
+    if (navigator.vibrate) {
+      if (name === 'slice') navigator.vibrate(8);
+      else if (name === 'gold') navigator.vibrate([10, 30, 20]);
+      else if (name === 'bomb') navigator.vibrate([60, 40, 60]);
+      else if (name === 'over') navigator.vibrate(40);
+    }
+  } catch (e) {}
+  if (name === 'slice') { noise(0.1, 6000, 0.25); tone(500, 950, 0.08, 'triangle', 0.12); }
+  else if (name === 'gold') { tone(1200, 1900, 0.22, 'sine', 0.2); tone(1800, 2600, 0.18, 'sine', 0.1); }
+  else if (name === 'bomb') { noise(0.4, 300, 0.5); tone(90, 35, 0.4, 'sine', 0.4); }
+  else if (name === 'tick') { tone(880, 880, 0.06, 'square', 0.08); }
+  else if (name === 'over') { tone(523, 523, 0.14, 'triangle', 0.18); setTimeout(function(){ tone(659, 659, 0.14, 'triangle', 0.18); }, 140); setTimeout(function(){ tone(784, 784, 0.3, 'triangle', 0.2); }, 280); }
+  else if (name === 'start') { tone(400, 800, 0.15, 'triangle', 0.15); }
+}
+function toggleMute() {
+  muted = !muted;
+  try { localStorage.setItem('ff_mute', muted ? '1' : '0'); } catch (e) {}
+}
+
+/* ---------- game flow ---------- */
+function startGame() {
+  var keep = { best: state.best, auto: state.auto };
+  state = FF.createState(FF.W0, FF.H0, (Date.now() % 2147483647) || 7);
+  state.best = keep.best; state.auto = keep.auto;
+  state.mode = 'playing';
+  paused = false;
+  sfx('start');
+}
+function gameOver() {
+  state.mode = 'over';
+  overAt = performance.now();
+  if (state.score > state.best) {
+    state.best = state.score;
+    try { localStorage.setItem('ff_best', String(state.best)); } catch (e) {}
+    state.newBest = true;
+  }
+  sfx('over');
+}
+function doSlice(px, py, qx, qy) {
+  for (var i = state.fruits.length - 1; i >= 0; i--) {
+    var f = state.fruits[i];
+    if (!f.whole) continue;
+    if (FF.segHitsCircle(px, py, qx, qy, f.x, f.y, f.r + 6)) {
+      var pts = FF.sliceFruit(state, f);
+      sfx(f.kind === 'bomb' ? 'bomb' : (f.kind === 'gold' ? 'gold' : 'slice'));
+    }
+  }
+}
+
+/* ---------- update ---------- */
+function update(dt) {
+  if (state.mode !== 'playing' || paused) return;
+  state.elapsed += dt;
+  var t = state.elapsed;
+  var remain = Math.max(0, FF.GAME_LEN - t);
+  var prevRemain = Math.ceil(remain);
+  state.time = remain;
+  if (remain <= 10.5 && Math.ceil(remain) !== state._lastTick && remain > 0) {
+    state._lastTick = Math.ceil(remain); sfx('tick');
+  }
+  if (remain <= 0) { gameOver(); return; }
+  /* spawning */
+  state.spawnT -= dt;
+  if (state.spawnT <= 0) {
+    state.spawnT = FF.spawnInterval(t) * (0.7 + state.rng() * 0.6);
+    state.fruits.push(FF.spawnFruit(state.rng, t, FF.W0, FF.H0));
+    state.throws++;
+    if (t > 30 && state.rng() < 0.35) { state.fruits.push(FF.spawnFruit(state.rng, t, FF.W0, FF.H0)); state.throws++; }
+  }
+  /* fruit physics */
+  for (var i = state.fruits.length - 1; i >= 0; i--) {
+    var f = state.fruits[i];
+    f.vy += FF.GRAV * dt;
+    f.x += f.vx * dt; f.y += f.vy * dt; f.rot += f.vrot * dt;
+    if (f.y > FF.H0 + 60) { FF.missFruit(state, f); state.fruits.splice(i, 1); }
+  }
+  /* halves */
+  for (var h = state.halves.length - 1; h >= 0; h--) {
+    var hh = state.halves[h];
+    hh.vy += FF.GRAV * dt; hh.x += hh.vx * dt; hh.y += hh.vy * dt; hh.rot += hh.vrot * dt; hh.life -= dt;
+    if (hh.life <= 0 || hh.y > FF.H0 + 60) state.halves.splice(h, 1);
+  }
+  /* particles */
+  for (var p = state.parts.length - 1; p >= 0; p--) {
+    var pt = state.parts[p];
+    pt.vy += FF.GRAV * 0.6 * dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= dt;
+    if (pt.life <= 0) state.parts.splice(p, 1);
+  }
+  /* trail + popups decay */
+  for (var k = state.trail.length - 1; k >= 0; k--) {
+    state.trail[k].age += dt;
+    if (state.trail[k].age > 0.14) state.trail.splice(k, 1);
+  }
+  for (var q = state.popups.length - 1; q >= 0; q--) {
+    state.popups[q].life -= dt; state.popups[q].y -= 55 * dt;
+    if (state.popups[q].life <= 0) state.popups.splice(q, 1);
+  }
+  if (state.shakes > 0) state.shakes -= dt;
+  if (state.flash > 0) state.flash -= dt;
+  /* autoplay demo: slash through any visible fruit */
+  if (state.auto) {
+    for (var a = 0; a < state.fruits.length; a++) {
+      var af = state.fruits[a];
+      if (af.whole && af.y < FF.H0 - 30 && af.y > 60) {
+        doSlice(af.x - 70, af.y + 50, af.x + 70, af.y - 50);
+        state.trail.push({ x: af.x - 70, y: af.y + 50, age: 0 });
+        state.trail.push({ x: af.x + 70, y: af.y - 50, age: 0 });
+      }
+    }
+  }
+}
+
+/* ---------- render ---------- */
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+function drawFruitEmoji(emoji, r, x, y, rot, gold, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+  ctx.translate(x, y); ctx.rotate(rot);
+  if (gold) { ctx.shadowColor = '#ffd34d'; ctx.shadowBlur = 26; }
+  ctx.font = (r * 2) + 'px serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(emoji, 0, 2);
+  ctx.restore();
+}
+function render() {
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = bgGrad || '#0b1020';
+  ctx.fillRect(0, 0, viewW, viewH);
+  var sx = viewW / FF.W0, sy = viewH / FF.H0;
+  /* NOTE: no offX/offY here — the canvas element is already centered on the
+     page by CSS; its internal bitmap starts at its own top-left. */
+  ctx.setTransform(DPR * sx, 0, 0, DPR * sy, 0, 0);
+  /* clip to game area (+ shake isolated in its own save/restore so the
+     transform can never drift across frames) */
+  ctx.save();
+  if (state.shakes > 0) {
+    var m = 9 * state.shakes / 0.35;
+    ctx.translate((Math.random() - 0.5) * m, (Math.random() - 0.5) * m);
+  }
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, FF.W0, FF.H0); ctx.clip();
+  /* stars */
+  var tt = performance.now() / 1000;
+  for (var i = 0; i < stars.length; i++) {
+    var st = stars[i];
+    ctx.globalAlpha = 0.35 + 0.3 * Math.sin(tt * 2 + st.tw);
+    ctx.fillStyle = '#8fa2ff';
+    ctx.beginPath(); ctx.arc(st.x, st.y, st.r, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  /* fruits */
+  for (var f = 0; f < state.fruits.length; f++) {
+    var fr = state.fruits[f];
+    if (fr.whole) drawFruitEmoji(fr.emoji, fr.r, fr.x, fr.y, fr.rot, fr.kind === 'gold');
+  }
+  /* halves (clipped emoji halves) */
+  for (var h = 0; h < state.halves.length; h++) {
+    var hh = state.halves[h];
+    var alpha = Math.min(1, hh.life / 0.4);
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(hh.x, hh.y); ctx.rotate(hh.rot);
+    if (hh.gold) { ctx.shadowColor = '#ffd34d'; ctx.shadowBlur = 20; }
+    ctx.beginPath();
+    if (hh.half === 0) ctx.rect(-hh.r, -hh.r, hh.r, hh.r * 2);
+    else ctx.rect(0, -hh.r, hh.r, hh.r * 2);
+    ctx.clip();
+    ctx.font = (hh.r * 2) + 'px serif';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(hh.emoji, 0, 2);
+    ctx.restore();
+  }
+  /* particles */
+  for (var p = 0; p < state.parts.length; p++) {
+    var pt = state.parts[p];
+    ctx.globalAlpha = Math.min(1, pt.life / 0.4);
+    ctx.fillStyle = pt.color;
+    ctx.beginPath(); ctx.arc(pt.x, pt.y, pt.r, 0, 6.283); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  /* blade trail */
+  if (state.trail.length > 1) {
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.shadowColor = '#7df9ff'; ctx.shadowBlur = 12;
+    for (var k = 1; k < state.trail.length; k++) {
+      var a = state.trail[k - 1], b = state.trail[k];
+      var fade = 1 - Math.max(a.age, b.age) / 0.14;
+      ctx.strokeStyle = 'rgba(180,240,255,' + (0.9 * fade).toFixed(3) + ')';
+      ctx.lineWidth = 10 * fade + 2;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+  }
+  /* popups */
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (var q = 0; q < state.popups.length; q++) {
+    var pp = state.popups[q];
+    ctx.globalAlpha = Math.min(1, pp.life / 0.4);
+    ctx.font = 'bold 26px system-ui, sans-serif';
+    ctx.fillStyle = pp.color;
+    ctx.fillText(pp.txt, pp.x, pp.y);
+  }
+  ctx.globalAlpha = 1;
+  ctx.restore(); /* clip */
+  ctx.restore(); /* shake */
+  /* bomb flash */
+  if (state.flash > 0) {
+    ctx.fillStyle = 'rgba(255,40,40,' + (0.35 * state.flash / 0.5).toFixed(3) + ')';
+    ctx.fillRect(0, 0, FF.W0, FF.H0);
+  }
+  drawHUD();
+  if (state.mode === 'menu') drawMenu();
+  else if (state.mode === 'over') drawOver();
+  else if (paused) drawPaused();
+}
+function drawHUD() {
+  ctx.textBaseline = 'middle';
+  /* score */
+  ctx.textAlign = 'left';
+  ctx.font = 'bold 24px system-ui, sans-serif';
+  ctx.fillStyle = '#fff';
+  ctx.fillText('SCORE', 18, 24);
+  ctx.font = 'bold 34px system-ui, sans-serif';
+  ctx.fillStyle = '#7df9ff';
+  ctx.fillText(String(state.score), 18, 56);
+  /* timer */
+  ctx.textAlign = 'center';
+  var remain = state.mode === 'playing' ? state.time : FF.GAME_LEN;
+  ctx.font = 'bold 40px system-ui, sans-serif';
+  ctx.fillStyle = remain <= 10 ? '#ff6b6b' : '#fff';
+  ctx.fillText(Math.ceil(remain) + 's', FF.W0 / 2, 40);
+  var bw = 180;
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  rr(FF.W0 / 2 - bw / 2, 62, bw, 8, 4); ctx.fill();
+  ctx.fillStyle = remain <= 10 ? '#ff6b6b' : '#7df9ff';
+  rr(FF.W0 / 2 - bw / 2, 62, bw * (remain / FF.GAME_LEN), 8, 4); ctx.fill();
+  /* combo badge */
+  if (state.combo > 1 && state.mode === 'playing') {
+    var pulse = 1 + 0.08 * Math.sin(performance.now() / 130);
+    ctx.save();
+    ctx.translate(FF.W0 - 120, 48); ctx.scale(pulse, pulse);
+    ctx.fillStyle = state.combo >= 5 ? '#ffd34d' : '#b47dff';
+    rr(-52, -26, 104, 52, 14); ctx.fill();
+    ctx.fillStyle = '#10142a'; ctx.font = 'bold 26px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('x' + state.combo, 0, 2);
+    ctx.restore();
+    ctx.textAlign = 'center'; ctx.font = '16px system-ui, sans-serif';
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText('chain ' + state.chain, FF.W0 - 120, 84);
+  }
+  /* mute button */
+  ctx.beginPath(); ctx.arc(FF.W0 - 36, 120, 22, 0, 6.283);
+  ctx.fillStyle = 'rgba(255,255,255,0.12)'; ctx.fill();
+  ctx.font = '20px serif'; ctx.textAlign = 'center';
+  ctx.fillText(muted ? '🔇' : '🔊', FF.W0 - 36, 121);
+}
+function centerText(txt, y, size, color, bold) {
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = (bold ? 'bold ' : '') + size + 'px system-ui, sans-serif';
+  ctx.fillStyle = color;
+  ctx.fillText(txt, FF.W0 / 2, y);
+}
+function drawMenu() {
+  ctx.fillStyle = 'rgba(5,8,22,0.72)';
+  ctx.fillRect(0, 0, FF.W0, FF.H0);
+  centerText('🍉 FRUIT FRENZY 🍍', 200, 44, '#ffd34d', true);
+  centerText('Swipe to slice flying fruit!', 300, 24, '#fff');
+  centerText('Dodge the bombs — slice one and it is -150', 340, 20, '#ff9b9b');
+  centerText('Chain 5 slices in a row to raise your combo', 375, 20, '#c2ffb8');
+  centerText('up to x5. Golden fruit pays 50 x combo!', 405, 20, '#ffd34d');
+  if (state.best > 0) centerText('BEST  ' + state.best, 470, 24, '#7df9ff', true);
+  centerText(state.auto ? 'DEMO' : 'TAP TO START', 560, 30, '#7df9ff', true);
+  ctx.font = '20px serif';
+  var demo = ['🍉', '🍎', '🍊', '🍋', '🍍'];
+  for (var i = 0; i < demo.length; i++) {
+    var wob = Math.sin(performance.now() / 500 + i) * 8;
+    ctx.fillText(demo[i], 90 + i * 75, 640 + wob);
+  }
+}
+function drawOver() {
+  ctx.fillStyle = 'rgba(5,8,22,0.78)';
+  ctx.fillRect(0, 0, FF.W0, FF.H0);
+  centerText("TIME'S UP!", 220, 44, '#ffd34d', true);
+  centerText(String(state.score), 300, 72, '#7df9ff', true);
+  if (state.newBest) centerText('NEW BEST!', 360, 26, '#ffd34d', true);
+  else if (state.best > 0) centerText('best ' + state.best, 360, 22, 'rgba(255,255,255,0.7)');
+  var acc = state.throws ? Math.round(100 * state.slices / state.throws) : 0;
+  centerText('sliced ' + state.slices + ' of ' + state.throws + '  ·  ' + acc + '%', 420, 20, '#fff');
+  centerText('golden ' + state.gold + '  ·  bombs hit ' + state.bombsHit, 455, 20, '#fff');
+  if (!state.auto && performance.now() - overAt > 800) {
+    var blink = Math.sin(performance.now() / 300) > 0;
+    if (blink) centerText('TAP TO PLAY AGAIN', 560, 28, '#7df9ff', true);
+  }
+}
+function drawPaused() {
+  ctx.fillStyle = 'rgba(5,8,22,0.7)';
+  ctx.fillRect(0, 0, FF.W0, FF.H0);
+  centerText('PAUSED', 360, 44, '#fff', true);
+  centerText('tap to resume', 420, 24, '#7df9ff');
+}
+
+/* ---------- input ---------- */
+function toGame(e) {
+  var r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * FF.W0, y: (e.clientY - r.top) / r.height * FF.H0 };
+}
+var lastPt = null;
+function onMove(e) {
+  var p = toGame(e);
+  if (lastPt && (state.mode === 'playing' || state.auto)) {
+    doSlice(lastPt.x, lastPt.y, p.x, p.y);
+    state.trail.push({ x: lastPt.x, y: lastPt.y, age: 0 });
+    state.trail.push({ x: p.x, y: p.y, age: 0 });
+  }
+  lastPt = p;
+  if (e.cancelable) e.preventDefault();
+}
+function onDown(e) {
+  ac(); /* unlock audio on gesture */
+  var p = toGame(e);
+  lastPt = p;
+  state.trail.push({ x: p.x, y: p.y, age: 0 });
+  /* mute button */
+  var dx = p.x - (FF.W0 - 36), dy = p.y - 120;
+  if (dx * dx + dy * dy < 26 * 26) { toggleMute(); return; }
+  if (paused) { paused = false; return; }
+  if (state.mode === 'menu') { startGame(); return; }
+  if (state.mode === 'over' && !state.auto && performance.now() - overAt > 800) { startGame(); return; }
+  if (e.cancelable) e.preventDefault();
+}
+canvas.addEventListener('pointermove', onMove);
+canvas.addEventListener('pointerdown', onDown);
+canvas.addEventListener('pointerup', function () { lastPt = null; });
+canvas.addEventListener('pointercancel', function () { lastPt = null; });
+canvas.addEventListener('pointerleave', function () { lastPt = null; });
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'm' || e.key === 'M') toggleMute();
+  else if ((e.key === ' ' || e.key === 'Enter')) {
+    if (state.mode === 'menu' || (state.mode === 'over' && !state.auto)) startGame();
+    else if (paused) paused = false;
+  }
+});
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden && state.mode === 'playing') paused = true;
+});
+
+/* ---------- main loop ---------- */
+var lastT = performance.now();
+function frame(now) {
+  var dt = Math.min(0.05, (now - lastT) / 1000);
+  lastT = now;
+  if (state.auto && state.mode === 'menu') startGame();
+  if (state.auto && state.mode === 'over' && now - overAt > 2500) startGame();
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
