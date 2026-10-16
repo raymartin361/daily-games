@@ -1,432 +1,288 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Zap Rush — Daily Game</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Serpent — Daily Game</title>
+<meta name="description" content="Neon Serpent: 60 seconds of speed-ramping snake action. Gobble orbs, chain combos, dodge the red ones.">
 <script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
 <style>
-  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#07070f;
-               font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-               -webkit-user-select:none; user-select:none; }
-  #game { display:block; touch-action:none; }
-  #muteBtn { position:fixed; right:14px; bottom:14px; z-index:10; width:52px; height:52px;
-             font-size:24px; border:none; border-radius:50%;
-             background:rgba(255,255,255,.10); color:#fff; cursor:pointer; }
-  #muteBtn:active { background:rgba(255,255,255,.25); }
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;background:#05070f;position:fixed;width:100%;overscroll-behavior:none;}
+body{font-family:'Segoe UI',system-ui,sans-serif;color:#e8f6ff;display:flex;flex-direction:column;align-items:center;user-select:none;-webkit-user-select:none}
+#hud{width:100%;max-width:460px;display:flex;justify-content:space-between;align-items:center;padding:10px 14px;font-weight:700}
+#hud .box{background:#0d1428;border:1px solid #1e2c52;border-radius:10px;padding:6px 12px;font-size:15px;min-width:78px;text-align:center}
+#hud .lbl{font-size:10px;color:#5f6fa3;letter-spacing:1px;font-weight:600}
+#score{color:#7CFC90}#time{color:#ffd76c}#time.low{color:#ff5d5d;animation:blink .5s steps(2) infinite}
+@keyframes blink{50%{opacity:.35}}
+#wrap{position:relative;width:100%;max-width:460px;flex:1;display:flex;align-items:center;justify-content:center}
+canvas{display:block;background:#070b18;border-radius:12px;box-shadow:0 0 40px rgba(0,229,255,.12),inset 0 0 60px rgba(0,60,120,.15);touch-action:none}
+#overlay{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(4,7,16,.82);border-radius:12px;text-align:center;padding:20px;z-index:5}
+#overlay h1{font-size:clamp(28px,7vw,44px);background:linear-gradient(90deg,#00e5ff,#7CFC90,#ffd76c);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:8px}
+#overlay p{color:#aebadd;margin:6px 0;line-height:1.5;font-size:15px}
+#overlay .big{font-size:52px;font-weight:900;color:#7CFC90}
+#btn{margin-top:14px;background:linear-gradient(90deg,#00c8e5,#7CFC90);border:none;border-radius:999px;padding:14px 42px;font-size:18px;font-weight:800;color:#04222b;cursor:pointer}
+#btn:active{transform:scale(.96)}
+#hint{color:#5f6fa3;font-size:12px;padding:8px 0 12px;text-align:center}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin:0 4px;vertical-align:baseline}
+.g{background:#7CFC90;box-shadow:0 0 8px #7CFC90}.y{background:#ffd76c;box-shadow:0 0 8px #ffd76c}.r{background:#ff5d5d;box-shadow:0 0 8px #ff5d5d}
 </style>
 </head>
 <body>
-<canvas id="game"></canvas>
-<button id="muteBtn" aria-label="toggle sound">🔊</button>
-
-<!-- Pure game-logic functions. No browser globals here so smoke-test.js can
-     extract this block and eval it in plain node to test the real code. -->
-<script id="logic">
+<div id="hud">
+  <div class="box"><div class="lbl">SCORE</div><div id="score">0</div></div>
+  <div class="box"><div class="lbl">TIME</div><div id="time">60</div></div>
+  <div class="box"><div class="lbl">BEST</div><div id="best">0</div></div>
+</div>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="overlay">
+    <h1>🐍 NEON SERPENT</h1>
+    <p>Swipe or use arrow keys.<br>
+    <span class="dot g"></span> green +10 &nbsp;<span class="dot y"></span> gold +50<br>
+    <span class="dot r"></span> red −25 &amp; breaks your combo<br>
+    Every 5 chained eats → combo × up to ×5.<br>Speed ramps up. Walls kill.</p>
+    <p><b>Survive 60 seconds. Eat everything.</b></p>
+    <button id="btn">▶ PLAY</button>
+  </div>
+</div>
+<div id="hint">swipe / arrows / WASD to steer</div>
+<script>
+document.addEventListener('touchmove',function(e){e.preventDefault();},{passive:false});
 'use strict';
-
-/* Points for tapping a normal target.
-   ringFrac: 1 = tapped the instant it spawned, 0 = tapped at the last moment.
-   Formula: score = 60 + 140 * ringFrac, rounded, then x combo multiplier. */
-function pointsFor(ringFrac, combo) {
-  const f = Math.max(0, Math.min(1, ringFrac));
-  return Math.round(60 + 140 * f) * combo;
+//LOGIC-START
+var COLS = 17, ROWS = 21, GAME_LEN = 60;
+function makeRng(seed){ var s = seed >>> 0 || 1; return function(){ s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; }; }
+function createState(rng){
+  var cx = (COLS/2)|0, cy = (ROWS/2)|0;
+  return { snake: [{x:cx,y:cy},{x:cx-1,y:cy},{x:cx-2,y:cy},{x:cx-3,y:cy}],
+    dir: {x:1,y:0}, pending: null, orbs: [], score: 0, streak: 0,
+    elapsed: 0, acc: 0, alive: true, timedOut: false, rng: rng };
 }
-
-/* Combo multiplier from the current chained-hit streak.
-   Every 6 chained hits raises it by 1, capped at x5. */
-function comboFor(streak) {
-  return Math.min(5, 1 + Math.floor(streak / 6));
+function setDir(st, dx, dy){
+  var d = st.dir;
+  if (dx === -d.x && dy === -d.y) return false;   // no 180° turn
+  if (dx === d.x && dy === d.y) return false;
+  st.pending = {x:dx,y:dy}; return true;
 }
-
-/* Difficulty ramp. elapsed = seconds since the run started (0..60).
-   Spawn interval shrinks 0.9s -> 0.45s, ring shrink time 1.2s -> 0.8s.
-   Values clamp so over/under-run times can't break the game. */
-function ramp(elapsed) {
-  const t = Math.max(0, Math.min(1, elapsed / 60));
-  return {
-    spawnInterval: 0.9 - 0.45 * t,
-    shrinkTime: 1.2 - 0.4 * t
-  };
+function speedFor(elapsed){ return 7 + Math.min(1, elapsed / GAME_LEN) * 5; } // 7 → 12 moves/s
+function comboMultiplier(streak){ return Math.min(5, 1 + ((streak / 5) | 0)); }
+function pointsFor(type, streak){
+  var m = comboMultiplier(streak);
+  if (type === 'gold') return 50 * m;
+  if (type === 'norm') return 10 * m;
+  return 0;
 }
-
-/* Pick a target kind. ~10% gold, ~12% void, rest normal. */
-function pickKind(rand) {
-  const r = rand();
-  if (r < 0.10) return 'gold';
-  if (r < 0.22) return 'void';
-  return 'normal';
+function freeCells(st){
+  var occ = {}, i, o;
+  for (i = 0; i < st.snake.length; i++) occ[st.snake[i].x + ',' + st.snake[i].y] = 1;
+  var cells = [];
+  for (var y = 0; y < ROWS; y++) for (var x = 0; x < COLS; x++)
+    if (!occ[x + ',' + y]) cells.push({x:x,y:y});
+  return cells;
 }
-
-/* Choose a non-overlapping spawn point for a target of radius r on a w x h
-   board. existing = [{x, y, r}, ...]. rand = randomness source (injectable).
-   Returns {x, y} or null when no free spot exists. */
-function spawnPoint(existing, w, h, r, rand) {
-  const margin = r + 8;
-  if (w - 2 * margin <= 0 || h - 2 * margin <= 0) return null;
-  for (let i = 0; i < 40; i++) {
-    const x = margin + rand() * (w - 2 * margin);
-    const y = margin + rand() * (h - 2 * margin);
-    let ok = true;
-    for (const t of existing) {
-      if (Math.hypot(t.x - x, t.y - y) < t.r + r + 10) { ok = false; break; }
+function spawnOrb(st){
+  var cells = freeCells(st);
+  if (!cells.length) return null;
+  var hasGold = false, hasPoison = false, i;
+  for (i = 0; i < st.orbs.length; i++){ if (st.orbs[i].type === 'gold') hasGold = true; if (st.orbs[i].type === 'poison') hasPoison = true; }
+  var r = st.rng(), type = 'norm';
+  if (r < 0.12 && !hasGold) type = 'gold';
+  else if (r < 0.27 && !hasPoison) type = 'poison';
+  var cell = cells[(st.rng() * cells.length) | 0];
+  var orb = {x: cell.x, y: cell.y, type: type};
+  st.orbs.push(orb);
+  return orb;
+}
+// Advance one grid step. Returns {died:false, ate:null|'norm'|'gold'|'poison'}.
+function stepLogic(st){
+  if (st.pending){ st.dir = st.pending; st.pending = null; }
+  var head = {x: st.snake[0].x + st.dir.x, y: st.snake[0].y + st.dir.y};
+  if (head.x < 0 || head.y < 0 || head.x >= COLS || head.y >= ROWS) return {died: true, ate: null};
+  for (var i = 0; i < st.snake.length - 1; i++)
+    if (st.snake[i].x === head.x && st.snake[i].y === head.y) return {died: true, ate: null};
+  var ate = null, grow = false;
+  for (i = 0; i < st.orbs.length; i++){
+    var o = st.orbs[i];
+    if (o.x === head.x && o.y === head.y){
+      ate = o.type; st.orbs.splice(i, 1);
+      if (ate === 'norm' || ate === 'gold'){ st.score += pointsFor(ate, st.streak); st.streak++; grow = true; }
+      else { st.score = Math.max(0, st.score - 25); st.streak = 0; grow = false; }
+      break;
     }
-    if (ok) return { x: x, y: y };
   }
-  return null;
+  st.snake.unshift(head);
+  if (!grow) st.snake.pop();
+  return {died: false, ate: ate};
 }
-
-/* Apply a tap on a target.
-   state = {score, streak, combo} (combo = multiplier used for THIS tap).
-   Returns {score, streak, combo, kind, points}.
-   - normal: pointsFor(ringFrac, combo); streak+1
-   - gold: flat +300 (no combo scaling); streak+1; bigger pop effect in UI
-   - void: -150 (score never below 0); streak broken (streak=0, combo back to x1) */
-function applyTap(state, target, ringFrac) {
-  if (target.kind === 'void') {
-    return { score: Math.max(0, state.score - 150), streak: 0, combo: 1,
-             kind: 'void', points: -150 };
-  }
-  const points = target.kind === 'gold' ? 300 : pointsFor(ringFrac, state.combo);
-  const streak = state.streak + 1;
-  return { score: state.score + points, streak: streak,
-           combo: comboFor(streak), kind: target.kind, points: points };
-}
-
-/* Apply a target vanishing untapped.
-   Normal/gold targets vanishing = a miss: streak breaks.
-   Void targets vanishing is harmless (they were never a threat). */
-function applyMiss(state, target) {
-  if (target.kind === 'void') return { streak: state.streak, combo: state.combo };
-  return { streak: 0, combo: 1 };
-}
+//LOGIC-END
 </script>
-
 <script>
 'use strict';
-/* Zap Rush — 60-second reflex game. Canvas renderer + WebAudio SFX.
-   Uses the pure logic functions from the <script id="logic"> block above. */
-(function () {
-  var canvas = document.getElementById('game');
-  var ctx = canvas.getContext('2d');
-  var W = 0, H = 0;
+(function(){
+var cv = document.getElementById('c'), ctx = cv.getContext('2d');
+var scoreEl = document.getElementById('score'), timeEl = document.getElementById('time'),
+    bestEl = document.getElementById('best'), overlay = document.getElementById('overlay'),
+    btn = document.getElementById('btn');
+var BEST_KEY = 'neon_serpent_best';
+var best = 0; try { best = parseInt(localStorage.getItem(BEST_KEY) || '0', 10) || 0; } catch(e){}
+bestEl.textContent = best;
 
-  function resize() {
-    var DPR = Math.min(2, window.devicePixelRatio || 1);
-    W = window.innerWidth; H = window.innerHeight;
-    canvas.width = Math.floor(W * DPR); canvas.height = Math.floor(H * DPR);
-    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
-    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  }
-  window.addEventListener('resize', resize);
-  resize();
+function sizeCanvas(){
+  var wrap = document.getElementById('wrap');
+  var w = Math.min(wrap.clientWidth - 16, 460), h = wrap.clientHeight - 8;
+  var cell = Math.floor(Math.min(w / COLS, h / ROWS));
+  cv.width = cell * COLS; cv.height = cell * ROWS;
+  cv.style.width = cv.width + 'px'; cv.style.height = cv.height + 'px';
+  return cell;
+}
+var cell = sizeCanvas();
+window.addEventListener('resize', function(){ cell = sizeCanvas(); draw(); });
 
-  /* ---------- audio ---------- */
-  var audioCtx = null, muted = false;
-  function ac() {
-    if (!audioCtx) {
-      var AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return null;
-      audioCtx = new AC();
+var AC = null;
+function audio(){ if (!AC){ try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch(e){} } return AC; }
+function beep(freq, dur, type, vol, slideTo){
+  var ac = audio(); if (!ac) return;
+  var o = ac.createOscillator(), g = ac.createGain();
+  o.type = type || 'square'; o.frequency.value = freq;
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, ac.currentTime + dur);
+  g.gain.setValueAtTime(vol || 0.08, ac.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + dur);
+  o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + dur);
+}
+function sfx(name, streak){
+  try {
+    if (name === 'eat') beep(440 + Math.min(streak, 20) * 30, 0.08, 'square', 0.06);
+    else if (name === 'gold') { beep(880, 0.1, 'sine', 0.08); setTimeout(function(){ beep(1320, 0.15, 'sine', 0.08); }, 80); }
+    else if (name === 'poison') beep(160, 0.25, 'sawtooth', 0.09, 80);
+    else if (name === 'die') beep(300, 0.5, 'sawtooth', 0.1, 50);
+    else if (name === 'tick') beep(1000, 0.05, 'square', 0.04);
+    else if (name === 'win') { [523,659,784,1047].forEach(function(f, i){ setTimeout(function(){ beep(f, 0.15, 'sine', 0.08); }, i * 120); }); }
+  } catch(e){}
+}
+function buzz(p){ try { if (navigator.vibrate) navigator.vibrate(p); } catch(e){} }
+
+var st = null, running = false, lastT = 0;
+
+function reset(){
+  st = createState(makeRng((Date.now() ^ (Math.random() * 1e9)) >>> 0));
+  st.orbs = [];
+  spawnOrb(st); spawnOrb(st); spawnOrb(st);
+  running = true; lastT = performance.now();
+  overlay.style.display = 'none';
+  timeEl.classList.remove('low');
+}
+
+function endGame(timedOut){
+  running = false;
+  st.alive = false; st.timedOut = !!timedOut;
+  if (st.score > best){ best = st.score; try { localStorage.setItem(BEST_KEY, String(best)); } catch(e){} bestEl.textContent = best; }
+  var isBest = st.score >= best && st.score > 0;
+  overlay.innerHTML =
+    '<h1>' + (timedOut ? '⏱ TIME!' : '💀 CRASHED') + '</h1>' +
+    '<div class="big">' + st.score + '</div>' +
+    '<p>' + (timedOut ? 'You survived the full 60 seconds!' : 'The walls (or your own tail) got you.') +
+    (isBest ? '<br>🏆 <b>New best score!</b>' : '<br>Best: ' + best) + '</p>' +
+    '<button id="btn">↻ PLAY AGAIN</button>';
+  overlay.style.display = 'flex';
+  document.getElementById('btn').addEventListener('click', reset);
+  if (timedOut){ sfx('win'); buzz(60); } else { sfx('die'); buzz([80, 40, 80]); }
+}
+
+function loop(t){
+  if (!running) return;
+  var dt = Math.min(0.1, (t - lastT) / 1000); lastT = t;
+  st.elapsed += dt;
+  var remain = Math.max(0, GAME_LEN - st.elapsed);
+  if (remain <= 5.5) timeEl.classList.add('low');
+  if (remain !== +timeEl.textContent){ timeEl.textContent = Math.ceil(remain); if (remain <= 5 && remain > 0) sfx('tick'); }
+  if (st.elapsed >= GAME_LEN){ draw(); endGame(true); return; }
+  st.acc += dt;
+  var stepT = 1 / speedFor(st.elapsed);
+  while (st.acc >= stepT){
+    st.acc -= stepT;
+    var r = stepLogic(st);
+    if (r.died){ draw(); endGame(false); return; }
+    if (r.ate){
+      if (r.ate === 'gold'){ sfx('gold'); buzz(40); }
+      else if (r.ate === 'poison'){ sfx('poison'); buzz([50, 30, 50]); }
+      else { sfx('eat', st.streak); buzz(15); }
+      scoreEl.textContent = st.score;
+      while (st.orbs.length < 3) spawnOrb(st);
     }
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    return audioCtx;
   }
-  function beep(freq, dur, type, vol, delay) {
-    if (muted) return;
-    try {
-      var c = ac(); if (!c) return;
-      var o = c.createOscillator(), g = c.createGain();
-      o.type = type || 'sine';
-      o.frequency.value = freq;
-      var t = c.currentTime + (delay || 0);
-      g.gain.setValueAtTime(vol || 0.15, t);
-      g.gain.exponentialRampToValueAtTime(0.001, t + dur);
-      o.connect(g); g.connect(c.destination);
-      o.start(t); o.stop(t + dur + 0.02);
-    } catch (e) { /* audio unavailable: stay silent */ }
-  }
-  function sfxHit(combo)   { beep(440 * Math.pow(1.12, combo), 0.12, 'triangle', 0.18); }
-  function sfxGold()       { beep(880, 0.15, 'sine', 0.2); beep(1318, 0.25, 'sine', 0.2, 0.08); }
-  function sfxVoid()       { beep(110, 0.3, 'sawtooth', 0.2); }
-  function sfxTick()       { beep(1000, 0.07, 'square', 0.08); }
-  function sfxOver()       { [523, 659, 784, 1046].forEach(function (f, i) { beep(f, 0.25, 'triangle', 0.18, i * 0.15); }); }
-  function buzz(ms) {
-    try { if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') navigator.vibrate(ms); }
-    catch (e) { /* no haptics */ }
-  }
+  draw();
+  requestAnimationFrame(loop);
+}
 
-  var muteBtn = document.getElementById('muteBtn');
-  muteBtn.addEventListener('click', function (e) {
-    e.stopPropagation();
-    muted = !muted;
-    muteBtn.textContent = muted ? '🔇' : '🔊';
+function draw(){
+  if (!st) return;
+  var W = cv.width, H = cv.height;
+  ctx.fillStyle = '#070b18'; ctx.fillRect(0, 0, W, H);
+  // grid dots
+  ctx.fillStyle = 'rgba(0,229,255,0.05)';
+  for (var y = 0; y < ROWS; y++) for (var x = 0; x < COLS; x++)
+    if ((x + y) % 2 === 0) ctx.fillRect(x * cell, y * cell, cell, cell);
+  var t = performance.now() / 300;
+  // orbs
+  st.orbs.forEach(function(o){
+    var cx = o.x * cell + cell / 2, cy = o.y * cell + cell / 2, r = cell * 0.32 + Math.sin(t + o.x) * 1.5;
+    var col = o.type === 'gold' ? '#ffd76c' : o.type === 'poison' ? '#ff5d5d' : '#7CFC90';
+    ctx.shadowColor = col; ctx.shadowBlur = 12; ctx.fillStyle = col;
+    ctx.beginPath(); ctx.arc(cx, cy, Math.max(2, r), 0, 7); ctx.fill();
+    ctx.shadowBlur = 0;
+    if (o.type === 'poison'){ ctx.fillStyle = '#05070f'; ctx.font = (cell * 0.5) + 'px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('✕', cx, cy + 1); }
   });
-
-  /* ---------- state ---------- */
-  var DURATION = 60;
-  var BEST_KEY = 'zap_rush_best';
-  var state = 'menu';            // menu | playing | paused | over
-  var targets = [], pops = [], floaters = [];
-  var score = 0, streak = 0, combo = 1, best = 0;
-  var startTime = 0, nextSpawn = 0, lastSecond = -1, pausedAt = 0;
-
-  try { best = parseInt(localStorage.getItem(BEST_KEY) || '0', 10) || 0; }
-  catch (e) { best = 0; }
-
-  function now() { return performance.now() / 1000 - startTime; }
-
-  function startGame() {
-    targets = []; pops = []; floaters = [];
-    score = 0; streak = 0; combo = 1;
-    startTime = performance.now() / 1000;
-    nextSpawn = 0; lastSecond = -1;
-    state = 'playing';
+  // snake
+  var n = st.snake.length;
+  for (var i = n - 1; i >= 0; i--){
+    var s = st.snake[i], frac = i / Math.max(1, n - 1);
+    var hue = 160 - frac * 60; // green → cyan tail
+    ctx.shadowColor = 'hsl(' + hue + ',100%,60%)'; ctx.shadowBlur = i === 0 ? 16 : 8;
+    ctx.fillStyle = 'hsl(' + hue + ',100%,' + (i === 0 ? 65 : 55 - frac * 15) + '%)';
+    var pad = i === 0 ? cell * 0.06 : cell * 0.14;
+    roundRect(s.x * cell + pad, s.y * cell + pad, cell - pad * 2, cell - pad * 2, cell * 0.3);
+    ctx.fill(); ctx.shadowBlur = 0;
   }
-
-  function endGame() {
-    state = 'over';
-    targets = [];
-    var isBest = score > best;
-    if (isBest) {
-      best = score;
-      try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) {}
-    }
-    endGame._isBest = isBest;
-    sfxOver();
+  // head eyes
+  var h = st.snake[0], d = st.dir, ex = h.x * cell + cell / 2, ey = h.y * cell + cell / 2;
+  ctx.fillStyle = '#04121a';
+  var eoff = cell * 0.18, foff = cell * 0.12;
+  ctx.beginPath(); ctx.arc(ex + d.x * foff - d.y * eoff, ey + d.y * foff + d.x * eoff, cell * 0.09, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(ex + d.x * foff + d.y * eoff, ey + d.y * foff - d.x * eoff, cell * 0.09, 0, 7); ctx.fill();
+  // combo badge
+  if (st.streak >= 5){
+    ctx.fillStyle = '#ffd76c'; ctx.font = 'bold 14px sans-serif'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText('🔥 ×' + comboMultiplier(st.streak), 8, 8);
   }
+}
+function roundRect(x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
 
-  function spawnTarget() {
-    var t = now();
-    var diff = ramp(t);
-    var kind = pickKind(Math.random);
-    var rad = kind === 'gold' ? 42 : 34;
-    var p = spawnPoint(targets, W, H, rad, Math.random);
-    if (!p) return;
-    targets.push({ x: p.x, y: p.y, r: rad, kind: kind, born: t, shrink: diff.shrinkTime });
+// input
+var KEYS = { ArrowUp: [0,-1], KeyW: [0,-1], ArrowDown: [0,1], KeyS: [0,1], ArrowLeft: [-1,0], KeyA: [-1,0], ArrowRight: [1,0], KeyD: [1,0] };
+document.addEventListener('keydown', function(e){
+  var k = KEYS[e.code];
+  if (k){ e.preventDefault(); if (st && running) setDir(st, k[0], k[1]); }
+  if ((e.code === 'Enter' || e.code === 'Space') && !running) reset();
+});
+var tsx = 0, tsy = 0;
+cv.addEventListener('touchstart', function(e){ e.preventDefault(); var t = e.changedTouches[0]; tsx = t.clientX; tsy = t.clientY; }, {passive: false});
+cv.addEventListener('touchend', function(e){
+  e.preventDefault();
+  var t = e.changedTouches[0], dx = t.clientX - tsx, dy = t.clientY - tsy;
+  if (Math.abs(dx) < 12 && Math.abs(dy) < 12) return;
+  if (st && running){
+    if (Math.abs(dx) > Math.abs(dy)) setDir(st, dx > 0 ? 1 : -1, 0);
+    else setDir(st, 0, dy > 0 ? 1 : -1);
   }
-
-  canvas.addEventListener('pointerdown', function (e) {
-    if (state === 'menu' || state === 'over') { startGame(); return; }
-    if (state !== 'playing') return;
-    var x = e.clientX, y = e.clientY;
-    for (var i = targets.length - 1; i >= 0; i--) {
-      var tg = targets[i];
-      if (Math.hypot(tg.x - x, tg.y - y) <= tg.r + 8) {
-        var frac = Math.max(0, 1 - (now() - tg.born) / tg.shrink);
-        var res = applyTap({ score: score, streak: streak, combo: combo }, tg, frac);
-        score = res.score; streak = res.streak; combo = res.combo;
-        pops.push({ x: tg.x, y: tg.y, t: 0, kind: tg.kind, r: tg.r });
-        floaters.push({ x: tg.x, y: tg.y - tg.r - 6, t: 0,
-                        text: (res.points >= 0 ? '+' : '') + res.points,
-                        color: tg.kind === 'void' ? '#f87171' : tg.kind === 'gold' ? '#fbbf24' : '#a5f3fc' });
-        if (tg.kind === 'void')      { sfxVoid(); buzz(80); }
-        else if (tg.kind === 'gold') { sfxGold(); buzz(40); }
-        else                         { sfxHit(combo); buzz(20); }
-        targets.splice(i, 1);
-        return;
-      }
-    }
-    // tapping empty space: no penalty, just nothing
-  });
-
-  /* Pause when the tab is hidden; on return, shift the clock so the game
-     resumes exactly where it left off (no lost time, no vanished targets). */
-  document.addEventListener('visibilitychange', function () {
-    if (document.hidden && state === 'playing') {
-      pausedAt = performance.now() / 1000;
-      state = 'paused';
-    } else if (!document.hidden && state === 'paused') {
-      startTime += (performance.now() / 1000 - pausedAt);
-      state = 'playing';
-    }
-  });
-
-  function update() {
-    var t = now();
-    // expire targets
-    for (var i = targets.length - 1; i >= 0; i--) {
-      var tg = targets[i];
-      if (t - tg.born >= tg.shrink) {
-        var res = applyMiss({ streak: streak, combo: combo }, tg);
-        if (tg.kind !== 'void') {
-          floaters.push({ x: tg.x, y: tg.y, t: 0, text: 'MISS', color: '#f87171' });
-        }
-        streak = res.streak; combo = res.combo;
-        targets.splice(i, 1);
-      }
-    }
-    // spawn
-    if (t >= nextSpawn) {
-      spawnTarget();
-      nextSpawn = t + ramp(t).spawnInterval;
-    }
-    // countdown ticks for the last 5 seconds
-    var remaining = DURATION - t;
-    var sec = Math.ceil(remaining);
-    if (sec <= 5 && sec >= 1 && sec !== lastSecond) { lastSecond = sec; sfxTick(); }
-    if (remaining <= 0) endGame();
-  }
-
-  function updateFx(dt) {
-    for (var i = pops.length - 1; i >= 0; i--) {
-      pops[i].t += dt * 2.2;
-      if (pops[i].t >= 1) pops.splice(i, 1);
-    }
-    for (var j = floaters.length - 1; j >= 0; j--) {
-      floaters[j].t += dt * 1.2;
-      if (floaters[j].t >= 1) floaters.splice(j, 1);
-    }
-  }
-
-  var KIND_COLOR = { normal: '#22d3ee', gold: '#fbbf24', void: '#8b5cf6' };
-
-  function drawTarget(tg) {
-    var frac = Math.max(0, 1 - (now() - tg.born) / tg.shrink);
-    var col = KIND_COLOR[tg.kind];
-    ctx.save();
-    ctx.shadowColor = col; ctx.shadowBlur = 18;
-    // outer ring (fixed size)
-    ctx.strokeStyle = col; ctx.globalAlpha = 0.35; ctx.lineWidth = 4;
-    ctx.beginPath(); ctx.arc(tg.x, tg.y, tg.r, 0, Math.PI * 2); ctx.stroke();
-    // shrinking inner ring = the timer
-    ctx.globalAlpha = 1; ctx.lineWidth = 6;
-    ctx.beginPath(); ctx.arc(tg.x, tg.y, Math.max(2, tg.r * frac), 0, Math.PI * 2); ctx.stroke();
-    // core
-    ctx.fillStyle = col; ctx.globalAlpha = 0.9;
-    ctx.beginPath(); ctx.arc(tg.x, tg.y, tg.kind === 'gold' ? 10 : 7, 0, Math.PI * 2); ctx.fill();
-    if (tg.kind === 'void') {           // dark hollow core marks the danger
-      ctx.globalAlpha = 1; ctx.fillStyle = '#0b0b14';
-      ctx.beginPath(); ctx.arc(tg.x, tg.y, 7, 0, Math.PI * 2); ctx.fill();
-      ctx.strokeStyle = '#f87171'; ctx.lineWidth = 2.5; ctx.globalAlpha = 0.9;
-      var s = 9;
-      ctx.beginPath();
-      ctx.moveTo(tg.x - s, tg.y - s); ctx.lineTo(tg.x + s, tg.y + s);
-      ctx.moveTo(tg.x + s, tg.y - s); ctx.lineTo(tg.x - s, tg.y + s);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  function drawFx() {
-    var i, p, f;
-    for (i = 0; i < pops.length; i++) {
-      p = pops[i];
-      var big = p.kind === 'gold' ? 1.6 : 1;
-      ctx.save();
-      ctx.globalAlpha = 1 - p.t;
-      ctx.strokeStyle = KIND_COLOR[p.kind];
-      ctx.lineWidth = 5;
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.r * (1 + p.t * 1.4 * big), 0, Math.PI * 2); ctx.stroke();
-      ctx.restore();
-    }
-    ctx.save();
-    ctx.textAlign = 'center';
-    ctx.font = 'bold 20px -apple-system, "Segoe UI", Roboto, sans-serif';
-    for (i = 0; i < floaters.length; i++) {
-      f = floaters[i];
-      ctx.globalAlpha = 1 - f.t;
-      ctx.fillStyle = f.color;
-      ctx.fillText(f.text, f.x, f.y - f.t * 46);
-    }
-    ctx.restore();
-  }
-
-  function drawHUD() {
-    var t = Math.max(0, DURATION - (state === 'playing' || state === 'paused' ? now() : 0));
-    ctx.save();
-    ctx.textBaseline = 'top';
-    ctx.font = 'bold 22px -apple-system, "Segoe UI", Roboto, sans-serif';
-    ctx.fillStyle = t <= 5 ? '#f87171' : '#e2e8f0';
-    ctx.textAlign = 'left';
-    ctx.fillText('⏱ ' + Math.ceil(t), 14, 12);
-    ctx.textAlign = 'right';
-    ctx.fillStyle = '#e2e8f0';
-    ctx.fillText(String(score), W - 14, 12);
-    if (combo > 1) {
-      ctx.textAlign = 'center';
-      ctx.fillStyle = combo >= 4 ? '#fbbf24' : '#a5f3fc';
-      ctx.font = 'bold 24px -apple-system, "Segoe UI", Roboto, sans-serif';
-      ctx.fillText('COMBO ×' + combo, W / 2, 12);
-      ctx.font = '15px -apple-system, "Segoe UI", Roboto, sans-serif';
-      ctx.fillStyle = '#94a3b8';
-      ctx.fillText(streak + ' streak', W / 2, 40);
-    }
-    ctx.restore();
-  }
-
-  function centerText(lines, y0) {
-    ctx.save();
-    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    lines.forEach(function (ln, i) {
-      ctx.font = ln.font; ctx.fillStyle = ln.color;
-      ctx.fillText(ln.text, W / 2, y0 + i * ln.gap);
-    });
-    ctx.restore();
-  }
-  function F(text, size, color, gap) {
-    return { text: text, font: 'bold ' + size + 'px -apple-system, "Segoe UI", Roboto, sans-serif', color: color, gap: gap || size * 1.5 };
-  }
-  function Fn(text, size, color, gap) {
-    return { text: text, font: size + 'px -apple-system, "Segoe UI", Roboto, sans-serif', color: color, gap: gap || size * 1.6 };
-  }
-
-  function drawMenu() {
-    centerText([
-      F('⚡ ZAP RUSH', 44, '#22d3ee', 60),
-      Fn('Tap glowing rings before they shrink away.', 17, '#cbd5e1'),
-      Fn('⚪ cyan = points (faster = more)   🟡 gold = +300', 15, '#94a3b8'),
-      Fn('🟣 void = DON\'T tap (-150 & streak gone)', 15, '#94a3b8'),
-      Fn('6 hits in a row → combo ×2, up to ×5. 60 seconds.', 15, '#94a3b8'),
-      F('BEST  ' + best, 20, '#fbbf24', 52),
-      F('TAP TO START', 26, '#4ade80', 40)
-    ], H / 2 - 150);
-  }
-
-  function drawOver() {
-    centerText([
-      F('⏱ TIME\'S UP', 40, '#22d3ee', 58),
-      F(String(score), 56, '#ffffff', 70),
-      Fn(endGame._isBest ? '🎉 NEW BEST!' : 'best  ' + best, 20, '#fbbf24', 48),
-      F('TAP TO PLAY AGAIN', 24, '#4ade80', 40)
-    ], H / 2 - 110);
-  }
-
-  function drawPaused() {
-    ctx.save();
-    ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillRect(0, 0, W, H);
-    ctx.restore();
-    centerText([F('⏸ PAUSED', 40, '#e2e8f0', 50)], H / 2 - 20);
-  }
-
-  function draw() {
-    // background
-    var g = ctx.createRadialGradient(W / 2, H / 2, 40, W / 2, H / 2, Math.max(W, H) * 0.75);
-    g.addColorStop(0, '#101024'); g.addColorStop(1, '#07070f');
-    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-
-    if (state === 'menu') { drawMenu(); return; }
-    if (state === 'over') { drawFx(); drawOver(); return; }
-
-    var i;
-    for (i = 0; i < targets.length; i++) drawTarget(targets[i]);
-    drawFx();
-    drawHUD();
-    if (state === 'paused') drawPaused();
-  }
-
-  var lastFrame = performance.now();
-  function frame() {
-    var pnow = performance.now();
-    var dt = Math.min(0.05, (pnow - lastFrame) / 1000);
-    lastFrame = pnow;
-    if (state === 'playing') update();
-    updateFx(dt);
-    draw();
-    requestAnimationFrame(frame);
-  }
-  frame();
+}, {passive: false});
+btn.addEventListener('click', function(){ audio(); reset(); requestAnimationFrame(loop); });
+document.addEventListener('visibilitychange', function(){ if (document.hidden && running){ running = false; overlay.innerHTML = '<h1>⏸ PAUSED</h1><p>Tab hidden — tap to resume.</p><button id="btn">▶ RESUME</button>'; overlay.style.display = 'flex'; document.getElementById('btn').addEventListener('click', function(){ overlay.style.display = 'none'; running = true; lastT = performance.now(); requestAnimationFrame(loop); }); } });
+draw();
 })();
 </script>
 </body>
