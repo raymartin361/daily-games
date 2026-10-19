@@ -59,6 +59,7 @@ function makeGame(){
     platforms: [], stars: [], popups: [],
     px: W/2, py: H - 120, vy: BOUNCE_V,
     cam: 0, minY: H - 120,
+    lastGenBroken: false, lastSafeY: H - 120,
     best: 0, goldHits: 0, overMsg: '', overSub: '', cleanBonus: false,
     lastEvent: null, starT: 1.0
   };
@@ -203,12 +204,23 @@ function update(g, dt, ax){
   // camera follows upward
   if (g.py - g.cam < H*0.42) g.cam = g.py - H*0.42;
 
-  // generate platforms above view
+  // generate platforms above view.
+  // FAIRNESS GUARANTEE (red-ceiling fix): red (broken) bars crumble with no
+  // bounce, so the generator must never strand the player. Two rules:
+  //  1) never two reds in a row;
+  //  2) a landable (non-red) platform at least every 240px going up
+  //     (max jump height is ~254px, so the player can always ascend).
+  // When a forced safe platform is needed, it is pulled down to within
+  // 240px of the last landable so the gap stays jumpable.
   var guard = 0;
   while (g.minY > g.cam - 260 && guard++ < 200){
     var gap = 90 + Math.random() * Math.min(60 + g.t*1.1, 125);
     g.minY -= gap;
-    spawnPlatform(g, 50 + Math.random()*(W - 100), g.minY);
+    var forceSafe = g.lastGenBroken || (g.lastSafeY - g.minY) > 240;
+    if (forceSafe) g.minY = Math.max(g.minY, g.lastSafeY - 240);
+    var np = spawnPlatform(g, 50 + Math.random()*(W - 100), g.minY, forceSafe ? 'norm' : undefined);
+    g.lastGenBroken = (np.type === 'broken');
+    if (np.type !== 'broken') g.lastSafeY = g.minY;
   }
 
   // star spawner
