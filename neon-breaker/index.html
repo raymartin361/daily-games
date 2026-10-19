@@ -246,7 +246,8 @@ function newState() {
     ball: null, stuck: true,
     bricks: makeBricks(1, (Math.random() * 1e9) | 0),
     bricksLeft: 0, particles: [], floats: [],
-    flash: 0, shake: 0
+    flash: 0, shake: 0,
+    lastHitT: 0 // last time the ball touched a brick or the paddle (anti-stall)
   };
 }
 function brickCount() { return S.bricks.filter(b => b.alive).length; }
@@ -254,6 +255,7 @@ function launchBall() {
   const sp = ballSpeed(S.t);
   S.ball = makeBall(S.paddle.x + S.paddle.w / 2, S.paddle.y - BALL_R - 1, sp, (Math.random() * 30 - 15));
   S.stuck = false;
+  S.lastHitT = S.t;
   beep(300, 0.08, 'square', 0.1, 200);
 }
 
@@ -335,6 +337,7 @@ function update(dt) {
     const b = S.ball, p = S.paddle;
     if (b.vy > 0 && circleRect(b.x, b.y, b.r, p.x, p.y, p.w, p.h)) {
       paddleBounce(b, p, speed);
+      S.lastHitT = S.t;
       sfx.paddle(); buzz(8);
     }
     // brick hits (one per frame is fine)
@@ -351,12 +354,25 @@ function update(dt) {
         const r = scoreBrick(S.streak, br.gold);
         S.streak = r.streak; S.combo = r.combo;
         S.score += r.points;
+        S.lastHitT = S.t;
         addFloat(br.x + br.w / 2, br.y, '+' + r.points, br.gold ? '#ffd24d' : '#fff');
         burst(b.x, b.y, br.gold ? '#ffd24d' : ROW_COLORS[br.row % ROW_COLORS.length], br.gold ? 14 : 7);
         if (br.gold) { sfx.gold(); buzz(25); } else { sfx.brick(S.combo); buzz(6); }
         S.flash = 0.08;
         break;
       }
+    }
+    // anti-stall: if the ball goes 4s without touching a brick or the paddle
+    // it's in a periodic loop — kick it toward the brick field to break it.
+    if (!S.stuck && S.ball && S.t - S.lastHitT > 4) {
+      const dir = Math.random() < 0.5 ? -1 : 1;
+      const ang = (25 + Math.random() * 35) * Math.PI / 180; // 25-60 deg from vertical
+      const vySign = S.ball.y < BRICK_TOP + 120 ? 1 : -1; // toward brick zone
+      S.ball.vx = dir * speed * Math.sin(ang);
+      S.ball.vy = vySign * speed * Math.cos(ang);
+      S.lastHitT = S.t;
+      addFloat(S.ball.x, Math.max(48, S.ball.y - 24), 'NUDGE!', '#ff5c7a');
+      beep(200, 0.12, 'square', 0.12, 150);
     }
     // wave cleared
     if (S.bricksLeft <= 0) {
