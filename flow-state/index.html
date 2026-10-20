@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Flow State — Day 26</title>
+<meta name="description" content="Flow State — 60 seconds of pipe-connecting puzzle chaos. Tap pipes to rotate them and connect the pump to the drain before time runs out.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#060a1c;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Flow State — Day 26. Pipe-connect puzzle: tap to rotate, flood the network,
+   reach the drain, chain levels. Board is always solvable: a random pump->drain
+   path is laid first, then every tile is scrambled. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+var FlowState = (function () {
+  var TAU = Math.PI * 2;
+  // directions: 0=N 1=E 2=S 3=W
+  var DX = [0, 1, 0, -1], DY = [-1, 0, 1, 0];
+  function opp(d) { return (d + 2) % 4; }
+  // tile types: 0 straight, 1 elbow, 2 tee, 3 cross, 4 pump(fixed), 5 drain(fixed)
+  var BASE = { 0: [0, 2], 1: [0, 1], 2: [0, 1, 3], 3: [0, 1, 2, 3] };
+  function openings(t, r) {
+    var b = BASE[t] || [];
+    var out = [];
+    for (var i = 0; i < b.length; i++) out.push((b[i] + r) % 4);
+    return out;
+  }
+  function hasOpen(t, r, d) { return openings(t, r).indexOf(d) >= 0; }
+  function openSet(t, r) { return openings(t, r).slice().sort().join(","); }
+
+  // WIDE PLAYFIELD: the world width scales with the viewport on wide screens
+  // (min 480 so mobile is unchanged), instead of a fixed 480 fit.
+  // Column count scales with viewport width; rows scale with level.
+  function computeWorld(vw) {
+    var cell = 80;
+    var cols = Math.round(vw / cell);
+    if (cols < 6) cols = 6;    // 6*80 = 480 minimum
+    if (cols > 14) cols = 14;  // cap at 1120 wide
+    return { cell: cell, cols: cols, w: cols * cell };
+  }
+  function rowsForLevel(level) {
+    var r = 5 + ((level - 1) >> 1);
+    return r > 8 ? 8 : r;
+  }
+  function scoreFor(pathLen, level) { return pathLen * 10 * level; }
+
+  function straightOrElbowRot(type, setStr) {
+    // find rotation whose openings match setStr
+    for (var r = 0; r < 4; r++) if (openSet(type, r) === setStr) return r;
+    return 0;
+  }
+
+  function genPath(cols, rows, pumpRow, rng) {
+    // random rightward-biased self-avoiding walk to the right edge;
+    // the end row becomes the drain row (guaranteed on-path)
+    for (var attempt = 0; attempt < 80; attempt++) {
+      var seen = {}, path = [{ x: 0, y: pumpRow }];
+      seen["0," + pumpRow] = 1;
+      var stuck = 0;
+      while (path[path.length - 1].x < cols - 1 && stuck < 4000) {
+        stuck++;
+        var cur = path[path.length - 1];
+        var cand = [];
+        var dirs = [[1, 0], [0, 1], [0, -1], [0, 1], [0, -1], [1, 0], [-1, 0]];
+        for (var i = 0; i < dirs.length; i++) {
+          var nx = cur.x + dirs[i][0], ny = cur.y + dirs[i][1];
+          if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+          if (seen[nx + "," + ny]) continue;
+          if (path.length === 1 && dirs[i][0] !== 1) continue; // pump only opens east
+          if (nx === cols - 1 && dirs[i][0] !== 1) continue;   // drain only opens west: arrive eastward
+          cand.push([nx, ny, dirs[i][0] === 1 ? 3 : 0]); // weight right moves
+        }
+        if (!cand.length) { path.pop(); continue; } // backtrack
+        cand.sort(function () { return rng() - 0.5; });
+        var pick = cand[0];
+        for (var k = 1; k < cand.length; k++) if (cand[k][2] > pick[2] && rng() < 0.75) { pick = cand[k]; break; }
+        seen[pick[0] + "," + pick[1]] = 1;
+        path.push({ x: pick[0], y: pick[1] });
+      }
+      var last = path[path.length - 1];
+      if (last && last.x === cols - 1 && path.length >= cols) return path;
+    }
+    // fallback: straight row path (always valid)
+    var fp = [];
+    for (var fx = 0; fx < cols; fx++) fp.push({ x: fx, y: pumpRow });
+    return fp;
+  }
+
+  function genBoard(wd, level, rng) {
+    rng = rng || Math.random;
+    var cols = wd.cols, rows = rowsForLevel(level), cell = wd.cell;
+    var pumpRow = 1 + Math.floor(rng() * (rows - 2));
+    var path = genPath(cols, rows, pumpRow, rng);
+    var drainRow = path[path.length - 1].y;
+    var tiles = [];
+    var i, x, y;
+    for (y = 0; y < rows; y++) for (x = 0; x < cols; x++) {
+      tiles.push({ t: Math.floor(rng() * 4), r: Math.floor(rng() * 4), fixed: false, sol: -1, anim: 0 });
+    }
+    var idx = function (xx, yy) { return yy * cols + xx; };
+    var onPath = {};
+    for (i = 0; i < path.length; i++) onPath[path[i].x + "," + path[i].y] = i;
+    var pumpIdx = idx(0, pumpRow), drainIdx = idx(cols - 1, drainRow);
+    // paint the solution path (interior cells)
+    for (i = 1; i < path.length - 1; i++) {
+      var p = path[i], pi = idx(p.x, p.y);
+      var prev = path[i - 1], next = path[i + 1];
+      var dIn = dirTo(p, prev), dOut = dirTo(p, next);
+      var setStr = [dIn, dOut].sort().join(",");
+      var type, rot;
+      if (setStr === "0,2" || setStr === "1,3") { type = 0; rot = straightOrElbowRot(0, setStr); }
+      else { type = 1; rot = straightOrElbowRot(1, setStr); }
+      var tile = tiles[pi];
+      tile.t = type; tile.sol = rot;
+      tile.r = (rot + 1 + Math.floor(rng() * 3)) % 4; // scramble: never starts solved
+    }
+    // pump + drain are fixed endpoints
+    tiles[pumpIdx].t = 4; tiles[pumpIdx].r = 0; tiles[pumpIdx].fixed = true;
+    tiles[drainIdx].t = 5; tiles[drainIdx].r = 0; tiles[drainIdx].fixed = true;
+    return { cols: cols, rows: rows, cell: cell, tiles: tiles, pumpIdx: pumpIdx, drainIdx: drainIdx, level: level };
+  }
+
+  function dirTo(a, b) {
+    var dx = b.x - a.x, dy = b.y - a.y;
+    for (var d = 0; d < 4; d++) if (DX[d] === dx && DY[d] === dy) return d;
+    return -1;
+  }
+
+  function typeOpenings(t, r) {
+    if (t === 4) return [1];      // pump opens east
+    if (t === 5) return [3];      // drain opens west
+    return openings(t, r);
+  }
+
+  function flood(board) {
+    var cols = board.cols, rows = board.rows, tiles = board.tiles;
+    var live = new Uint8Array(cols * rows);
+    var parent = new Int32Array(cols * rows);
+    for (var k = 0; k < parent.length; k++) parent[k] = -1;
+    var q = [board.pumpIdx];
+    live[board.pumpIdx] = 1;
+    var reached = false;
+    while (q.length) {
+      var i = q.pop();
+      if (i === board.drainIdx) { reached = true; break; }
+      var x = i % cols, y = (i / cols) | 0;
+      var tt = tiles[i];
+      var os = typeOpenings(tt.t, tt.r);
+      for (var o = 0; o < os.length; o++) {
+        var d = os[o];
+        var nx = x + DX[d], ny = y + DY[d];
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        var j = ny * cols + nx;
+        var nt = tiles[j];
+        if (typeOpenings(nt.t, nt.r).indexOf(opp(d)) < 0) continue;
+        if (!live[j]) { live[j] = 1; parent[j] = i; q.push(j); }
+      }
+    }
+    var path = [];
+    if (reached) {
+      var c = board.drainIdx;
+      while (c !== -1) { path.unshift(c); c = parent[c]; }
+    }
+    return { live: live, reached: reached, path: path };
+  }
+
+  function newState(wd, rng) {
+    rng = rng || Math.random;
+    var board = genBoard(wd, 1, rng);
+    var fl = flood(board);
+    return {
+      wd: wd, level: 1, board: board, live: fl.live, reached: false,
+      flowing: null, flowPath: [], score: 0, timeLeft: 60, over: false,
+      events: [], particles: [], flash: 0, shake: 0, tickMark: 6,
+      stats: { rotated: 0, solved: 0 }
+    };
+  }
+
+  function rotate(S, i) {
+    if (S.over || S.flowing) return false;
+    var tile = S.board.tiles[i];
+    if (!tile || tile.fixed) return false;
+    tile.r = (tile.r + 1) % 4;
+    tile.anim = 1;
+    S.stats.rotated++;
+    var fl = flood(S.board);
+    S.live = fl.live;
+    S.events.push({ type: "rotate" });
+    if (fl.reached && !S.reached) {
+      S.reached = true;
+      S.flowPath = fl.path;
+      S.flowing = { t: 0, dur: Math.min(1.6, 0.6 + fl.path.length * 0.06) };
+      S.events.push({ type: "flowstart", pathLen: fl.path.length });
+    }
+    return true;
+  }
+
+  function completeFlow(S) {
+    var pathLen = S.flowPath.length;
+    var pts = scoreFor(pathLen, S.level);
+    S.score += pts;
+    S.stats.solved++;
+    S.events.push({ type: "levelup", pts: pts, pathLen: pathLen, level: S.level });
+    S.flash = 0.8; S.shake = 8;
+    for (var k = 0; k < 40; k++) {
+      S.particles.push({
+        x: Math.random() * S.board.cols * S.board.cell,
+        y: Math.random() * rowsForLevel(S.level) * S.board.cell,
+        vx: (Math.random() - 0.5) * 260, vy: (Math.random() - 0.5) * 260,
+        life: 0.9, color: ["#35e8ff", "#ffd94d", "#ff5dd2", "#8dff6e"][k % 4]
+      });
+    }
+    S.level++;
+    S.board = genBoard(S.wd, S.level, Math.random);
+    var fl = flood(S.board);
+    S.live = fl.live; S.reached = false; S.flowing = null; S.flowPath = [];
+    S.events.push({ type: "newboard", level: S.level });
+  }
+
+  function endGame(S) {
+    if (S.over) return;
+    S.over = true;
+    S.events.push({ type: "end", score: S.score });
+  }
+
+  function update(S, dt) {
+    if (S.over) return;
+    if (S.flowing) {
+      S.flowing.t += dt;
+      if (S.flowing.t >= S.flowing.dur) completeFlow(S);
+      return;
+    }
+    S.timeLeft -= dt;
+    if (S.timeLeft <= 5.5 && S.tickMark > 0 && Math.ceil(S.timeLeft) < S.tickMark) {
+      S.tickMark = Math.ceil(S.timeLeft);
+      S.events.push({ type: "tick" });
+    }
+    if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(S); return; }
+    if (S.flash > 0) S.flash -= dt * 2;
+    if (S.shake > 0) S.shake -= dt * 40;
+  }
+
+  function bestUpdate(best, score) { return score > best ? score : best; }
+
+  // autoplay demo AI: rotate the first unsolved path tile toward its solution
+  function autoplay(S, dt) {
+    S.autoT = (S.autoT || 0) - dt;
+    if (S.autoT > 0 || S.over || S.flowing) return;
+    S.autoT = 0.12;
+    var tiles = S.board.tiles;
+    for (var i = 0; i < tiles.length; i++) {
+      if (tiles[i].sol >= 0 && tiles[i].r !== tiles[i].sol) { rotate(S, i); return; }
+    }
+  }
+
+  return {
+    computeWorld: computeWorld, rowsForLevel: rowsForLevel, scoreFor: scoreFor,
+    openings: openings, hasOpen: hasOpen, openSet: openSet,
+    genBoard: genBoard, genPath: genPath, flood: flood, newState: newState,
+    rotate: rotate, update: update, endGame: endGame, completeFlow: completeFlow,
+    bestUpdate: bestUpdate, autoplay: autoplay, typeOpenings: typeOpenings
+  };
+})();
+
+if (typeof module !== "undefined" && module.exports) module.exports = FlowState;
+
+/* ---------------- rendering + input (browser only) ---------------- */
+(function () {
+  if (typeof document === "undefined") return;
+  var canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  var WD = null, S = null, screen = "title", lastT = 0;
+  var best = 0;
+  var auto = /[?&]auto=1/.test(location.search);
+  try { best = parseInt(localStorage.getItem("flow_state_best") || "0", 10) || 0; } catch (e) {}
+
+  var muted = false;
+  try { muted = localStorage.getItem("flow_state_mute") === "1"; } catch (e) {}
+  var AC = null;
+  function beep(f, d, type, vol, slide) {
+    if (muted) return;
+    try {
+      AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type || "square"; o.frequency.setValueAtTime(f, AC.currentTime);
+      if (slide) o.frequency.exponentialRampToValueAtTime(slide, AC.currentTime + d);
+      g.gain.setValueAtTime(vol || 0.06, AC.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + d);
+      o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime + d);
+    } catch (e) {}
+  }
+  function buzz(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight; dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    WD = FlowState.computeWorld(vw);
+    fitBoard();
+  }
+  function boardW() { return S.board.cols * S.board.cell; }
+  function boardH() { return S.board.rows * S.board.cell; }
+  function fitBoard() {
+    if (!S) return;
+    scale = Math.min(vw / boardW(), (vh - 96) / boardH());
+    ox = (vw - boardW() * scale) / 2;
+    oy = 88 + ((vh - 96) - boardH() * scale) / 2;
+  }
+  window.addEventListener("resize", resize); resize();
+
+  function newGame() {
+    S = FlowState.newState(WD, Math.random);
+    fitBoard();
+    screen = "play"; lastT = performance.now();
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    var cx = (e.touches && e.touches[0] ? e.touches[0].clientX : e.clientX);
+    var cy = (e.touches && e.touches[0] ? e.touches[0].clientY : e.clientY);
+    return { x: (cx - r.left - ox) / scale, y: (cy - r.top - oy) / scale };
+  }
+
+  function press(e) {
+    if (screen === "title") { newGame(); if (e) e.preventDefault(); return; }
+    if (screen === "over") {
+      if (performance.now() - overAt > 800) newGame();
+      return;
+    }
+    var w = toWorld(e), cell = S.board.cell;
+    var x = Math.floor(w.x / cell), y = Math.floor(w.y / cell);
+    if (x < 0 || y < 0 || x >= S.board.cols || y >= S.board.rows) return;
+    if (FlowState.rotate(S, y * S.board.cols + x)) {
+      beep(700, 0.06, "square", 0.045);
+      buzz(12);
+    }
+    if (e.cancelable) e.preventDefault();
+  }
+  canvas.addEventListener("pointerdown", press);
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("flow_state_mute", muted ? "1" : "0"); } catch (x) {} return; }
+    if (e.key === " " || e.key === "Enter") { press(e); return; }
+  });
+  document.addEventListener("visibilitychange", function () { if (document.hidden && screen === "play") lastT = performance.now(); });
+
+  var overAt = 0;
+  var PIPE = ["#35e8ff", "#8dff6e", "#ffd94d", "#ff5dd2", "#b18cff"];
+  function pipeColor(i) { return PIPE[i % PIPE.length]; }
+
+  function drawTile(x, y, tile, live, now) {
+    var cell = S.board.cell, px = x * cell, py = y * cell;
+    ctx.save();
+    ctx.translate(px, py);
+    // tile bg — gradient created AFTER the translate, in local coords
+    var bg = ctx.createLinearGradient(0, 0, cell, cell);
+    bg.addColorStop(0, live ? "#15204a" : "#0d1330");
+    bg.addColorStop(1, live ? "#1a2a63" : "#0a0f28");
+    ctx.fillStyle = bg;
+    roundRect(2, 2, cell - 4, cell - 4, 10); ctx.fill();
+    ctx.strokeStyle = live ? "rgba(53,232,255,0.5)" : "rgba(90,110,220,0.25)";
+    ctx.lineWidth = 1.5;
+    roundRect(2, 2, cell - 4, cell - 4, 10); ctx.stroke();
+
+    var cx = cell / 2, cy = cell / 2, isEnd = tile.t >= 4;
+    var os = FlowState.typeOpenings(tile.t, tile.r);
+    var col = live ? "#35e8ff" : "#5a6a9e";
+    if (isEnd) col = live ? "#35e8ff" : "#8a7bd8";
+    ctx.save();
+    ctx.translate(cx, cy);
+    if (tile.anim > 0) ctx.rotate(-(tile.anim) * Math.PI / 2); // snappy clockwise spin
+    ctx.translate(-cx, -cy);
+    ctx.lineCap = "round";
+    ctx.lineWidth = cell * 0.30;
+    ctx.strokeStyle = "#232c5e";
+    ctx.beginPath();
+    for (var o = 0; o < os.length; o++) {
+      var d = os[o];
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + (d === 1 ? cx : d === 3 ? -cx : 0), cy + (d === 2 ? cy : d === 0 ? -cy : 0));
+    }
+    ctx.stroke();
+    ctx.lineWidth = cell * 0.20;
+    if (live) { ctx.shadowColor = col; ctx.shadowBlur = 14; }
+    ctx.strokeStyle = col;
+    ctx.beginPath();
+    for (var q = 0; q < os.length; q++) {
+      var d2 = os[q];
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + (d2 === 1 ? cx : d2 === 3 ? -cx : 0), cy + (d2 === 2 ? cy : d2 === 0 ? -cy : 0));
+    }
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    // center hub
+    ctx.fillStyle = isEnd ? col : (live ? "#dffbff" : "#3a4670");
+    ctx.beginPath(); ctx.arc(cx, cy, cell * 0.16, 0, 6.2832); ctx.fill();
+    ctx.restore();
+
+    if (isEnd) {
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.font = "800 " + Math.round(cell * 0.22) + "px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillStyle = live ? "#ffffff" : "#8a7bd8";
+      ctx.fillText(tile.t === 4 ? "IN" : "OUT", cx, cell - cell * 0.14);
+      var gg = ctx.createRadialGradient(cx, cy, 2, cx, cy, cell * 0.5);
+      gg.addColorStop(0, tile.t === 4 ? "rgba(53,232,255,0.9)" : "rgba(255,93,210,0.9)");
+      gg.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = gg;
+      ctx.beginPath(); ctx.arc(cx, cy, cell * 0.5, 0, 6.2832); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  function roundRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function render(now) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#060a1c"; ctx.fillRect(0, 0, vw, vh);
+    ctx.setTransform(scale * dpr, 0, 0, scale * dpr, ox * dpr, oy * dpr);
+    if (S && S.shake > 0) ctx.translate((Math.random() - 0.5) * S.shake, (Math.random() - 0.5) * S.shake);
+    if (screen === "title") { drawTitle(now); return; }
+    var cols = S.board.cols, rows = S.board.rows, cell = S.board.cell;
+
+    // board bg
+    ctx.fillStyle = "#080d24";
+    roundRect(-8, -8, cols * cell + 16, rows * cell + 16, 16); ctx.fill();
+
+    for (var y = 0; y < rows; y++) for (var x = 0; x < cols; x++) {
+      var i = y * cols + x;
+      drawTile(x, y, S.board.tiles[i], S.live[i], now);
+    }
+
+    // flowing water animation along the solved path
+    if (S.flowing && S.flowPath.length > 1) {
+      var prog = Math.min(1, S.flowing.t / S.flowing.dur);
+      var segs = S.flowPath.length - 1;
+      var head = prog * segs;
+      for (var s2 = 0; s2 <= Math.floor(head); s2++) {
+        var ci = S.flowPath[s2], ccx = (ci % cols + 0.5) * cell, ccy = (((ci / cols) | 0) + 0.5) * cell;
+        var wg = ctx.createRadialGradient(ccx, ccy, 1, ccx, ccy, cell * 0.42);
+        wg.addColorStop(0, "#ffffff"); wg.addColorStop(0.5, "#35e8ff"); wg.addColorStop(1, "rgba(53,232,255,0)");
+        ctx.fillStyle = wg;
+        ctx.beginPath(); ctx.arc(ccx, ccy, cell * 0.42, 0, 6.2832); ctx.fill();
+      }
+      // bright moving head
+      var hi = Math.min(segs, Math.floor(head)), hf = head - hi;
+      var a = S.flowPath[hi], b = S.flowPath[Math.min(segs, hi + 1)];
+      var hx = ((a % cols) + 0.5) * cell * (1 - hf) + ((b % cols) + 0.5) * cell * hf;
+      var hy = ((((a / cols) | 0)) + 0.5) * cell * (1 - hf) + ((((b / cols) | 0)) + 0.5) * cell * hf;
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath(); ctx.arc(hx, hy, cell * 0.18, 0, 6.2832); ctx.fill();
+    }
+
+    // particles
+    for (var pi = S.particles.length - 1; pi >= 0; pi--) {
+      var pt = S.particles[pi];
+      ctx.globalAlpha = Math.max(0, pt.life);
+      ctx.fillStyle = pt.color;
+      ctx.fillRect(pt.x - 3, pt.y - 3, 6, 6);
+      ctx.globalAlpha = 1;
+    }
+
+    // HUD (screen space)
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "#e8ecff"; ctx.font = "700 22px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("LVL " + S.level, 14, 32);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffd94d"; ctx.font = "800 30px 'Segoe UI',system-ui,sans-serif";
+    var tcol = S.timeLeft <= 10 ? "#ff5d7e" : "#ffd94d";
+    ctx.fillStyle = tcol;
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", vw / 2, 36);
+    ctx.textAlign = "right"; ctx.fillStyle = "#35e8ff"; ctx.font = "800 22px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(S.score, vw - 14, 32);
+    ctx.fillStyle = "#7780b8"; ctx.font = "12px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("best " + best + " · M: " + (muted ? "unmute" : "mute"), vw - 14, 54);
+    ctx.textAlign = "left";
+    ctx.fillText("Tap a pipe to rotate it", 14, 54);
+    if (S.flash > 0) { ctx.fillStyle = "rgba(53,232,255," + (S.flash * 0.35) + ")"; ctx.fillRect(0, 0, vw, vh); }
+    if (screen === "over") drawOver();
+  }
+
+  function drawTitle(now) {
+    var w = S ? boardW() : WD.w;
+    var h = S ? boardH() : 480;
+    ctx.fillStyle = "#060a1c"; ctx.fillRect(0, 0, w, h);
+    ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    var tg = ctx.createLinearGradient(0, h / 2 - 130, 0, h / 2 - 50);
+    tg.addColorStop(0, "#35e8ff"); tg.addColorStop(1, "#ff5dd2");
+    ctx.fillStyle = tg;
+    ctx.font = "800 72px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("FLOW STATE", w / 2, h / 2 - 110);
+    ctx.fillStyle = "#aab4e8"; ctx.font = "21px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("Tap pipes to rotate them. Connect the pump to the drain.", w / 2, h / 2 - 55);
+    ctx.fillText("Faster boards = bigger scores. 60 seconds on the clock.", w / 2, h / 2 - 22);
+    if (best > 0) { ctx.fillStyle = "#ffd94d"; ctx.font = "20px 'Segoe UI',system-ui,sans-serif"; ctx.fillText("BEST " + best, w / 2, h / 2 + 18); }
+    var pulse = 0.6 + 0.4 * Math.sin(now / 400);
+    ctx.fillStyle = "rgba(53,232,255," + pulse + ")";
+    ctx.font = "800 28px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(auto ? "AUTO DEMO" : "TAP TO START", w / 2, h / 2 + 70);
+    ctx.fillStyle = "#7780b8"; ctx.font = "16px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("Solve a board to grow the grid", w / 2, h / 2 + 108);
+    if (auto) { newGame(); }
+  }
+
+  function drawOver() {
+    ctx.fillStyle = "rgba(4,6,16,0.85)"; ctx.fillRect(0, 0, vw, vh);
+    ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    ctx.fillStyle = "#35e8ff";
+    ctx.font = "800 48px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("TIME UP!", vw / 2, vh / 2 - 70);
+    ctx.fillStyle = "#aab4e8"; ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("Solved " + S.stats.solved + " boards · " + S.stats.rotated + " rotations", vw / 2, vh / 2 - 22);
+    ctx.fillStyle = "#ffd94d"; ctx.font = "800 36px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("SCORE " + S.score, vw / 2, vh / 2 + 32);
+    if (S.score > best) {
+      ctx.fillStyle = "#ff5dd2"; ctx.font = "22px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("NEW BEST!", vw / 2, vh / 2 + 68);
+    } else { ctx.fillStyle = "#7780b8"; ctx.font = "18px 'Segoe UI',system-ui,sans-serif"; ctx.fillText("Best " + best, vw / 2, vh / 2 + 68); }
+    ctx.fillStyle = "#aab4e8"; ctx.font = "18px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("Tap to play again", vw / 2, vh / 2 + 112);
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = Math.min(0.05, (now - lastT) / 1000 || 0.016); lastT = now;
+    if (screen !== "play" || !S) { render(now); return; }
+    if (auto) FlowState.autoplay(S, dt);
+    FlowState.update(S, dt);
+    for (var i = 0; i < S.events.length; i++) {
+      var ev = S.events[i];
+      if (ev.type === "rotate") { /* click already beeped on input */ }
+      else if (ev.type === "flowstart") {
+        beep(440, 0.5, "sine", 0.08, 1320);
+        buzz([20, 30, 20, 30, 40]);
+      }
+      else if (ev.type === "levelup") {
+        beep(660, 0.12, "square", 0.06);
+        setTimeout(function () { beep(880, 0.12, "square", 0.06); }, 110);
+        setTimeout(function () { beep(1320, 0.22, "square", 0.06); }, 220);
+        buzz([40, 50, 80]);
+      }
+      else if (ev.type === "newboard") { /* silent */ }
+      else if (ev.type === "tick") { beep(980, 0.07, "square", 0.05); }
+      else if (ev.type === "end") {
+        overAt = performance.now(); screen = "over";
+        beep(520, 0.6, "triangle", 0.08, 130);
+        buzz([80, 60, 120]);
+        if (S.score > best) { best = S.score; try { localStorage.setItem("flow_state_best", String(best)); } catch (e) {} }
+      }
+    }
+    S.events.length = 0;
+    // animate rotations + particles
+    var tiles = S.board.tiles;
+    for (var t = 0; t < tiles.length; t++) if (tiles[t].anim > 0) tiles[t].anim = Math.max(0, tiles[t].anim - dt * 8);
+    for (var pi = S.particles.length - 1; pi >= 0; pi--) {
+      var pt = S.particles[pi];
+      pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.life -= dt * 1.1;
+      if (pt.life <= 0) S.particles.splice(pi, 1);
+    }
+    render(now);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
