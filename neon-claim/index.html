@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Claim — Day 25</title>
+<meta name="description" content="Neon Claim — 60 seconds of territory-claiming chaos. Carve out neon turf, dodge the static orbs, chain golden sparks.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070a18;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Claim — Day 25. Territory claimer: carve turf, dodge static orbs, grab sparks. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+var NeonClaim = (function () {
+  var TAU = Math.PI * 2;
+
+  // WIDE PLAYFIELD: the world width scales with the viewport on wide screens
+  // (min 480 so mobile is unchanged), instead of the old fixed 480 fit.
+  function computeWorld(vw) {
+    var cell = 14;
+    var cols = Math.round((vw - 24) / cell);
+    if (cols < 35) cols = 35;   // 35*14 = 490 >= 480 minimum
+    if (cols > 96) cols = 96;   // cap at 1344 wide
+    var rows = 44;
+    return { cell: cell, cols: cols, rows: rows, w: cols * cell, h: rows * cell };
+  }
+
+  function newState(wd, rng) {
+    rng = rng || Math.random;
+    var cols = wd.cols, rows = wd.rows;
+    var grid = new Uint8Array(cols * rows); // 0 unclaimed, 1 claimed, 2 trail
+    // home block, bottom center
+    var hx0 = Math.floor(cols / 2) - 4, hx1 = Math.floor(cols / 2) + 4;
+    var hy0 = rows - 8, hy1 = rows - 2;
+    var claimed = 0;
+    for (var y = hy0; y <= hy1; y++) for (var x = hx0; x <= hx1; x++) {
+      grid[y * cols + x] = 1; claimed++;
+    }
+    var S = {
+      wd: wd, cols: cols, rows: rows, grid: grid, claimed: claimed,
+      player: { cx: Math.floor(cols / 2), cy: rows - 5, dir: [0, -1], ndir: null },
+      trail: [], hazards: [], sparks: [],
+      hearts: 3, timeLeft: 60, over: false, win: false,
+      score: 0, bonus: 0, sparkT: 0, respawnT: 0, invulnT: 0,
+      target: null, autoT: 0, autoDirT: 0,
+      shake: 0, flash: 0, particles: [], events: []
+    };
+    var n = 3;
+    for (var i = 0; i < n; i++) spawnHazard(S, rng);
+    return S;
+  }
+
+  function rnd(rng, a, b) { return a + rng() * (b - a); }
+
+  function randomUnclaimedCell(S, rng) {
+    for (var t = 0; t < 200; t++) {
+      var x = 1 + Math.floor(rng() * (S.cols - 2));
+      var y = 1 + Math.floor(rng() * (S.rows - 2));
+      if (S.grid[y * S.cols + x] === 0) return { x: x, y: y };
+    }
+    return null;
+  }
+
+  function spawnHazard(S, rng) {
+    rng = rng || Math.random;
+    var c = randomUnclaimedCell(S, rng) || { x: S.cols >> 1, y: 4 };
+    var ang = rng() * TAU, sp = rnd(rng, 80, 110);
+    S.hazards.push({
+      x: (c.x + 0.5) * S.wd.cell, y: (c.y + 0.5) * S.wd.cell,
+      vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp, r: 9, dead: false
+    });
+  }
+
+  function spawnSpark(S, rng) {
+    rng = rng || Math.random;
+    var c = randomUnclaimedCell(S, rng);
+    if (!c) return;
+    S.sparks.push({ x: (c.x + 0.5) * S.wd.cell, y: (c.y + 0.5) * S.wd.cell, cx: c.x, cy: c.y, t: 12 });
+  }
+
+  function cellAt(S, px, py) {
+    var x = Math.floor(px / S.wd.cell), y = Math.floor(py / S.wd.cell);
+    if (x < 0 || y < 0 || x >= S.cols || y >= S.rows) return -1;
+    return S.grid[y * S.cols + x];
+  }
+
+  function claimedPct(S) { return S.claimed / (S.cols * S.rows) * 100; }
+
+  function loseLife(S, why) {
+    if (S.invulnT > 0 || S.over) return;
+    S.hearts--;
+    S.events.push({ type: "hit", why: why });
+    S.shake = 14; S.flash = 0.7;
+    // clear the trail
+    for (var i = 0; i < S.trail.length; i++) S.grid[S.trail[i].y * S.cols + S.trail[i].x] = 0;
+    S.trail.length = 0;
+    // respawn at home
+    S.player.cx = Math.floor(S.cols / 2); S.player.cy = S.rows - 5;
+    S.player.dir = [0, -1]; S.player.ndir = null; S.target = null;
+    S.player.px = undefined; S.player.py = undefined; S.retreat = false;
+    S.invulnT = 2;
+    if (S.hearts <= 0) endGame(S, false);
+  }
+
+  function completeClaim(S) {
+    var cols = S.cols, cell = S.wd.cell;
+    for (var i = 0; i < S.trail.length; i++) S.grid[S.trail[i].y * cols + S.trail[i].x] = 1;
+    // BFS from every hazard over unclaimed cells -> the "safe" region
+    var seen = new Uint8Array(cols * S.rows), q = [];
+    for (var h = 0; h < S.hazards.length; h++) {
+      var hz = S.hazards[h]; if (hz.dead) continue;
+      var cx = Math.floor(hz.x / cell), cy = Math.floor(hz.y / cell);
+      if (cx < 0 || cy < 0 || cx >= cols || cy >= S.rows) continue;
+      var si = cy * cols + cx;
+      if (S.grid[si] === 0 && !seen[si]) { seen[si] = 1; q.push(si); }
+    }
+    while (q.length) {
+      var cur = q.pop(), x = cur % cols, y = (cur / cols) | 0;
+      if (x > 0) tryPush(cur - 1); if (x < cols - 1) tryPush(cur + 1);
+      if (y > 0) tryPush(cur - cols); if (y < S.rows - 1) tryPush(cur + cols);
+    }
+    function tryPush(j) { if (!seen[j] && S.grid[j] === 0) { seen[j] = 1; q.push(j); } }
+    var gained = 0, kills = 0;
+    for (var k = 0; k < S.grid.length; k++) {
+      if (S.grid[k] === 0 && !seen[k]) { S.grid[k] = 1; gained++; }
+    }
+    // hazards caught inside the new claim are destroyed
+    for (var m = 0; m < S.hazards.length; m++) {
+      var hz2 = S.hazards[m]; if (hz2.dead) continue;
+      var hx = Math.floor(hz2.x / cell), hy = Math.floor(hz2.y / cell);
+      if (hx >= 0 && hy >= 0 && hx < cols && hy < S.rows && S.grid[hy * cols + hx] === 1) {
+        hz2.dead = true; kills++;
+        S.events.push({ type: "kill", x: hz2.x, y: hz2.y });
+      }
+    }
+    S.trail.length = 0;
+    S.claimed = countClaimed(S);
+    var pts = gained + kills * 500;
+    S.score += pts;
+    S.events.push({ type: "claim", gained: gained, kills: kills });
+    if (gained >= 60) S.events.push({ type: "bigclaim" });
+    return { gained: gained, kills: kills };
+  }
+
+  function countClaimed(S) {
+    var n = 0;
+    for (var i = 0; i < S.grid.length; i++) if (S.grid[i] === 1) n++;
+    return n;
+  }
+
+  function discClaim(S, cx, cy, rad) {
+    var kills = 0, gained = 0;
+    for (var y = cy - rad; y <= cy + rad; y++) for (var x = cx - rad; x <= cx + rad; x++) {
+      if (x < 0 || y < 0 || x >= S.cols || y >= S.rows) continue;
+      var dx = x - cx, dy = y - cy;
+      if (dx * dx + dy * dy > rad * rad) continue;
+      var i = y * S.cols + x;
+      if (S.grid[i] === 0) { S.grid[i] = 1; gained++; }
+    }
+    for (var h = 0; h < S.hazards.length; h++) {
+      var hz = S.hazards[h]; if (hz.dead) continue;
+      var hx = Math.floor(hz.x / S.wd.cell), hy = Math.floor(hz.y / S.wd.cell);
+      var ddx = hx - cx, ddy = hy - cy;
+      if (ddx * ddx + ddy * ddy <= rad * rad) {
+        hz.dead = true; kills++;
+        S.events.push({ type: "kill", x: hz.x, y: hz.y });
+      }
+    }
+    S.claimed = countClaimed(S);
+    return { gained: gained, kills: kills };
+  }
+
+  function steerToward(S, tx, ty) {
+    // tap-to-steer: pick the axis with the larger delta (retracing your own
+    // trail is safe, so reversals are allowed)
+    var p = S.player;
+    var dx = tx - p.cx, dy = ty - p.cy;
+    if (dx === 0 && dy === 0) return;
+    if (Math.abs(dx) >= Math.abs(dy)) p.ndir = [dx > 0 ? 1 : -1, 0];
+    else p.ndir = [0, dy > 0 ? 1 : -1];
+  }
+
+  function tickMove(S) {
+    var p = S.player, cols = S.cols, rows = S.rows;
+    if (S.retreat) {
+      // walk back along the breadcrumb trail to safety
+      if (p.px !== undefined) p.ndir = [p.px - p.cx, p.py - p.cy];
+    } else if (S.target) steerToward(S, S.target.x, S.target.y);
+    if (p.ndir) { p.dir = p.ndir; p.ndir = null; }
+    var nx = p.cx + p.dir[0], ny = p.cy + p.dir[1];
+    if (nx < 0) nx = 0; if (ny < 0) ny = 0; if (nx >= cols) nx = cols - 1; if (ny >= rows) ny = rows - 1;
+    var idx = ny * cols + nx, v = S.grid[idx];
+    p.px = p.cx; p.py = p.cy;
+    if (v === 1) {
+      if (S.trail.length > 0) completeClaim(S);            // closed a loop -> claim!
+      S.retreat = false;
+    } else if (v === 2) {
+      // retracing your own trail is safe: step back, don't extend it
+    } else {
+      S.grid[idx] = 2;
+      S.trail.push({ x: nx, y: ny });
+    }
+    p.cx = nx; p.cy = ny;
+  }
+
+  function updateHazards(S, dt, rng) {
+    rng = rng || Math.random;
+    var cell = S.wd.cell;
+    for (var i = 0; i < S.hazards.length; i++) {
+      var hz = S.hazards[i]; if (hz.dead) continue;
+      var nx = hz.x + hz.vx * dt, ny = hz.y + hz.vy * dt;
+      var r = hz.r;
+      var hitX = cellAt(S, nx + (hz.vx > 0 ? r : -r), hz.y) !== 0;
+      var hitY = cellAt(S, hz.x, ny + (hz.vy > 0 ? r : -r)) !== 0;
+      if (hitX) { hz.vx = -hz.vx; nx = hz.x; }
+      if (hitY) { hz.vy = -hz.vy; ny = hz.y; }
+      hz.x = nx; hz.y = ny;
+      // hazard touches the trail -> cut it
+      var cx = Math.floor(hz.x / cell), cy = Math.floor(hz.y / cell);
+      var ci = cy * S.cols + cx;
+      if (cx >= 0 && cy >= 0 && cx < S.cols && cy < S.rows && S.grid[ci] === 2) {
+        loseLife(S, "trail"); continue;
+      }
+      // hazard touches the player while the player is exposed
+      var p = S.player;
+      var pcx = (p.cx + 0.5) * cell, pcy = (p.cy + 0.5) * cell;
+      var ddx = hz.x - pcx, ddy = hz.y - pcy;
+      var exposed = S.grid[p.cy * S.cols + p.cx] !== 1;
+      if (exposed && ddx * ddx + ddy * ddy < (r + 8) * (r + 8)) loseLife(S, "body");
+    }
+    // respawn destroyed hazards to keep the pressure on
+    S.respawnT -= dt;
+    if (S.respawnT <= 0) {
+      var alive = S.hazards.filter(function (h) { return !h.dead; }).length;
+      if (alive < 3) spawnHazard(S, rng);
+      S.respawnT = 8;
+    }
+    S.hazards = S.hazards.filter(function (h) { return !h.dead || (h.deadT = (h.deadT || 0) + dt) < 1.2; });
+  }
+
+  function updateSparks(S, dt) {
+    S.sparkT -= dt;
+    if (S.sparkT <= 0) { if (S.sparks.length < 3) spawnSpark(S, Math.random); S.sparkT = 7; }
+    var p = S.player, cell = S.wd.cell;
+    for (var i = S.sparks.length - 1; i >= 0; i--) {
+      var sp = S.sparks[i];
+      sp.t -= dt;
+      if (sp.t <= 0) { S.sparks.splice(i, 1); continue; }
+      if (p.cx === sp.cx && p.cy === sp.cy) {
+        var res = discClaim(S, sp.cx, sp.cy, 5);
+        S.score += 250 + res.kills * 500;
+        S.events.push({ type: "spark", gained: res.gained, kills: res.kills });
+        S.sparks.splice(i, 1);
+      }
+    }
+  }
+
+  function autoplay(S, dt) {
+    // demo AI: carve small loops near home, retreat along breadcrumbs when a
+    // hazard closes in on any part of the trail
+    var p = S.player;
+    S.autoT -= dt;
+    if (S.autoT > 0) return;
+    S.autoT = 0.4;
+    var exposed = S.grid[p.cy * S.cols + p.cx] !== 1;
+    var danger = false;
+    if (exposed && S.trail.length > 1) {
+      for (var ti = 0; ti < S.trail.length && !danger; ti += 2) {
+        var tc = S.trail[ti];
+        var tx = (tc.x + 0.5) * S.wd.cell, ty = (tc.y + 0.5) * S.wd.cell;
+        for (var i = 0; i < S.hazards.length; i++) {
+          var hz = S.hazards[i]; if (hz.dead) continue;
+          var dx = hz.x - tx, dy = hz.y - ty;
+          if (dx * dx + dy * dy < 110 * 110) { danger = true; break; }
+        }
+      }
+    }
+    if (danger || (exposed && S.trail.length > 24)) {
+      S.retreat = true; // tickMove walks the breadcrumbs back home
+    } else if (!exposed && S.autoDirT <= 0) {
+      var dirs = [[1, 0], [-1, 0], [0, -1], [0, 1]];
+      p.ndir = dirs[(Math.random() * 4) | 0];
+      S.autoDirT = 0.9;
+    }
+    S.autoDirT -= 0.4;
+    if (exposed && !danger && !S.retreat) {
+      var t = S.trail.length;
+      if (t < 8) p.ndir = [0, -1];
+      else if (t < 20 && p.cx < S.cols - 6) p.ndir = [1, 0];
+      else steerToward(S, Math.floor(S.cols / 2), S.rows - 5);
+    }
+  }
+
+  function endGame(S, win) {
+    if (S.over) return;
+    S.over = true; S.win = win;
+    var pct = claimedPct(S);
+    S.score = Math.round(pct * 10) + (S.hearts === 3 ? 500 : 0) + S.score;
+    S.events.push({ type: "end", win: win, pct: pct });
+  }
+
+  function update(S, dt, rng) {
+    if (S.over) return;
+    S.timeLeft -= dt;
+    if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(S, true); return; }
+    if (S.invulnT > 0) S.invulnT -= dt;
+    if (S.shake > 0) S.shake -= dt * 40;
+    if (S.flash > 0) S.flash -= dt * 2;
+    updateHazards(S, dt, rng);
+    updateSparks(S, dt);
+  }
+
+  return {
+    computeWorld: computeWorld, newState: newState, tickMove: tickMove,
+    update: update, completeClaim: completeClaim, discClaim: discClaim,
+    claimedPct: claimedPct, loseLife: loseLife, endGame: endGame,
+    spawnSpark: spawnSpark, spawnHazard: spawnHazard, autoplay: autoplay,
+    steerToward: steerToward
+  };
+})();
+
+if (typeof module !== "undefined" && module.exports) module.exports = NeonClaim;
+
+/* ---------------- rendering + input (browser only) ---------------- */
+(function () {
+  if (typeof document === "undefined") return;
+  var canvas = document.getElementById("c"), ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  var WD = null, S = null, screen = "title", lastT = 0, moveAcc = 0, best = 0;
+  var auto = /[?&]auto=1/.test(location.search);
+  try { best = parseInt(localStorage.getItem("neon_claim_best") || "0", 10) || 0; } catch (e) {}
+
+  var muted = false;
+  try { muted = localStorage.getItem("neon_claim_mute") === "1"; } catch (e) {}
+  var AC = null;
+  function beep(f, d, type, vol) {
+    if (muted) return;
+    try {
+      AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type || "square"; o.frequency.value = f;
+      g.gain.setValueAtTime(vol || 0.06, AC.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + d);
+      o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime + d);
+    } catch (e) {}
+  }
+  function buzz(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight; dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    WD = NeonClaim.computeWorld(vw);
+    scale = Math.min(vw / WD.w, vh / WD.h);
+    ox = (vw - WD.w * scale) / 2; oy = (vh - WD.h * scale) / 2;
+  }
+  window.addEventListener("resize", resize); resize();
+
+  function newGame() {
+    S = NeonClaim.newState(WD, Math.random);
+    screen = "play"; lastT = performance.now(); moveAcc = 0;
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    var cx = (e.touches && e.touches[0] ? e.touches[0].clientX : e.clientX);
+    var cy = (e.touches && e.touches[0] ? e.touches[0].clientY : e.clientY);
+    return { x: (cx - r.left - ox) / scale, y: (cy - r.top - oy) / scale };
+  }
+
+  function press(e) {
+    if (screen === "title") { newGame(); if (e) e.preventDefault(); return; }
+    if (screen === "over") {
+      var w = toWorld(e);
+      // tap anywhere to replay
+      if (performance.now() - overAt > 800) { newGame(); }
+      return;
+    }
+    var w2 = toWorld(e), cell = WD.cell;
+    S.target = { x: Math.floor(w2.x / cell), y: Math.floor(w2.y / cell) };
+    if (S.target.x < 0) S.target.x = 0; if (S.target.y < 0) S.target.y = 0;
+    if (S.target.x >= WD.cols) S.target.x = WD.cols - 1;
+    if (S.target.y >= WD.rows) S.target.y = WD.rows - 1;
+    if (e.cancelable) e.preventDefault();
+  }
+  canvas.addEventListener("pointerdown", press);
+  var keymap = { ArrowUp: [0, -1], ArrowDown: [0, 1], ArrowLeft: [-1, 0], ArrowRight: [1, 0], w: [0, -1], s: [0, 1], a: [-1, 0], d: [1, 0], W: [0, -1], S: [0, 1], A: [-1, 0], D: [1, 0] };
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_claim_mute", muted ? "1" : "0"); } catch (x) {} return; }
+    if (e.key === " " || e.key === "Enter") { press(e); return; }
+    var d = keymap[e.key];
+    if (d && S && screen === "play") { S.player.ndir = d; S.target = null; e.preventDefault(); }
+  });
+  document.addEventListener("visibilitychange", function () { if (document.hidden && screen === "play") lastT = performance.now(); });
+
+  var overAt = 0;
+
+  function drawCell(x, y, color) {
+    var c = WD.cell;
+    ctx.fillStyle = color;
+    ctx.fillRect(x * c + 0.5, y * c + 0.5, c - 1, c - 1);
+  }
+
+  function render(now) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070a18"; ctx.fillRect(0, 0, vw, vh);
+    ctx.setTransform(scale * dpr, 0, 0, scale * dpr, ox * dpr, oy * dpr);
+    if (S && S.shake > 0) ctx.translate((Math.random() - 0.5) * S.shake, (Math.random() - 0.5) * S.shake);
+
+    if (screen === "title") {
+      drawTitle(now); return;
+    }
+    // board
+    ctx.fillStyle = "#0b1026"; ctx.fillRect(0, 0, WD.w, WD.h);
+    // faint grid
+    ctx.strokeStyle = "rgba(90,110,220,0.07)"; ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var gx = 0; gx <= WD.cols; gx += 4) { ctx.moveTo(gx * WD.cell, 0); ctx.lineTo(gx * WD.cell, WD.h); }
+    for (var gy = 0; gy <= WD.rows; gy += 4) { ctx.moveTo(0, gy * WD.cell); ctx.lineTo(WD.w, gy * WD.cell); }
+    ctx.stroke();
+    // claimed
+    for (var y = 0; y < WD.rows; y++) for (var x = 0; x < WD.cols; x++) {
+      var v = S.grid[y * WD.cols + x];
+      if (v === 1) drawCell(x, y, "rgba(0,229,255,0.28)");
+      else if (v === 2) drawCell(x, y, "#ff3fd4");
+    }
+    // sparks
+    for (var s = 0; s < S.sparks.length; s++) {
+      var sp = S.sparks[s], pulse = 0.7 + 0.3 * Math.sin(now / 150 + s);
+      ctx.fillStyle = "#ffd94d";
+      ctx.beginPath();
+      var sx = sp.x, sy = sp.y, r = 9 * pulse;
+      for (var k = 0; k < 10; k++) {
+        var rr = k % 2 ? r * 0.45 : r, aa = k * Math.PI / 5 - Math.PI / 2;
+        ctx[k ? "lineTo" : "moveTo"](sx + Math.cos(aa) * rr, sy + Math.sin(aa) * rr);
+      }
+      ctx.closePath(); ctx.fill();
+    }
+    // hazards
+    for (var h = 0; h < S.hazards.length; h++) {
+      var hz = S.hazards[h]; if (hz.dead) continue;
+      var hg = ctx.createRadialGradient(hz.x, hz.y, 1, hz.x, hz.y, hz.r * 2.2);
+      hg.addColorStop(0, "#ff5d5d"); hg.addColorStop(1, "rgba(255,40,40,0)");
+      ctx.fillStyle = hg;
+      ctx.beginPath(); ctx.arc(hz.x, hz.y, hz.r * 2.2, 0, 6.2832); ctx.fill();
+      ctx.fillStyle = "#ff2222";
+      ctx.beginPath(); ctx.arc(hz.x, hz.y, hz.r, 0, 6.2832); ctx.fill();
+    }
+    // player
+    var p = S.player, px = (p.cx + 0.5) * WD.cell, py = (p.cy + 0.5) * WD.cell;
+    if (!(S.invulnT > 0 && Math.floor(now / 120) % 2 === 0)) {
+      var pg = ctx.createRadialGradient(px, py, 1, px, py, 22);
+      pg.addColorStop(0, "#ffffff"); pg.addColorStop(0.4, "#5df2ff"); pg.addColorStop(1, "rgba(0,229,255,0)");
+      ctx.fillStyle = pg;
+      ctx.beginPath(); ctx.arc(px, py, 22, 0, 6.2832); ctx.fill();
+    }
+    // particles
+    for (var pi = S.particles.length - 1; pi >= 0; pi--) {
+      var pt = S.particles[pi];
+      ctx.globalAlpha = Math.max(0, pt.life);
+      ctx.fillStyle = pt.color;
+      ctx.fillRect(pt.x - 2, pt.y - 2, 4, 4);
+      ctx.globalAlpha = 1;
+    }
+    // HUD
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    var pct = NeonClaim.claimedPct(S);
+    ctx.fillStyle = "#e8ecff"; ctx.font = "700 22px 'Segoe UI',system-ui,sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("CLAIMED " + pct.toFixed(1) + "%", 14, 32);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffd94d"; ctx.font = "800 26px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", vw / 2, 34);
+    ctx.textAlign = "right"; ctx.fillStyle = "#ff8cd1";
+    var hearts = ""; for (var hh = 0; hh < 3; hh++) hearts += hh < S.hearts ? "❤" : "🖤";
+    ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(hearts, vw - 14, 32);
+    ctx.fillStyle = "#7780b8"; ctx.font = "12px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(muted ? "M: unmute" : "M: mute", vw - 14, 52);
+    if (S.flash > 0) { ctx.fillStyle = "rgba(255,40,60," + (S.flash * 0.5) + ")"; ctx.fillRect(0, 0, vw, vh); }
+    if (screen === "over") drawOver();
+  }
+
+  function drawTitle(now) {
+    ctx.fillStyle = "#070a18"; ctx.fillRect(0, 0, WD.w, WD.h);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#5df2ff"; ctx.font = "800 64px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("NEON CLAIM", WD.w / 2, WD.h / 2 - 90);
+    ctx.fillStyle = "#aab4e8"; ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("Carve out neon turf. Close a loop to claim it.", WD.w / 2, WD.h / 2 - 40);
+    ctx.fillText("Red static orbs cut your trail — 3 hits and you're done.", WD.w / 2, WD.h / 2 - 10);
+    ctx.fillText("Gold sparks blast-claim a zone. 60 seconds. Go big.", WD.w / 2, WD.h / 2 + 20);
+    if (best > 0) { ctx.fillStyle = "#ffd94d"; ctx.fillText("BEST " + best, WD.w / 2, WD.h / 2 + 58); }
+    var pulse = 0.6 + 0.4 * Math.sin(now / 400);
+    ctx.fillStyle = "rgba(93,242,255," + pulse + ")";
+    ctx.font = "800 26px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(auto ? "AUTO DEMO" : "TAP TO START", WD.w / 2, WD.h / 2 + 110);
+    ctx.fillStyle = "#7780b8"; ctx.font = "15px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("Arrows/WASD or tap to steer", WD.w / 2, WD.h / 2 + 145);
+    if (auto) { newGame(); }
+  }
+
+  function drawOver() {
+    ctx.fillStyle = "rgba(4,6,16,0.82)"; ctx.fillRect(0, 0, vw, vh);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.win ? "#5df2ff" : "#ff5d7e";
+    ctx.font = "800 46px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(S.win ? "TIME UP!" : "WIPED OUT", vw / 2, vh / 2 - 70);
+    ctx.fillStyle = "#e8ecff"; ctx.font = "22px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("Claimed " + NeonClaim.claimedPct(S).toFixed(1) + "% of the grid", vw / 2, vh / 2 - 20);
+    ctx.fillStyle = "#ffd94d"; ctx.font = "800 34px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("SCORE " + S.score, vw / 2, vh / 2 + 30);
+    if (S.score > best) {
+      ctx.fillStyle = "#ff8cd1"; ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("NEW BEST!", vw / 2, vh / 2 + 62);
+    } else { ctx.fillStyle = "#7780b8"; ctx.font = "18px 'Segoe UI',system-ui,sans-serif"; ctx.fillText("Best " + best, vw / 2, vh / 2 + 62); }
+    ctx.fillStyle = "#aab4e8"; ctx.font = "18px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("Tap to play again", vw / 2, vh / 2 + 110);
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = Math.min(0.05, (now - lastT) / 1000 || 0.016); lastT = now;
+    if (screen !== "play" || !S) { render(now); return; }
+    if (auto) NeonClaim.autoplay(S, dt);
+    moveAcc += dt;
+    var step = 0.1;
+    while (moveAcc >= step && !S.over) { NeonClaim.tickMove(S); moveAcc -= step; }
+    NeonClaim.update(S, dt, Math.random);
+    // events -> sfx/haptics/particles
+    for (var i = 0; i < S.events.length; i++) {
+      var ev = S.events[i], cell = WD.cell;
+      if (ev.type === "claim") {
+        beep(520 + Math.min(400, ev.gained * 4), 0.18, "square", 0.05);
+        for (var k = 0; k < 24; k++) S.particles.push({ x: Math.random() * WD.w, y: Math.random() * WD.h, vx: 0, vy: 0, life: 0.8, color: "#5df2ff" });
+        buzz(20);
+      } else if (ev.type === "bigclaim") { beep(880, 0.3, "sawtooth", 0.06); buzz([30, 40, 30]); }
+      else if (ev.type === "spark") { beep(1320, 0.22, "sine", 0.07); buzz(35); }
+      else if (ev.type === "kill") { beep(220, 0.25, "sawtooth", 0.07); buzz(50); }
+      else if (ev.type === "hit") { beep(140, 0.4, "sawtooth", 0.09); buzz([60, 60, 60]); }
+      else if (ev.type === "end") {
+        overAt = performance.now(); screen = "over";
+        beep(ev.win ? 660 : 180, 0.5, "triangle", 0.08);
+        if (S.score > best) { best = S.score; try { localStorage.setItem("neon_claim_best", String(best)); } catch (e) {} }
+      }
+    }
+    S.events.length = 0;
+    for (var pi = S.particles.length - 1; pi >= 0; pi--) {
+      var pt = S.particles[pi]; pt.life -= dt * 1.4;
+      if (pt.life <= 0) S.particles.splice(pi, 1);
+    }
+    render(now);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
