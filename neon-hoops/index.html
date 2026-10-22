@@ -188,15 +188,16 @@ var NeonHoopsLogic = (function () {
   var L = NeonHoopsLogic;
   var canvas = document.getElementById("c");
   var ctx = canvas.getContext("2d");
+  // Canvas sizing: the CSS size MUST be set explicitly (style.width/height).
+  // Without it a canvas is a replaced element and displays at bitmap size —
+  // on a DPR-3 phone that is a 3x zoomed crop of the game. Recompute on
+  // resize/orientationchange; the world transform is re-applied every frame.
   var vw = window.innerWidth, vh = window.innerHeight;
+  var dpr = Math.min(2, window.devicePixelRatio || 1);
   var world = L.computeWorld(vw);
   var W = world.w, H = world.h;
   var scale = Math.min(vw / W, vh / H);
-  canvas.width = Math.round(vw * (window.devicePixelRatio || 1));
-  canvas.height = Math.round(vh * (window.devicePixelRatio || 1));
-  ctx.setTransform((window.devicePixelRatio || 1) * scale, 0, 0, (window.devicePixelRatio || 1) * scale,
-    (window.devicePixelRatio || 1) * (vw - W * scale) / 2,
-    (window.devicePixelRatio || 1) * (vh - H * scale) / 2);
+  var ox = (vw - W * scale) / 2, oy = (vh - H * scale) / 2;
 
   var BEST_KEY = "neon_hoops_best";
   var best = 0;
@@ -205,6 +206,25 @@ var NeonHoopsLogic = (function () {
   var st = L.makeState(W);
   st.best = best;
   var started = false;
+
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.round(vw * dpr);
+    canvas.height = Math.round(vh * dpr);
+    canvas.style.width = vw + "px";
+    canvas.style.height = vh + "px";
+    if (!started) {
+      var nw = L.computeWorld(vw);
+      if (nw.w !== W) { W = nw.w; H = nw.h; st = L.makeState(W); st.best = best; }
+    }
+    scale = Math.min(vw / W, vh / H);
+    ox = (vw - W * scale) / 2;
+    oy = (vh - H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
   var muted = false;
   var aim = null; // {sx, sy, cx, cy} in world coords
 
@@ -252,8 +272,8 @@ var NeonHoopsLogic = (function () {
   // ---- input ----
   function toWorld(e) {
     var r = canvas.getBoundingClientRect();
-    var x = (e.clientX - r.left - (vw - W * scale) / 2) / scale;
-    var y = (e.clientY - r.top - (vh - H * scale) / 2) / scale;
+    var x = (e.clientX - r.left - ox) / scale;
+    var y = (e.clientY - r.top - oy) / scale;
     return { x: x, y: y };
   }
   canvas.addEventListener("pointerdown", function (e) {
@@ -426,6 +446,13 @@ var NeonHoopsLogic = (function () {
       }
     }
     // ---- render ----
+    // full-canvas clear in device pixels, then the world transform for this
+    // frame (setting canvas.width on resize resets context state, so the
+    // transform must be re-applied here, never only once at load)
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#070512";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
     ctx.clearRect(0, 0, W, H);
     // bg grid
     ctx.strokeStyle = "rgba(120,60,200,0.10)"; ctx.lineWidth = 1;
