@@ -329,18 +329,16 @@ var PlinkoLogic = (function () {
   }
 
   function drawBall(b) {
-    // trail (gradient created after transform, in local coords)
+    // trail: ONE continuous ribbon. Stroking each segment separately with
+    // round caps renders as a dotted chain of mini-balls at speed.
     if (b.trail.length >= 4) {
       ctx.save();
-      ctx.lineWidth = b.r * 1.1; ctx.lineCap = "round";
-      for (var i = 0; i < b.trail.length - 2; i += 2) {
-        var a = (i / b.trail.length) * 0.35;
-        ctx.strokeStyle = b.golden ? "rgba(255,210,80," + a + ")" : "rgba(80,200,255," + a + ")";
-        ctx.beginPath();
-        ctx.moveTo(b.trail[i], b.trail[i + 1]);
-        ctx.lineTo(b.trail[i + 2], b.trail[i + 3]);
-        ctx.stroke();
-      }
+      ctx.strokeStyle = b.golden ? "rgba(255,210,80,0.28)" : "rgba(80,200,255,0.28)";
+      ctx.lineWidth = b.r * 0.9; ctx.lineCap = "round"; ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(b.trail[0], b.trail[1]);
+      for (var i = 2; i < b.trail.length; i += 2) ctx.lineTo(b.trail[i], b.trail[i + 1]);
+      ctx.stroke();
       ctx.restore();
     }
     var g = ctx.createRadialGradient(b.x - 3, b.y - 3, 1, b.x, b.y, b.r);
@@ -391,9 +389,14 @@ var PlinkoLogic = (function () {
       ctx.fillText(isGold ? "x10" : "x" + mults[s], x0 + sw / 2, 710);
     }
 
-    // dropper
-    ctx.fillStyle = "#38c8ff";
-    ctx.beginPath(); ctx.arc(dropperX, 118, 12, 0, Math.PI * 2); ctx.fill();
+    // dropper: a hollow funnel, deliberately NOT ball-shaped — a filled
+    // circle here reads as a second ball sitting at the emitter
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3; ctx.lineJoin = "round";
+    ctx.fillStyle = "rgba(255,255,255,0.12)";
+    ctx.beginPath();
+    ctx.moveTo(dropperX - 17, 98); ctx.lineTo(dropperX + 17, 98);
+    ctx.lineTo(dropperX, 124); ctx.closePath();
+    ctx.fill(); ctx.stroke();
     ctx.strokeStyle = "rgba(56,200,255,0.5)"; ctx.lineWidth = 2;
     ctx.setLineDash([6, 6]);
     ctx.beginPath(); ctx.moveTo(dropperX, 130); ctx.lineTo(dropperX, 180); ctx.stroke();
