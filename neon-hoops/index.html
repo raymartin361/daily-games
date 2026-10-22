@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Hoops — Day 28</title>
+<meta name="description" content="Neon Hoops — 60 seconds of trick-shot chaos. Drag back and release to launch the ball through the moving neon hoop. Chain baskets for combo multipliers up to x5 — Golden Hoop events pay 5x!">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Hoops — Day 28. Trick shots: drag back anywhere and release to launch
+   the ball at the sliding neon hoop. Baskets chain the combo ladder x1->x5
+   (a miss resets it); swishes pay +50; Golden Hoop events pay 5x. 60 seconds,
+   best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//==LOGIC==
+var NeonHoopsLogic = (function () {
+  // WIDE PLAYFIELD: world width scales with the viewport (min 480 so mobile
+  // is unchanged, capped at 1120), instead of a fixed 480 fit.
+  function computeWorld(vw) {
+    var w = Math.round(vw * 0.92);
+    if (w < 480) w = 480;
+    if (w > 1120) w = 1120;
+    return { w: w, h: 800 };
+  }
+
+  var GRAV = 1400;          // px/s^2
+  var BALL_R = 14;
+  var RIM_R = 42;           // half-width of the rim opening
+  var AIM_POWER = 3.4;      // drag px -> velocity px/s
+  var MAX_SPEED = 2400;
+  var MIN_DRAG = 28;        // below this = tap, no shot
+  var GAME_LEN = 60;
+  var COMBO_MAX = 5;
+  var GOLD_EVERY = 15;      // gold hoop every 15s
+  var GOLD_LEN = 8;         // gold lasts 8s
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+  function aimVelocity(drag) {
+    // drag = {x, y}: vector from current touch to the touch-start (slingshot).
+    var vx = drag.x * AIM_POWER, vy = drag.y * AIM_POWER;
+    var sp = Math.sqrt(vx * vx + vy * vy);
+    if (sp > MAX_SPEED) { vx *= MAX_SPEED / sp; vy *= MAX_SPEED / sp; }
+    return { vx: vx, vy: vy };
+  }
+
+  function hoopAt(t, W, ramp) {
+    // ramps up speed over the minute
+    var speed = 0.55 + ramp * 0.9;
+    var hx = W / 2 + Math.sin(t * speed) * (W / 2 - 140);
+    var hy = 330 + Math.sin(t * (0.37 + ramp * 0.3) + 1.3) * 95;
+    return { hx: hx, hy: hy };
+  }
+
+  function goldActive(elapsed) {
+    // elapsed seconds; gold during [15..23), [30..38), [45..53)
+    var cyc = elapsed % GOLD_EVERY;
+    return elapsed >= GOLD_EVERY && cyc < GOLD_LEN;
+  }
+
+  function makeState(W) {
+    return {
+      W: W, H: 800, t: 0, elapsed: 0, over: false,
+      score: 0, combo: 0, best: 0, misses: 0, baskets: 0,
+      ball: readyBall(W), hoop: { hx: W / 2, hy: 330 },
+      floaters: [], gold: false, justScored: 0
+    };
+  }
+
+  function readyBall(W) {
+    return { x: W / 2, y: 710, vx: 0, vy: 0, state: "ready", rimHit: false, scored: false };
+  }
+
+  function shoot(st, vx, vy) {
+    var b = st.ball;
+    b.state = "fly"; b.vx = vx; b.vy = vy; b.rimHit = false; b.scored = false;
+  }
+
+  function step(st, dt) {
+    if (st.over) return;
+    st.t += dt; st.elapsed += dt;
+    if (st.elapsed >= GAME_LEN) { st.over = true; return; }
+    var ramp = st.elapsed / GAME_LEN;
+    var h = hoopAt(st.elapsed, st.W, ramp);
+    st.hoop = h;
+    st.gold = goldActive(st.elapsed);
+    if (st.justScored > 0) st.justScored -= dt;
+
+    var b = st.ball;
+    if (b.state !== "fly") return;
+
+    var prevY = b.y;
+    b.vy += GRAV * dt;
+    b.x += b.vx * dt;
+    b.y += b.vy * dt;
+
+    // wall bounces (side walls only; ceiling passes)
+    if (b.x < BALL_R) { b.x = BALL_R; b.vx = Math.abs(b.vx) * 0.7; }
+    if (b.x > st.W - BALL_R) { b.x = st.W - BALL_R; b.vx = -Math.abs(b.vx) * 0.7; }
+
+    // rim point collisions (two rim tips)
+    var rimPts = [{ x: h.hx - RIM_R, y: h.hy }, { x: h.hx + RIM_R, y: h.hy }];
+    for (var i = 0; i < 2; i++) {
+      var p = rimPts[i];
+      var dx = b.x - p.x, dy = b.y - p.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      var minD = BALL_R + 4;
+      if (d < minD && d > 0.001) {
+        var nx = dx / d, ny = dy / d;
+        b.x = p.x + nx * minD; b.y = p.y + ny * minD;
+        var vn = b.vx * nx + b.vy * ny;
+        if (vn < 0) {
+          b.vx -= (1 + 0.55) * vn * nx;
+          b.vy -= (1 + 0.55) * vn * ny;
+          b.rimHit = true;
+        }
+      }
+    }
+
+    // basket detection: crossing the rim plane downward inside the opening
+    if (!b.scored && b.vy > 0 && prevY < h.hy && b.y >= h.hy &&
+        Math.abs(b.x - h.hx) < RIM_R * 0.82) {
+      b.scored = true;
+      onBasket(st, !b.rimHit);
+      // net drag
+      b.vx *= 0.35; b.vy *= 0.35;
+    }
+
+    // miss: fell off the bottom
+    if (b.y > st.H + 40) {
+      onMiss(st);
+      st.ball = readyBall(st.W);
+    }
+  }
+
+  function scoreFor(comboStep, swish, gold) {
+    var mult = comboStep + 1; // comboStep 0..4 -> x1..x5
+    var base = 100 + (swish ? 50 : 0);
+    return base * mult * (gold ? 5 : 1);
+  }
+
+  function onBasket(st, swish) {
+    var pts = scoreFor(st.combo, swish, st.gold);
+    st.score += pts;
+    st.baskets++;
+    st.combo = Math.min(COMBO_MAX - 1, st.combo + 1);
+    st.justScored = 1.2;
+    st.floaters.push({ x: st.hoop.hx, y: st.hoop.hy - 30, txt: "+" + pts + (swish ? " SWISH" : ""), life: 1.1 });
+  }
+
+  function onMiss(st) {
+    st.misses++;
+    st.combo = 0;
+  }
+
+  function finalScore(st) {
+    // flawless bonus: +500 if no misses and at least one basket
+    return st.score + (st.misses === 0 && st.baskets > 0 ? 500 : 0);
+  }
+
+  // export for tests
+  return {
+    computeWorld: computeWorld, aimVelocity: aimVelocity, hoopAt: hoopAt,
+    goldActive: goldActive, makeState: makeState, shoot: shoot, step: step,
+    scoreFor: scoreFor, finalScore: finalScore, onBasket: onBasket, onMiss: onMiss,
+    CONSTS: { GRAV: GRAV, BALL_R: BALL_R, RIM_R: RIM_R, MIN_DRAG: MIN_DRAG,
+              GAME_LEN: GAME_LEN, GOLD_EVERY: GOLD_EVERY, GOLD_LEN: GOLD_LEN,
+              MAX_SPEED: MAX_SPEED, AIM_POWER: AIM_POWER, COMBO_MAX: COMBO_MAX }
+  };
+})();
+//==/LOGIC==
+
+/* ---------- rendering + input (browser only) ---------- */
+(function () {
+  if (typeof document === "undefined") return;
+  var L = NeonHoopsLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = window.innerWidth, vh = window.innerHeight;
+  var world = L.computeWorld(vw);
+  var W = world.w, H = world.h;
+  var scale = Math.min(vw / W, vh / H);
+  canvas.width = Math.round(vw * (window.devicePixelRatio || 1));
+  canvas.height = Math.round(vh * (window.devicePixelRatio || 1));
+  ctx.setTransform((window.devicePixelRatio || 1) * scale, 0, 0, (window.devicePixelRatio || 1) * scale,
+    (window.devicePixelRatio || 1) * (vw - W * scale) / 2,
+    (window.devicePixelRatio || 1) * (vh - H * scale) / 2);
+
+  var BEST_KEY = "neon_hoops_best";
+  var best = 0;
+  try { best = parseInt(localStorage.getItem(BEST_KEY) || "0", 10) || 0; } catch (e) {}
+
+  var st = L.makeState(W);
+  st.best = best;
+  var started = false;
+  var muted = false;
+  var aim = null; // {sx, sy, cx, cy} in world coords
+
+  // ---- audio ----
+  var AC = null;
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var c = ac(); if (!c) return;
+    var o = c.createOscillator(), g = c.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, c.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, c.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
+    o.connect(g); g.connect(c.destination);
+    o.start(); o.stop(c.currentTime + dur + 0.02);
+  }
+  function noise(dur, vol, freq) {
+    if (muted) return;
+    var c = ac(); if (!c) return;
+    var n = Math.floor(c.sampleRate * dur);
+    var buf = c.createBuffer(1, n, c.sampleRate);
+    var d = buf.getChannelData(0);
+    for (var i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
+    var src = c.createBufferSource(); src.buffer = buf;
+    var f = c.createBiquadFilter(); f.type = "bandpass"; f.frequency.value = freq || 1200; f.Q.value = 0.8;
+    var g = c.createGain(); g.gain.value = vol || 0.2;
+    src.connect(f); f.connect(g); g.connect(c.destination);
+    src.start();
+  }
+  var sfx = {
+    shoot: function () { noise(0.18, 0.12, 700); tone(300, 0.15, "sine", 0.08, 700); },
+    rim: function () { tone(220, 0.12, "square", 0.1, 140); noise(0.08, 0.1, 900); },
+    swish: function () { noise(0.25, 0.2, 2500); },
+    score: function (combo) { tone(520 + combo * 90, 0.18, "sine", 0.14, 880 + combo * 120); },
+    gold: function () { tone(880, 0.3, "triangle", 0.16, 1760); },
+    buzz: function () { tone(160, 0.3, "sawtooth", 0.12, 90); },
+    end: function () { tone(440, 0.4, "sine", 0.12, 880); }
+  };
+  function buzz(pat) { try { if (navigator.vibrate) navigator.vibrate(pat); } catch (e) {} }
+
+  // ---- input ----
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    var x = (e.clientX - r.left - (vw - W * scale) / 2) / scale;
+    var y = (e.clientY - r.top - (vh - H * scale) / 2) / scale;
+    return { x: x, y: y };
+  }
+  canvas.addEventListener("pointerdown", function (e) {
+    if (!started) { started = true; ac(); return; }
+    if (st.over) {
+      if (e.clientY < vh * 0.75) { // tap upper area = play again
+        st = L.makeState(W); st.best = best; started = true;
+      }
+      return;
+    }
+    var p = toWorld(e);
+    if (st.ball.state === "ready") aim = { sx: p.x, sy: p.y, cx: p.x, cy: p.y };
+    e.preventDefault();
+  });
+  canvas.addEventListener("pointermove", function (e) {
+    if (aim) { var p = toWorld(e); aim.cx = p.x; aim.cy = p.y; }
+  });
+  function release() {
+    if (!aim) return;
+    var dx = aim.sx - aim.cx, dy = aim.sy - aim.cy;
+    var drag = Math.sqrt(dx * dx + dy * dy);
+    aim = null;
+    if (drag < L.CONSTS.MIN_DRAG) return;
+    if (st.ball.state !== "ready" || st.over) return;
+    var v = L.aimVelocity({ x: dx, y: dy });
+    L.shoot(st, v.vx, v.vy);
+    sfx.shoot();
+  }
+  canvas.addEventListener("pointerup", release);
+  canvas.addEventListener("pointercancel", function () { aim = null; });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") muted = !muted;
+    if ((e.key === " " || e.key === "Enter") && !started) { started = true; ac(); }
+  });
+  // mute button region: top-right 44x44
+  canvas.addEventListener("dblclick", function () { muted = !muted; });
+
+  // ---- drawing helpers (gradients created AFTER transforms) ----
+  function neonGlow(x, y, r, color) {
+    var g = ctx.createRadialGradient(x, y, 0, x, y, r);
+    g.addColorStop(0, color);
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    return g;
+  }
+
+  function drawHoop(h, gold) {
+    var rimColor = gold ? "#ffd54a" : "#ff4fd8";
+    // glow (created after translate, in local coords)
+    ctx.save();
+    ctx.translate(h.hx, h.hy);
+    ctx.fillStyle = neonGlow(0, 0, 120, gold ? "rgba(255,213,74,0.35)" : "rgba(255,79,216,0.30)");
+    ctx.fillRect(-120, -120, 240, 240);
+    // rim bar
+    var g = ctx.createLinearGradient(-L.CONSTS.RIM_R, 0, L.CONSTS.RIM_R, 0);
+    g.addColorStop(0, "#7a2b6d"); g.addColorStop(0.5, rimColor); g.addColorStop(1, "#7a2b6d");
+    ctx.strokeStyle = g; ctx.lineWidth = 10; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(-L.CONSTS.RIM_R, 0); ctx.lineTo(L.CONSTS.RIM_R, 0); ctx.stroke();
+    // net
+    ctx.strokeStyle = gold ? "rgba(255,213,74,0.55)" : "rgba(255,79,216,0.45)";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    for (var i = -2; i <= 2; i++) {
+      ctx.moveTo(i * (L.CONSTS.RIM_R / 2.5), 4);
+      ctx.lineTo(i * (L.CONSTS.RIM_R / 4), 52);
+    }
+    ctx.stroke();
+    // rim tips
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(-L.CONSTS.RIM_R, 0, 5, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(L.CONSTS.RIM_R, 0, 5, 0, 7); ctx.fill();
+    ctx.restore();
+    if (gold) {
+      ctx.save();
+      ctx.fillStyle = "#ffd54a";
+      ctx.font = "bold 26px system-ui";
+      ctx.textAlign = "center";
+      ctx.fillText("GOLDEN HOOP x5", h.hx, h.hy - 90);
+      ctx.restore();
+    }
+  }
+
+  function drawBall(b) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.fillStyle = neonGlow(0, 0, 44, "rgba(255,140,40,0.5)");
+    ctx.fillRect(-44, -44, 88, 88);
+    var g = ctx.createRadialGradient(-5, -6, 2, 0, 0, L.CONSTS.BALL_R);
+    g.addColorStop(0, "#ffd9a0"); g.addColorStop(0.6, "#ff8c28"); g.addColorStop(1, "#b34a00");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, L.CONSTS.BALL_R, 0, 7); ctx.fill();
+    ctx.strokeStyle = "rgba(90,30,0,0.8)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, L.CONSTS.BALL_R, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-L.CONSTS.BALL_R, 0); ctx.lineTo(L.CONSTS.BALL_R, 0); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, -L.CONSTS.BALL_R); ctx.lineTo(0, L.CONSTS.BALL_R); ctx.stroke();
+    ctx.restore();
+  }
+
+  function drawAim() {
+    if (!aim || st.ball.state !== "ready") return;
+    var dx = aim.sx - aim.cx, dy = aim.sy - aim.cy;
+    var drag = Math.sqrt(dx * dx + dy * dy);
+    if (drag < 10) return;
+    var v = L.aimVelocity({ x: dx, y: dy });
+    // sling line
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(st.ball.x, st.ball.y); ctx.lineTo(aim.cx, aim.cy); ctx.stroke();
+    // trajectory preview: simulate 1.2s
+    ctx.fillStyle = "rgba(255,213,74,0.85)";
+    var px = st.ball.x, py = st.ball.y, pvx = v.vx, pvy = v.vy;
+    var dt = 1 / 60;
+    for (var i = 0; i < 42; i++) {
+      pvy += L.CONSTS.GRAV * dt; px += pvx * dt; py += pvy * dt;
+      if (i % 3 === 0) { ctx.beginPath(); ctx.arc(px, py, 3, 0, 7); ctx.fill(); }
+      if (py > H) break;
+    }
+  }
+
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.92)";
+    ctx.font = "bold 30px system-ui"; ctx.textAlign = "left";
+    ctx.fillText(String(st.score), 18, 44);
+    ctx.font = "20px system-ui"; ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.fillText("BEST " + Math.max(best, st.score), 18, 70);
+    var timeLeft = Math.max(0, Math.ceil(L.CONSTS.GAME_LEN - st.elapsed));
+    ctx.font = "bold 30px system-ui"; ctx.textAlign = "right";
+    ctx.fillStyle = timeLeft <= 10 ? "#ff5a5a" : "rgba(255,255,255,0.92)";
+    ctx.fillText(timeLeft + "s", W - 18, 44);
+    if (st.combo > 0) {
+      ctx.textAlign = "center"; ctx.font = "bold 26px system-ui";
+      ctx.fillStyle = "#ffd54a";
+      ctx.fillText("x" + (st.combo + 1) + " COMBO", W / 2, 44);
+    }
+    // mute hint
+    ctx.textAlign = "right"; ctx.font = "16px system-ui"; ctx.fillStyle = "rgba(255,255,255,0.45)";
+    ctx.fillText(muted ? "M: unmute" : "M: mute", W - 18, 70);
+    ctx.restore();
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    if (started && !st.over) {
+      var prevScore = st.score;
+      L.step(st, dt);
+      if (st.score > prevScore) {
+        var swish = st.floaters.length && st.floaters[st.floaters.length - 1].txt.indexOf("SWISH") >= 0;
+        if (swish) sfx.swish();
+        sfx.score(st.combo);
+        if (st.gold) sfx.gold();
+        buzz(30);
+      } else if (st.ball.state === "ready" && st.misses > 0 && !st._buzzed) {
+        // miss just resolved (ball reset to ready)
+      }
+      if (st.ball.rimHit && !st._rimSounded) { sfx.rim(); st._rimSounded = true; }
+      if (st.ball.state === "ready") st._rimSounded = false;
+      for (var i = st.floaters.length - 1; i >= 0; i--) {
+        st.floaters[i].life -= dt; st.floaters[i].y -= 40 * dt;
+        if (st.floaters[i].life <= 0) st.floaters.splice(i, 1);
+      }
+      if (st.over) {
+        sfx.end();
+        var total = L.finalScore(st);
+        st.score = total;
+        if (total > best) {
+          best = total;
+          try { localStorage.setItem(BEST_KEY, String(best)); } catch (e) {}
+        }
+      }
+    }
+    // ---- render ----
+    ctx.clearRect(0, 0, W, H);
+    // bg grid
+    ctx.strokeStyle = "rgba(120,60,200,0.10)"; ctx.lineWidth = 1;
+    for (var gx = 0; gx <= W; gx += 40) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, H); ctx.stroke(); }
+    for (var gy = 0; gy <= H; gy += 40) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(W, gy); ctx.stroke(); }
+
+    drawHoop(st.hoop, st.gold);
+    if (st.ball.state !== "ready" || !st.over) drawBall(st.ball);
+    drawAim();
+    for (var f = 0; f < st.floaters.length; f++) {
+      var fl = st.floaters[f];
+      ctx.save();
+      ctx.globalAlpha = Math.min(1, fl.life);
+      ctx.fillStyle = "#ffd54a"; ctx.font = "bold 28px system-ui"; ctx.textAlign = "center";
+      ctx.fillText(fl.txt, fl.x, fl.y);
+      ctx.restore();
+    }
+    // launch pad
+    if (st.ball.state === "ready" && !st.over) {
+      ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(st.ball.x, st.ball.y, 26, 0, 7); ctx.stroke();
+    }
+    drawHUD();
+
+    if (!started) {
+      ctx.fillStyle = "rgba(4,2,12,0.78)"; ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = "center"; ctx.fillStyle = "#ff8c28";
+      ctx.font = "bold 54px system-ui";
+      ctx.fillText("NEON HOOPS", W / 2, H / 2 - 90);
+      ctx.fillStyle = "rgba(255,255,255,0.9)"; ctx.font = "24px system-ui";
+      ctx.fillText("Drag back and release to shoot.", W / 2, H / 2 - 30);
+      ctx.fillText("Thread the moving hoop. Chain baskets", W / 2, H / 2 + 4);
+      ctx.fillText("for combo up to x5. Golden Hoop pays 5x!", W / 2, H / 2 + 36);
+      ctx.fillStyle = "#ffd54a"; ctx.font = "bold 26px system-ui";
+      ctx.fillText("TAP TO START", W / 2, H / 2 + 100);
+    }
+    if (st.over) {
+      ctx.fillStyle = "rgba(4,2,12,0.82)"; ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ff8c28"; ctx.font = "bold 50px system-ui";
+      ctx.fillText("TIME!", W / 2, H / 2 - 80);
+      ctx.fillStyle = "#fff"; ctx.font = "bold 64px system-ui";
+      ctx.fillText(String(st.score), W / 2, H / 2);
+      ctx.font = "24px system-ui"; ctx.fillStyle = "rgba(255,255,255,0.85)";
+      var sub = st.baskets + " baskets" + (st.misses === 0 && st.baskets > 0 ? " · FLAWLESS +500" : "");
+      ctx.fillText(sub, W / 2, H / 2 + 44);
+      ctx.fillStyle = "#ffd54a"; ctx.font = "20px system-ui";
+      ctx.fillText("BEST " + best, W / 2, H / 2 + 76);
+      ctx.fillStyle = "rgba(255,255,255,0.7)";
+      ctx.fillText("tap the top to play again", W / 2, H / 2 + 120);
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+
+  // debug hook for automated smoke testing (no gameplay effect)
+  window.NeonHoops = {
+    getState: function () {
+      return { score: st.score, baskets: st.baskets, misses: st.misses,
+        elapsed: Math.round(st.elapsed * 10) / 10, over: st.over, started: started,
+        ballState: st.ball.state, hoop: { hx: Math.round(st.hoop.hx), hy: Math.round(st.hoop.hy) },
+        ball: { x: Math.round(st.ball.x), y: Math.round(st.ball.y) } };
+    },
+    worldW: function () { return W; },
+    aimShoot: function (T) {
+      // autoplay helper: fire the ball to (predicted) hoop position in T seconds
+      if (st.ball.state !== "ready" || st.over) return false;
+      var t2 = st.elapsed + T, ramp = Math.min(1, t2 / L.CONSTS.GAME_LEN);
+      var h = L.hoopAt(t2, W, ramp);
+      var bx = st.ball.x, by = st.ball.y;
+      var vx = (h.hx - bx) / T;
+      var vy = (h.hy - by - 0.5 * L.CONSTS.GRAV * T * T) / T;
+      L.shoot(st, vx, vy);
+      return true;
+    }
+  };
+})();
+</script>
+</body>
+</html>
