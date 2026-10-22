@@ -103,8 +103,11 @@ var PlinkoLogic = (function () {
     ball.vy += GRAV * dt;
     ball.x += ball.vx * dt;
     ball.y += ball.vy * dt;
-    if (ball.trail.length > 14) ball.trail.shift();
+    // trail is a flat [x,y,x,y,...] list: trim WHOLE PAIRS from the front.
+    // (Trimming single values misaligns the pairs — the renderer then draws
+    // a second axis-swapped ghost line — and push(2)/shift(1) grows forever.)
     ball.trail.push(ball.x, ball.y);
+    while (ball.trail.length > 14) ball.trail.splice(0, 2);
     // side walls
     if (ball.x < ball.r + 6) { ball.x = ball.r + 6; if (ball.vx < 0) { ball.vx = -ball.vx * 0.4; hooks.onWall && hooks.onWall(); } }
     if (ball.x > W - ball.r - 6) { ball.x = W - ball.r - 6; if (ball.vx > 0) { ball.vx = -ball.vx * 0.4; hooks.onWall && hooks.onWall(); } }
