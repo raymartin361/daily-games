@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Color Clash — Day 29</title>
+<meta name="description" content="Color Clash — 60 seconds of Stroop-test chaos. Tap the INK color, not the word. Chain 6 streaks to raise your combo to x5.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#0a0616;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Color Clash — Day 29. Cognitive: a 60-second Stroop test.
+   A big word flashes naming a color but printed in a DIFFERENT ink color.
+   Tap the button matching the INK color (not the word). Correct answers chain
+   a streak; every 6 chained raise the combo ladder x1->x5. Each round has a
+   shrinking time limit (3.0s -> 1.0s); a wrong tap or timeout resets the
+   streak and combo. Every 8th round is GOLDEN (5x score). Flawless run: +500.
+   Best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//==LOGIC==
+var ColorClashLogic = (function () {
+  function makeRng(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+
+  // WIDE PLAYFIELD: world width scales with the viewport (min 480 so mobile
+  // is unchanged, capped at 1120), instead of a fixed 480 fit.
+  function computeWorld(vw) {
+    var w = Math.round(vw * 0.92);
+    if (w < 480) w = 480;
+    if (w > 1120) w = 1120;
+    return { w: w, h: 800 };
+  }
+
+  var COLORS = [
+    { name: "RED",    hex: "#ff5a6e" },
+    { name: "GREEN",  hex: "#38e08c" },
+    { name: "BLUE",   hex: "#54a8ff" },
+    { name: "YELLOW", hex: "#ffd23f" }
+  ];
+
+  function pickOther(rng, exclude) {
+    var i = Math.floor(rng() * 3);
+    return i >= exclude ? i + 1 : i; // uniform over the 3 others
+  }
+
+  // One round: word names one color, ink is a different color (Stroop conflict).
+  function newRound(rng) {
+    var wordIdx = Math.floor(rng() * 4);
+    var inkIdx = pickOther(rng, wordIdx);
+    return { wordIdx: wordIdx, inkIdx: inkIdx };
+  }
+
+  function isGolden(roundNum) { return roundNum % 8 === 7; } // every 8th round
+
+  // Time limit per round shrinks with streak: 3.0s down to a 1.0s floor.
+  function roundTimeLimit(streak) {
+    var t = 3.0 - 0.08 * streak;
+    return t < 1.0 ? 1.0 : t;
+  }
+
+  // Correct: streak+1; every 6th chained correct raises combo, cap x5.
+  function afterCorrect(streak, combo) {
+    var s = streak + 1, c = combo;
+    if (s % 6 === 0 && c < 5) c = c + 1;
+    return { streak: s, combo: c };
+  }
+  function afterMiss() { return { streak: 0, combo: 1 }; }
+
+  function scoreForCorrect(combo, golden) {
+    return 100 * combo * (golden ? 5 : 1);
+  }
+  function scoreForWrong(score) {
+    return score >= 25 ? score - 25 : 0;
+  }
+
+  // Button layout: 2x2 grid in the lower half of the world.
+  function buttonRects(W) {
+    var m = 24, gap = 16;
+    var bw = (W - m * 2 - gap) / 2, bh = 150;
+    var y0 = 440, x1 = m + bw + gap, y1 = y0 + bh + gap;
+    return [
+      { x: m,  y: y0, w: bw, h: bh },
+      { x: x1, y: y0, w: bw, h: bh },
+      { x: m,  y: y1, w: bw, h: bh },
+      { x: x1, y: y1, w: bw, h: bh }
+    ];
+  }
+
+  function hitTest(px, py, W) {
+    var rs = buttonRects(W);
+    for (var i = 0; i < 4; i++) {
+      var r = rs[i];
+      if (px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h) return i;
+    }
+    return -1;
+  }
+
+  return {
+    makeRng: makeRng,
+    computeWorld: computeWorld,
+    COLORS: COLORS,
+    newRound: newRound,
+    isGolden: isGolden,
+    roundTimeLimit: roundTimeLimit,
+    afterCorrect: afterCorrect,
+    afterMiss: afterMiss,
+    scoreForCorrect: scoreForCorrect,
+    scoreForWrong: scoreForWrong,
+    buttonRects: buttonRects,
+    hitTest: hitTest,
+    CONSTS: { GAME_TIME: 60, FLAWLESS_BONUS: 500 }
+  };
+})();
+//==/LOGIC==
+
+(function () {
+  var L = ColorClashLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  var WD = L.computeWorld(480);
+
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.round(vw * dpr);
+    canvas.height = Math.round(vh * dpr);
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    WD = L.computeWorld(vw);
+    scale = Math.min(vw / WD.w, vh / WD.h);
+    ox = (vw - WD.w * scale) / 2;
+    oy = (vh - WD.h * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+
+  // ---- audio ----
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("color_clash_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination);
+    o.start(); o.stop(a.currentTime + dur + 0.02);
+  }
+  function buzz() {
+    try { if (navigator.vibrate) navigator.vibrate([40, 30, 40]); } catch (e) {}
+  }
+  function tap() {
+    try { if (navigator.vibrate) navigator.vibrate(12); } catch (e) {}
+  }
+
+  // ---- state ----
+  var state = "title"; // title | play | over
+  var score = 0, best = 0, streak = 0, combo = 1, t = 60;
+  var round = null, roundNum = 0, roundTimeLeft = 0, mistakes = 0;
+  var shakeT = 0, flashT = 0, flashOk = true, floaters = [];
+  try { best = parseInt(localStorage.getItem("color_clash_best") || "0", 10) || 0; } catch (e) {}
+  function saveBest() {
+    if (score > best) { best = score; try { localStorage.setItem("color_clash_best", String(best)); } catch (e) {} }
+  }
+
+  function newRound() {
+    round = L.newRound(Math.random);
+    roundNum++;
+    roundTimeLeft = L.roundTimeLimit(streak);
+  }
+  function start() {
+    score = 0; streak = 0; combo = 1; t = L.CONSTS.GAME_TIME;
+    roundNum = 0; mistakes = 0; floaters = [];
+    newRound(); state = "play";
+    tone(440, 0.12, "sine", 0.15, 880);
+  }
+  function addFloater(x, y, text, color) {
+    floaters.push({ x: x, y: y, text: text, color: color, life: 1.0 });
+  }
+  function answer(i) {
+    if (state !== "play" || i < 0) return;
+    var golden = L.isGolden(roundNum);
+    if (i === round.inkIdx) {
+      var r = L.afterCorrect(streak, combo);
+      streak = r.streak; combo = r.combo;
+      var pts = L.scoreForCorrect(combo, golden);
+      score += pts;
+      flashT = 0.25; flashOk = true;
+      addFloater(WD.w / 2, 220, "+" + pts, golden ? "#ffd23f" : "#38e08c");
+      tone(520 + combo * 90, 0.14, "sine", 0.16, 520 + combo * 90 + 220);
+      tap();
+      newRound();
+    } else {
+      score = L.scoreForWrong(score);
+      var m = L.afterMiss(); streak = m.streak; combo = m.combo;
+      mistakes++;
+      shakeT = 0.35; flashT = 0.35; flashOk = false;
+      addFloater(WD.w / 2, 220, "WRONG INK!", "#ff5a6e");
+      tone(160, 0.25, "sawtooth", 0.14, 90);
+      buzz();
+      newRound();
+    }
+  }
+
+  function toWorld(cx, cy) {
+    return { x: (cx - ox) / scale, y: (cy - oy) / scale };
+  }
+  canvas.addEventListener("pointerdown", function (e) {
+    if (AC && AC.state === "suspended") AC.resume();
+    var cx = e.clientX, cy = e.clientY;
+    if (state === "title" || state === "over") { start(); return; }
+    var p = toWorld(cx, cy);
+    answer(L.hitTest(p.x, p.y, WD.w));
+  });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") {
+      muted = !muted;
+      try { localStorage.setItem("color_clash_mute", muted ? "1" : "0"); } catch (x) {}
+    } else if (e.key === " " || e.key === "Enter") {
+      if (state !== "play") start();
+    }
+  });
+
+  var last = 0, ticked = 99;
+  function update(dt) {
+    if (state !== "play") return;
+    t -= dt;
+    var whole = Math.ceil(t);
+    if (t <= 5.5 && whole !== ticked && whole > 0) { ticked = whole; tone(880, 0.07, "square", 0.08); }
+    roundTimeLeft -= dt;
+    if (roundTimeLeft <= 0) {
+      var m = L.afterMiss(); streak = m.streak; combo = m.combo;
+      mistakes++;
+      flashT = 0.3; flashOk = false;
+      addFloater(WD.w / 2, 220, "TOO SLOW!", "#ff5a6e");
+      tone(220, 0.2, "triangle", 0.12, 140);
+      newRound();
+    }
+    if (shakeT > 0) shakeT -= dt;
+    if (flashT > 0) flashT -= dt;
+    for (var i = floaters.length - 1; i >= 0; i--) {
+      floaters[i].life -= dt * 1.2; floaters[i].y -= 40 * dt;
+      if (floaters[i].life <= 0) floaters.splice(i, 1);
+    }
+    if (t <= 0) {
+      t = 0; state = "over";
+      if (mistakes === 0) {
+        score += L.CONSTS.FLAWLESS_BONUS;
+        addFloater(WD.w / 2, 400, "FLAWLESS +500", "#ffd23f");
+      }
+      saveBest();
+      tone(523, 0.15, "sine", 0.15); setTimeout(function () { tone(659, 0.15, "sine", 0.15); }, 140);
+      setTimeout(function () { tone(784, 0.3, "sine", 0.15); }, 280);
+    }
+  }
+
+  function rr(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function draw() {
+    // World transform re-applied at the start of EVERY frame (canvas resets
+    // its context state on resize, so this must never be done only once).
+    ctx.setTransform(scale * dpr, 0, 0, scale * dpr, ox * dpr, oy * dpr);
+    var shx = 0;
+    if (shakeT > 0) shx = Math.sin(shakeT * 60) * 10 * (shakeT / 0.35);
+    ctx.translate(shx, 0);
+
+    // background
+    var bg = ctx.createLinearGradient(0, 0, 0, WD.h);
+    bg.addColorStop(0, "#0a0616"); bg.addColorStop(1, "#160b2e");
+    ctx.fillStyle = bg; ctx.fillRect(-Math.abs(shx) - 2, 0, WD.w + 2 * Math.abs(shx) + 4, WD.h);
+
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+
+    // HUD
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 30px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "left"; ctx.fillText("SCORE " + score, 20, 40);
+    ctx.textAlign = "right";
+    ctx.fillStyle = t <= 10 ? "#ff5a6e" : "#e8ecff";
+    ctx.fillText("TIME " + Math.ceil(t), WD.w - 20, 40);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffd23f"; ctx.font = "bold 24px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("COMBO x" + combo + "   STREAK " + streak, WD.w / 2, 78);
+    ctx.fillStyle = "#7780b8"; ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("BEST " + best, WD.w / 2, 108);
+
+    if (state === "title") {
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 64px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("COLOR CLASH", WD.w / 2, 240);
+      ctx.font = "26px 'Segoe UI',system-ui,sans-serif"; ctx.fillStyle = "#aab4e8";
+      ctx.fillText("The word names a color.", WD.w / 2, 300);
+      ctx.fillText("Tap the button matching the", WD.w / 2, 336);
+      ctx.fillStyle = "#54a8ff"; ctx.font = "bold 30px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("INK COLOR — not the word!", WD.w / 2, 376);
+      ctx.fillStyle = "#7780b8"; ctx.font = "22px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("6 chained correct raise your combo to x5.", WD.w / 2, 430);
+      ctx.fillText("Golden rounds pay 5x. 60 seconds. Go!", WD.w / 2, 462);
+      ctx.fillStyle = "#38e08c"; ctx.font = "bold 34px 'Segoe UI',system-ui,sans-serif";
+      if (Math.floor(performance.now() / 500) % 2 === 0) ctx.fillText("— TAP TO START —", WD.w / 2, 540);
+      ctx.fillStyle = "#555fa0"; ctx.font = "18px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("M = mute", WD.w / 2, 760);
+      return;
+    }
+    if (state === "over") {
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 56px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TIME UP!", WD.w / 2, 240);
+      ctx.font = "bold 40px 'Segoe UI',system-ui,sans-serif"; ctx.fillStyle = "#ffd23f";
+      ctx.fillText("SCORE " + score, WD.w / 2, 330);
+      ctx.font = "26px 'Segoe UI',system-ui,sans-serif"; ctx.fillStyle = "#aab4e8";
+      ctx.fillText("Best: " + best, WD.w / 2, 380);
+      ctx.fillStyle = "#38e08c"; ctx.font = "bold 32px 'Segoe UI',system-ui,sans-serif";
+      if (Math.floor(performance.now() / 500) % 2 === 0) ctx.fillText("— TAP TO PLAY AGAIN —", WD.w / 2, 470);
+      return;
+    }
+
+    // play: the word in its ink color
+    var word = L.COLORS[round.wordIdx], ink = L.COLORS[round.inkIdx];
+    var golden = L.isGolden(roundNum);
+    ctx.font = "bold 110px 'Segoe UI',system-ui,sans-serif";
+    ctx.shadowColor = golden ? "#ffd23f" : ink.hex; ctx.shadowBlur = 30;
+    ctx.fillStyle = golden ? "#ffd23f" : ink.hex;
+    ctx.fillText(word.name, WD.w / 2, 270);
+    ctx.shadowBlur = 0;
+
+    // round time bar
+    var limit = L.roundTimeLimit(streak);
+    var bw = WD.w * 0.6, bx = (WD.w - bw) / 2;
+    ctx.fillStyle = "#1a1440"; rr(bx, 340, bw, 14, 7); ctx.fill();
+    var frac = roundTimeLeft / limit;
+    ctx.fillStyle = frac > 0.4 ? "#38e08c" : "#ff5a6e";
+    if (frac > 0) { rr(bx, 340, bw * frac, 14, 7); ctx.fill(); }
+
+    // flash overlay on correct/wrong
+    if (flashT > 0) {
+      ctx.globalAlpha = Math.min(0.35, flashT);
+      ctx.fillStyle = flashOk ? "#38e08c" : "#ff5a6e";
+      ctx.fillRect(0, 0, WD.w, WD.h);
+      ctx.globalAlpha = 1;
+    }
+
+    // buttons
+    var rects = L.buttonRects(WD.w);
+    for (var i = 0; i < 4; i++) {
+      var r = rects[i], c = L.COLORS[i];
+      rr(r.x, r.y, r.w, r.h, 18);
+      ctx.fillStyle = c.hex + "33"; ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = c.hex;
+      ctx.shadowColor = c.hex; ctx.shadowBlur = 14; ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "#ffffff"; ctx.font = "bold 46px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(c.name, r.x + r.w / 2, r.y + r.h / 2);
+    }
+
+    // floaters
+    for (var f = 0; f < floaters.length; f++) {
+      var fl = floaters[f];
+      ctx.globalAlpha = Math.max(0, Math.min(1, fl.life));
+      ctx.fillStyle = fl.color; ctx.font = "bold 36px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(fl.text, fl.x, fl.y);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function frame(ts) {
+    var dt = Math.min(0.05, (ts - last) / 1000 || 0);
+    last = ts;
+    update(dt); draw();
+    requestAnimationFrame(frame);
+  }
+
+  resize();
+  newRound();
+  requestAnimationFrame(frame);
+
+  // Debug hooks for automated testing (harmless in production).
+  window.ColorClash = {
+    getState: function () {
+      var rects = L.buttonRects(WD.w);
+      return {
+        state: state, score: score, streak: streak, combo: combo, t: t,
+        word: round ? L.COLORS[round.wordIdx].name : null,
+        ink: round ? L.COLORS[round.inkIdx].name : null,
+        inkIdx: round ? round.inkIdx : -1,
+        golden: L.isGolden(roundNum), roundNum: roundNum,
+        scale: scale, ox: ox, oy: oy, worldW: WD.w,
+        buttons: rects.map(function (r) {
+          return {
+            cx: ox + (r.x + r.w / 2) * scale,
+            cy: oy + (r.y + r.h / 2) * scale
+          };
+        })
+      };
+    },
+    start: start,
+    answer: answer,
+    L: L
+  };
+})();
+</script>
+</body>
+</html>
