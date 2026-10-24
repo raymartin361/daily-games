@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Angler — Day 30</title>
+<meta name="description" content="Neon Angler — 60 seconds of deep-sea fishing chaos. Drag to steer your hook, catch glowing fish, dodge jellyfish, chain 8 catches to raise your combo to x5.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#04121e;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Angler — Day 30. Fishing: a 60-second deep-sea catch game.
+   Drag anywhere to steer the boat/hook left-right. The hook sinks on its
+   own, then reels back up; steer it into glowing fish to catch them.
+   Normal fish +100 x combo; golden fish pay 5x. Every 8 chained catches
+   raises the combo ladder x1->x5. Touch a jellyfish: lose a heart and the
+   combo resets. 3 hearts. A flawless run (no jellyfish hit) earns +500.
+   Best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+var NeonAnglerLogic = (function () {
+  function makeRng(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+  // Combo ladder: every 8 chained catches raises combo, capped at x5.
+  function comboFor(streak) {
+    var c = 1 + Math.floor(streak / 8);
+    return c > 5 ? 5 : c;
+  }
+  function scoreFor(combo, golden) { return 100 * combo * (golden ? 5 : 1); }
+  function afterCatch(streak) { return streak + 1; }
+  function afterJelly() { return 0; }
+  function surfaceY(H) { return Math.round(H * 0.22); }
+  function fishCount(W) {
+    var n = Math.floor(W / 90);
+    if (n < 6) n = 6;
+    if (n > 12) n = 12;
+    return n;
+  }
+  // One fish: swims horizontally, wraps around the screen edges.
+  function newFish(rng, W, H, i) {
+    var golden = rng() < 0.14;
+    var jelly = !golden && rng() < 0.18;
+    var dir = rng() < 0.5 ? -1 : 1;
+    var y = surfaceY(H) + 50 + rng() * Math.max(60, H - surfaceY(H) - 130);
+    var x = dir > 0 ? -30 - rng() * 100 : W + 30 + rng() * 100;
+    var speed = jelly ? 30 + rng() * 25 : 45 + rng() * 70;
+    return { x: x, y: y, vx: dir * speed, r: jelly ? 20 : (golden ? 24 : 18 + rng() * 10),
+      golden: golden, jelly: jelly, id: i, phase: rng() * 6.28 };
+  }
+  function moveFish(f, dt, W) {
+    f.x += f.vx * dt;
+    f.phase += dt * 3;
+    if (f.vx > 0 && f.x > W + 40) f.x = -40;
+    if (f.vx < 0 && f.x < -40) f.x = W + 40;
+  }
+  // Hook: sinks at 200 px/s to the bottom, then reels up at 330 px/s.
+  function hookStep(hook, dt, H) {
+    if (hook.goingDown) {
+      hook.y += 200 * dt;
+      if (hook.y >= H - 50) { hook.y = H - 50; hook.goingDown = false; }
+    } else {
+      hook.y -= 330 * dt;
+      if (hook.y <= surfaceY(H) + 10) { hook.y = surfaceY(H) + 10; hook.goingDown = true; }
+    }
+    return hook;
+  }
+  // Catch test: hook tip within fish radius + hook radius (12).
+  function hitsFish(hook, f) {
+    var dx = hook.x - f.x, dy = hook.y - f.y;
+    return dx * dx + dy * dy < (f.r + 12) * (f.r + 12);
+  }
+  return { makeRng: makeRng, comboFor: comboFor, scoreFor: scoreFor,
+    afterCatch: afterCatch, afterJelly: afterJelly, surfaceY: surfaceY,
+    fishCount: fishCount, newFish: newFish, moveFish: moveFish,
+    hookStep: hookStep, hitsFish: hitsFish };
+})();
+if (typeof window !== "undefined") { window.NeonAnglerLogic = NeonAnglerLogic; }
+
+(function () {
+  if (typeof document === "undefined") return;
+  var canvas = document.getElementById("c");
+  if (!canvas) return;
+  var ctx = canvas.getContext("2d");
+  var W = 0, H = 0, dpr = 1;
+  // CANVAS SIZING: explicit CSS size = viewport, bitmap = CSS x DPR (capped 2).
+  // Bound to resize + orientationchange; transform re-applied every frame.
+  function resize() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    W = vw; H = vh;
+    canvas.style.width = vw + "px";
+    canvas.style.height = vh + "px";
+    canvas.width = Math.round(vw * dpr);
+    canvas.height = Math.round(vh * dpr);
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var state = "title"; // title | play | over
+  var score = 0, streak = 0, combo = 1, hearts = 3, timeLeft = 60, best = 0;
+  var jellyHits = 0, catches = 0, invuln = 0, floaters = [];
+  var hook = { x: 200, y: 100, goingDown: true };
+  var targetX = 200, fishes = [];
+  var rng = Math.random;
+  try { best = parseInt(window.localStorage.getItem("neon_angler_best") || "0", 10) || 0; } catch (e) { best = 0; }
+  var audio = null;
+  function beep(freq, dur, type) {
+    try {
+      if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+      var o = audio.createOscillator(), g = audio.createGain();
+      o.type = type || "sine"; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.12, audio.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + dur);
+      o.connect(g); g.connect(audio.destination);
+      o.start(); o.stop(audio.currentTime + dur);
+    } catch (e) { /* audio unavailable */ }
+  }
+  function vibrate(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+  function startGame() {
+    score = 0; streak = 0; combo = 1; hearts = 3; timeLeft = 60;
+    jellyHits = 0; catches = 0; invuln = 0; floaters = [];
+    hook = { x: W / 2, y: NeonAnglerLogic.surfaceY(H) + 10, goingDown: true };
+    targetX = W / 2;
+    fishes = [];
+    for (var i = 0; i < NeonAnglerLogic.fishCount(W); i++) fishes.push(NeonAnglerLogic.newFish(rng, W, H, i));
+    state = "play";
+  }
+  function onPointer(e) {
+    var x = (e.clientX !== undefined) ? e.clientX : (e.touches && e.touches[0] ? e.touches[0].clientX : W / 2);
+    targetX = x;
+    if (state === "title") startGame();
+    else if (state === "over") state = "title";
+  }
+  canvas.addEventListener("pointerdown", onPointer);
+  canvas.addEventListener("pointermove", onPointer);
+  canvas.addEventListener("touchstart", onPointer, { passive: true });
+  canvas.addEventListener("touchmove", onPointer, { passive: true });
+
+  var last = 0;
+  function frame(ts) {
+    var dt = last ? Math.min(0.05, (ts - last) / 1000) : 0.016;
+    last = ts;
+    // World transform re-applied at the start of every frame (resize resets it).
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (state === "play") {
+      timeLeft -= dt;
+      if (invuln > 0) invuln -= dt;
+      hook.x += (targetX - hook.x) * Math.min(1, dt * 12);
+      NeonAnglerLogic.hookStep(hook, dt, H);
+      for (var i = 0; i < fishes.length; i++) {
+        var f = fishes[i];
+        NeonAnglerLogic.moveFish(f, dt, W);
+        if (invuln <= 0) {
+          if (NeonAnglerLogic.hitsFish(hook, f)) {
+            if (f.jelly) {
+              hearts--; jellyHits++; streak = NeonAnglerLogic.afterJelly(); combo = 1;
+              invuln = 1.2; beep(120, 0.25, "sawtooth"); vibrate(120);
+              floaters.push({ x: f.x, y: f.y, txt: "OUCH! -1 HEART", t: 1 });
+              fishes[i] = NeonAnglerLogic.newFish(rng, W, H, f.id);
+            } else {
+              streak = NeonAnglerLogic.afterCatch(streak);
+              combo = NeonAnglerLogic.comboFor(streak);
+              var pts = NeonAnglerLogic.scoreFor(combo, f.golden);
+              score += pts; catches++;
+              beep(f.golden ? 880 : 520 + Math.min(300, streak * 20), 0.15, "sine");
+              vibrate(20);
+              floaters.push({ x: f.x, y: f.y, txt: "+" + pts + (f.golden ? " GOLD!" : ""), t: 1 });
+              fishes[i] = NeonAnglerLogic.newFish(rng, W, H, f.id);
+            }
+          }
+        }
+      }
+      for (var j = floaters.length - 1; j >= 0; j--) {
+        floaters[j].y -= 30 * dt; floaters[j].t -= dt;
+        if (floaters[j].t <= 0) floaters.splice(j, 1);
+      }
+      if (hearts <= 0 || timeLeft <= 0) {
+        if (hearts > 0 && jellyHits === 0) score += 500;
+        if (score > best) { best = score; try { window.localStorage.setItem("neon_angler_best", String(best)); } catch (e) {} }
+        state = "over";
+      }
+    }
+    draw();
+    requestAnimationFrame(frame);
+  }
+  function drawFish(f) {
+    var dir = f.vx > 0 ? 1 : -1;
+    ctx.save();
+    ctx.translate(f.x, f.y + Math.sin(f.phase) * 3);
+    ctx.scale(dir, 1);
+    if (f.jelly) {
+      ctx.fillStyle = "rgba(255,90,150,0.9)";
+      ctx.beginPath(); ctx.arc(0, 0, f.r, Math.PI, 0); ctx.fill();
+      ctx.strokeStyle = "#ff5a96"; ctx.lineWidth = 2;
+      for (var t = -1; t <= 1; t++) { ctx.beginPath(); ctx.moveTo(t * 8, f.r * 0.6); ctx.lineTo(t * 10, f.r + 14 + Math.sin(f.phase + t) * 4); ctx.stroke(); }
+    } else {
+      ctx.fillStyle = f.golden ? "#ffd23f" : ["#38e08c", "#54a8ff", "#ff8cd1", "#6cf0ff"][f.id % 4];
+      ctx.beginPath(); ctx.ellipse(0, 0, f.r, f.r * 0.62, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.moveTo(-f.r, 0); ctx.lineTo(-f.r - 12, -9); ctx.lineTo(-f.r - 12, 9); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "#04121e"; ctx.beginPath(); ctx.arc(f.r * 0.5, -3, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+  }
+  function draw() {
+    ctx.fillStyle = "#04121e"; ctx.fillRect(0, 0, W, H);
+    var sy = NeonAnglerLogic.surfaceY(H);
+    ctx.fillStyle = "#0a2a4a"; ctx.fillRect(0, sy, W, H - sy);
+    ctx.fillStyle = "rgba(108,240,255,0.25)";
+    for (var b = 0; b < 14; b++) {
+      var bx = (b * 97 + Math.floor(Date.now() / 60) * 2) % (W + 40) - 20;
+      ctx.beginPath(); ctx.arc(bx, sy + 12 + (b % 5) * 3, 2.5, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.fillStyle = "#ffd23f"; ctx.font = "bold 20px system-ui,sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("SCORE " + score, 16, 30);
+    ctx.fillText("x" + combo, 16, 56);
+    ctx.textAlign = "right";
+    ctx.fillText("TIME " + Math.max(0, Math.ceil(timeLeft)) + "s", W - 16, 30);
+    ctx.fillText("BEST " + best, W - 16, 56);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ff5a6e"; ctx.font = "bold 22px system-ui,sans-serif";
+    ctx.fillText("♥".repeat(Math.max(0, hearts)) + "♡".repeat(Math.max(0, 3 - hearts)), W / 2, 34);
+    if (state === "title") {
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 44px system-ui,sans-serif";
+      ctx.fillText("NEON ANGLER", W / 2, H * 0.38);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "19px system-ui,sans-serif";
+      ctx.fillText("Drag to steer your hook.", W / 2, H * 0.38 + 36);
+      ctx.fillText("Catch fish, dodge jellyfish!", W / 2, H * 0.38 + 62);
+      ctx.fillStyle = "#ffd23f"; ctx.font = "bold 24px system-ui,sans-serif";
+      ctx.fillText("TAP TO FISH", W / 2, H * 0.38 + 108);
+    } else if (state === "over") {
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 40px system-ui,sans-serif";
+      ctx.fillText("TIME UP!", W / 2, H * 0.38);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "24px system-ui,sans-serif";
+      ctx.fillText("Score: " + score + "  ·  Catches: " + catches, W / 2, H * 0.38 + 40);
+      ctx.fillText("Best: " + best + (jellyHits === 0 && hearts > 0 ? "  ·  Flawless +500!" : ""), W / 2, H * 0.38 + 74);
+      ctx.fillStyle = "#ffd23f"; ctx.font = "bold 24px system-ui,sans-serif";
+      ctx.fillText("TAP TO PLAY AGAIN", W / 2, H * 0.38 + 118);
+    }
+    if (state !== "title") {
+      for (var i = 0; i < fishes.length; i++) drawFish(fishes[i]);
+      // Boat + line + hook (hook is a hollow ring, never a filled fish-lookalike).
+      ctx.fillStyle = "#ff8c42";
+      ctx.beginPath(); ctx.moveTo(hook.x - 26, sy - 8); ctx.lineTo(hook.x + 26, sy - 8); ctx.lineTo(hook.x + 18, sy + 10); ctx.lineTo(hook.x - 18, sy + 10); ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = "#e8ecff"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(hook.x, sy + 10); ctx.lineTo(hook.x, hook.y); ctx.stroke();
+      ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(hook.x, hook.y, 11, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillStyle = "#ffffff"; ctx.font = "bold 16px system-ui,sans-serif"; ctx.textAlign = "center";
+      for (var k = 0; k < floaters.length; k++) ctx.fillText(floaters[k].txt, floaters[k].x, floaters[k].y);
+    }
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
