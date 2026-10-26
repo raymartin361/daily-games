@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Mines — Day 32</title>
+<meta name="description" content="Neon Mines — 60 seconds of minesweeper-style deduction chaos. Tap safe tiles, read the numbers, dodge the mines, chain 8 safe taps to raise your combo to x5. Golden tiles pay 5x.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#0b1026;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Mines — Day 32. Minesweeper-style deduction: 60 seconds, 7x9 grid.
+   Tap a tile to reveal it. Numbers count adjacent mines. A mine costs a
+   heart and resets the combo. Every 8 chained safe taps raises the combo
+   ladder x1->x5. Safe tile +50 x combo; golden tile 5x. Clearing a board
+   pays +500 and deals a fresh board. Flawless run (no mine hits) +500. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+var NeonMinesLogic = (function () {
+  var COLS = 7, ROWS = 9, MINES = 11;
+  function makeRng(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+  function comboFor(streak) {
+    var c = 1 + Math.floor(streak / 8);
+    return c > 5 ? 5 : c;
+  }
+  function pointsForCell(combo, golden) { return 50 * combo * (golden ? 5 : 1); }
+  function idx(col, row) { return row * COLS + col; }
+  function colOf(i) { return i % COLS; }
+  function rowOf(i) { return Math.floor(i / COLS); }
+  function neighbors(i) {
+    var c = colOf(i), r = rowOf(i), out = [], dc, dr, nc, nr;
+    for (dc = -1; dc <= 1; dc++) for (dr = -1; dr <= 1; dr++) {
+      if (dc === 0 && dr === 0) continue;
+      nc = c + dc; nr = r + dr;
+      if (nc >= 0 && nc < COLS && nr >= 0 && nr < ROWS) out.push(idx(nc, nr));
+    }
+    return out;
+  }
+  function createBoard(rng, safeIdx) {
+    var cells = [], i, j, m, cand, nbs, nb;
+    for (i = 0; i < COLS * ROWS; i++) cells.push({ mine: false, revealed: false, adj: 0, golden: false });
+    var placed = 0, guard = 0;
+    while (placed < MINES && guard < 1000) {
+      guard++;
+      cand = Math.floor(rng() * cells.length);
+      if (cand === safeIdx || cells[cand].mine) continue;
+      cells[cand].mine = true; placed++;
+    }
+    for (i = 0; i < cells.length; i++) {
+      if (cells[i].mine) continue;
+      nbs = neighbors(i); m = 0;
+      for (j = 0; j < nbs.length; j++) if (cells[nbs[j]].mine) m++;
+      cells[i].adj = m;
+    }
+    var safe = [];
+    for (i = 0; i < cells.length; i++) if (!cells[i].mine) safe.push(i);
+    for (i = safe.length - 1; i > 0; i--) { j = Math.floor(rng() * (i + 1)); var t = safe[i]; safe[i] = safe[j]; safe[j] = t; }
+    var goldCount = Math.floor(safe.length * 0.12);
+    for (i = 0; i < goldCount; i++) cells[safe[i]].golden = true;
+    return { cells: cells, cols: COLS, rows: ROWS, mines: MINES };
+  }
+  // Reveal starting at startIdx. Returns {revealed:[idx...], hitMine:bool}.
+  function reveal(board, startIdx) {
+    var cells = board.cells;
+    if (cells[startIdx].revealed) return { revealed: [], hitMine: false };
+    if (cells[startIdx].mine) { cells[startIdx].revealed = true; return { revealed: [startIdx], hitMine: true }; }
+    var out = [], stack = [startIdx], cur, nbs, k;
+    while (stack.length) {
+      cur = stack.pop();
+      if (cells[cur].revealed || cells[cur].mine) continue;
+      cells[cur].revealed = true; out.push(cur);
+      if (cells[cur].adj === 0) {
+        nbs = neighbors(cur);
+        for (k = 0; k < nbs.length; k++) if (!cells[nbs[k]].revealed && !cells[nbs[k]].mine) stack.push(nbs[k]);
+      }
+    }
+    return { revealed: out, hitMine: false };
+  }
+  function allSafeRevealed(board) {
+    var i;
+    for (i = 0; i < board.cells.length; i++) if (!board.cells[i].mine && !board.cells[i].revealed) return false;
+    return true;
+  }
+  function revealedCount(board) {
+    var i, n = 0;
+    for (i = 0; i < board.cells.length; i++) if (board.cells[i].revealed) n++;
+    return n;
+  }
+  function boardRect(W, H) {
+    var top = 104, bottom = 48;
+    var availH = H - top - bottom;
+    var cell = Math.floor(Math.min((W - 24) / COLS, availH / ROWS));
+    if (cell < 10) cell = 10;
+    var bw = cell * COLS, bh = cell * ROWS;
+    return { x: Math.floor((W - bw) / 2), y: top + Math.floor((availH - bh) / 2), cell: cell, bw: bw, bh: bh };
+  }
+  function cellCenter(rect, i) {
+    return { x: rect.x + (colOf(i) + 0.5) * rect.cell, y: rect.y + (rowOf(i) + 0.5) * rect.cell };
+  }
+  return { COLS: COLS, ROWS: ROWS, MINES: MINES, makeRng: makeRng, comboFor: comboFor,
+    pointsForCell: pointsForCell, idx: idx, colOf: colOf, rowOf: rowOf, neighbors: neighbors,
+    createBoard: createBoard, reveal: reveal, allSafeRevealed: allSafeRevealed,
+    revealedCount: revealedCount, boardRect: boardRect, cellCenter: cellCenter };
+})();
+if (typeof window !== "undefined") window.NeonMinesLogic = NeonMinesLogic;
+
+(function () {
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var W = 0, H = 0, dpr = 1;
+  function resize() {
+    var vw = window.innerWidth, vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    W = vw; H = vh;
+    canvas.style.width = vw + "px";
+    canvas.style.height = vh + "px";
+    canvas.width = Math.round(vw * dpr);
+    canvas.height = Math.round(vh * dpr);
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var state = "title"; // title | play | over
+  var score = 0, streak = 0, combo = 1, hearts = 3, timeLeft = 60, best = 0;
+  var mineHits = 0, safeTaps = 0, boardsCleared = 0, floaters = [], board = null;
+  var elapsed = 0, lastT = 0, audioOn = true, audio = null, autoTimer = 0;
+  var autoMode = (window.location.search.indexOf("auto=1") !== -1);
+  try { best = parseInt(window.localStorage.getItem("neon_mines_best") || "0", 10) || 0; } catch (e) { best = 0; }
+
+  function beep(f, d, type) {
+    if (!audioOn) return;
+    try {
+      if (!audio) audio = new (window.AudioContext || window.webkitAudioContext)();
+      var o = audio.createOscillator(), g = audio.createGain();
+      o.type = type || "square"; o.frequency.value = f;
+      g.gain.setValueAtTime(0.08, audio.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, audio.currentTime + d);
+      o.connect(g); g.connect(audio.destination); o.start(); o.stop(audio.currentTime + d);
+    } catch (e) {}
+  }
+  function buzz(p) { try { if (navigator.vibrate) navigator.vibrate(p); } catch (e) {} }
+
+  function start() {
+    state = "play"; score = 0; streak = 0; combo = 1; hearts = 3;
+    timeLeft = 60; mineHits = 0; safeTaps = 0; boardsCleared = 0;
+    floaters = []; board = null; elapsed = 0; autoTimer = 0;
+    lastT = performance.now();
+  }
+  function endGame(flawless) {
+    state = "over";
+    if (flawless) score += 500;
+    if (score > best) { best = score; try { localStorage.setItem("neon_mines_best", String(best)); } catch (e) {} }
+  }
+  function cellAt(x, y) {
+    var rect = NeonMinesLogic.boardRect(W, H);
+    if (x < rect.x || x >= rect.x + rect.bw || y < rect.y || y >= rect.y + rect.bh) return -1;
+    var col = Math.floor((x - rect.x) / rect.cell);
+    var row = Math.floor((y - rect.y) / rect.cell);
+    return NeonMinesLogic.idx(col, row);
+  }
+  function onTap(x, y) {
+    if (state === "title") { start(); beep(660, 0.12); return; }
+    if (state === "over") { state = "title"; return; }
+    if (x > W - 60 && y < 44) { audioOn = !audioOn; return; }
+    var ci = cellAt(x, y);
+    if (ci < 0) return;
+    if (!board) board = NeonMinesLogic.createBoard(Math.random, ci);
+    var res = NeonMinesLogic.reveal(board, ci);
+    if (!res.revealed.length) return;
+    var rect = NeonMinesLogic.boardRect(W, H);
+    var ctr = NeonMinesLogic.cellCenter(rect, ci);
+    if (res.hitMine) {
+      hearts--; mineHits++; streak = 0; combo = 1; score = Math.max(0, score - 50);
+      floaters.push({ x: ctr.x, y: ctr.y - 10, txt: "-50 MINE!", col: "#ff4d6d", t: 1 });
+      beep(140, 0.25, "sawtooth"); buzz(120);
+      if (hearts <= 0) endGame(false);
+      return;
+    }
+    safeTaps++; streak++;
+    combo = NeonMinesLogic.comboFor(streak);
+    var pts = 0, k, cell;
+    for (k = 0; k < res.revealed.length; k++) {
+      cell = board.cells[res.revealed[k]];
+      pts += NeonMinesLogic.pointsForCell(combo, cell.golden);
+    }
+    score += pts;
+    var first = NeonMinesLogic.cellCenter(rect, res.revealed[0]);
+    floaters.push({ x: first.x, y: first.y - 8, txt: "+" + pts, col: "#ffd166", t: 1 });
+    beep(520 + combo * 60, 0.1); buzz(20);
+    if (NeonMinesLogic.allSafeRevealed(board)) {
+      boardsCleared++; score += 500;
+      floaters.push({ x: W / 2, y: H / 2, txt: "BOARD CLEAR +500", col: "#39ff9a", t: 1.4 });
+      beep(880, 0.2); board = NeonMinesLogic.createBoard(Math.random, -1);
+    }
+  }
+  canvas.addEventListener("pointerdown", function (e) { e.preventDefault(); onTap(e.clientX, e.clientY); });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") audioOn = !audioOn;
+    if (e.key === " " && state !== "play") { e.preventDefault(); onTap(W / 2, H / 2); }
+  });
+
+  var NUM_COLS = ["", "#39c6ff", "#39ff9a", "#ffd166", "#ff9f43", "#ff4d6d", "#c084fc", "#ff6b9d", "#ffffff"];
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "#0b1026"; ctx.fillRect(0, 0, W, H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#eaf6ff"; ctx.font = "bold 26px system-ui, sans-serif";
+    ctx.fillText("NEON MINES", W / 2, 34);
+    ctx.font = "15px system-ui, sans-serif"; ctx.fillStyle = "#9fd8ff";
+    ctx.fillText("SCORE " + score + "   x" + combo + "   " + "♥".repeat(Math.max(0, hearts)) + "   " + Math.ceil(timeLeft) + "s", W / 2, 58);
+    ctx.fillStyle = "#ffd166"; ctx.font = "13px system-ui, sans-serif";
+    ctx.fillText("BEST " + best + "  ·  Tap safe tiles · numbers count adjacent mines", W / 2, 78);
+    ctx.fillStyle = audioOn ? "#39ff9a" : "#ff4d6d"; ctx.font = "20px system-ui, sans-serif"; ctx.textAlign = "right";
+    ctx.fillText(audioOn ? "♪" : "✕", W - 16, 32); ctx.textAlign = "center";
+    if (state === "title") {
+      ctx.fillStyle = "rgba(5,10,30,0.72)"; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "#eaf6ff"; ctx.font = "bold 34px system-ui, sans-serif";
+      ctx.fillText("NEON MINES", W / 2, H / 2 - 70);
+      ctx.font = "17px system-ui, sans-serif"; ctx.fillStyle = "#9fd8ff";
+      ctx.fillText("Tap tiles to reveal them.", W / 2, H / 2 - 30);
+      ctx.fillText("Numbers = adjacent mines. Mines cost a heart.", W / 2, H / 2 - 4);
+      ctx.fillText("8 safe taps in a row raise your combo to x5.", W / 2, H / 2 + 22);
+      ctx.fillText("Golden tiles pay 5x. Clear a board: +500.", W / 2, H / 2 + 48);
+      ctx.fillStyle = "#39ff9a"; ctx.font = "bold 22px system-ui, sans-serif";
+      ctx.fillText("TAP TO START", W / 2, H / 2 + 100);
+      return;
+    }
+    if (state === "over") {
+      ctx.fillStyle = "rgba(5,10,30,0.72)"; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "#eaf6ff"; ctx.font = "bold 32px system-ui, sans-serif";
+      ctx.fillText("TIME UP!", W / 2, H / 2 - 40);
+      ctx.font = "20px system-ui, sans-serif"; ctx.fillStyle = "#ffd166";
+      ctx.fillText("SCORE " + score + "  ·  BEST " + best, W / 2, H / 2);
+      ctx.fillStyle = "#9fd8ff"; ctx.font = "16px system-ui, sans-serif";
+      ctx.fillText("Safe taps " + safeTaps + " · Boards cleared " + boardsCleared, W / 2, H / 2 + 30);
+      ctx.fillStyle = "#39ff9a"; ctx.font = "bold 20px system-ui, sans-serif";
+      ctx.fillText("TAP TO PLAY AGAIN", W / 2, H / 2 + 80);
+      return;
+    }
+    // play: draw board (empty grid until the first tap deals a board)
+    var rect = NeonMinesLogic.boardRect(W, H);
+    var i, cell, ctr;
+    if (!board) {
+      for (i = 0; i < NeonMinesLogic.COLS * NeonMinesLogic.ROWS; i++) {
+        var egx = rect.x + NeonMinesLogic.colOf(i) * rect.cell;
+        var egy = rect.y + NeonMinesLogic.rowOf(i) * rect.cell;
+        ctx.fillStyle = "#1d2f6e";
+        ctx.fillRect(egx + 2, egy + 2, rect.cell - 4, rect.cell - 4);
+        ctx.strokeStyle = "#39c6ff"; ctx.lineWidth = 1.5;
+        ctx.strokeRect(egx + 2, egy + 2, rect.cell - 4, rect.cell - 4);
+      }
+      ctx.fillStyle = "#9fd8ff"; ctx.font = "17px system-ui, sans-serif";
+      ctx.fillText("Tap any tile — your first tap is always safe!", W / 2, H - 22);
+      return;
+    }
+    for (i = 0; i < board.cells.length; i++) {
+      cell = board.cells[i]; ctr = NeonMinesLogic.cellCenter(rect, i);
+      var gx = rect.x + NeonMinesLogic.colOf(i) * rect.cell;
+      var gy = rect.y + NeonMinesLogic.rowOf(i) * rect.cell;
+      var pad = 2;
+      ctx.fillStyle = cell.revealed ? (cell.golden ? "#3a2c00" : "#16224f") : "#1d2f6e";
+      ctx.fillRect(gx + pad, gy + pad, rect.cell - pad * 2, rect.cell - pad * 2);
+      ctx.strokeStyle = cell.revealed ? "#2a4a8f" : "#39c6ff";
+      ctx.lineWidth = cell.revealed ? 1 : 1.5;
+      ctx.strokeRect(gx + pad, gy + pad, rect.cell - pad * 2, rect.cell - pad * 2);
+      if (!cell.revealed) continue;
+      if (cell.mine) {
+        ctx.fillStyle = "#ff4d6d"; ctx.beginPath();
+        ctx.arc(ctr.x, ctr.y, rect.cell * 0.26, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = "#fff"; ctx.font = "bold " + Math.floor(rect.cell * 0.32) + "px system-ui, sans-serif";
+        ctx.fillText("✹", ctr.x, ctr.y + rect.cell * 0.12);
+      } else if (cell.adj > 0) {
+        ctx.fillStyle = NUM_COLS[cell.adj] || "#fff";
+        ctx.font = "bold " + Math.floor(rect.cell * 0.42) + "px system-ui, sans-serif";
+        ctx.fillText(String(cell.adj), ctr.x, ctr.y + rect.cell * 0.15);
+        if (cell.golden) { ctx.fillStyle = "#ffd166"; ctx.font = "bold 11px system-ui, sans-serif"; ctx.fillText("★", ctr.x, ctr.y + rect.cell * 0.38); }
+      } else if (cell.golden) {
+        ctx.fillStyle = "#ffd166"; ctx.font = "bold 14px system-ui, sans-serif";
+        ctx.fillText("★", ctr.x, ctr.y + 5);
+      }
+    }
+    if (!board) {
+      ctx.fillStyle = "#9fd8ff"; ctx.font = "17px system-ui, sans-serif";
+      ctx.fillText("Tap any tile — your first tap is always safe!", W / 2, H - 22);
+    } else {
+      ctx.fillStyle = "#9fd8ff"; ctx.font = "14px system-ui, sans-serif";
+      ctx.fillText("Mines: " + NeonMinesLogic.MINES + " · Safe taps: " + safeTaps + " · Streak: " + streak, W / 2, H - 22);
+    }
+    var f;
+    for (f = 0; f < floaters.length; f++) {
+      ctx.globalAlpha = Math.max(0, floaters[f].t);
+      ctx.fillStyle = floaters[f].col; ctx.font = "bold 18px system-ui, sans-serif";
+      ctx.fillText(floaters[f].txt, floaters[f].x, floaters[f].y);
+    }
+    ctx.globalAlpha = 1;
+  }
+  function frame(now) {
+    var dt = 0;
+    if (lastT) dt = Math.min(0.1, (now - lastT) / 1000);
+    lastT = now;
+    if (state === "play") {
+      timeLeft -= dt; elapsed += dt;
+      var k;
+      for (k = floaters.length - 1; k >= 0; k--) { floaters[k].t -= dt; floaters[k].y -= 18 * dt; if (floaters[k].t <= 0) floaters.splice(k, 1); }
+      if (autoMode) {
+        autoTimer += dt;
+        if (autoTimer > 0.7) {
+          autoTimer = 0;
+          var rect = NeonMinesLogic.boardRect(W, H), i2, ctr2;
+          if (!board) { ctr2 = NeonMinesLogic.cellCenter(rect, NeonMinesLogic.idx(3, 4)); onTap(ctr2.x, ctr2.y); }
+          else {
+            for (i2 = 0; i2 < board.cells.length; i2++) {
+              if (!board.cells[i2].revealed && !board.cells[i2].mine) { ctr2 = NeonMinesLogic.cellCenter(rect, i2); onTap(ctr2.x, ctr2.y); break; }
+            }
+          }
+        }
+      }
+      if (timeLeft <= 0) { timeLeft = 0; endGame(mineHits === 0); }
+    }
+    draw();
+    requestAnimationFrame(frame);
+  }
+  window.NeonMinesDebug = {
+    snapshot: function () {
+      var rect = NeonMinesLogic.boardRect(W, H), cells = null, i, ctr;
+      if (board) {
+        cells = [];
+        for (i = 0; i < board.cells.length; i++) {
+          ctr = NeonMinesLogic.cellCenter(rect, i);
+          cells.push({ x: Math.round(ctr.x), y: Math.round(ctr.y), col: NeonMinesLogic.colOf(i), row: NeonMinesLogic.rowOf(i), revealed: board.cells[i].revealed, mine: board.cells[i].mine, golden: board.cells[i].golden });
+        }
+      }
+      return { state: state, score: score, hearts: hearts, combo: combo, timeLeft: timeLeft, cells: cells, rect: rect };
+    }
+  };
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
