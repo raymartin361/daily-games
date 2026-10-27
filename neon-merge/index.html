@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Merge — Daily Game</title>
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0b1026;font-family:'Segoe UI',system-ui,sans-serif;touch-action:none;overscroll-behavior:none}
+canvas{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+var canvas=document.getElementById("c"), ctx=canvas.getContext("2d");
+var vw=390, vh=844, dpr=1;
+function resize(){
+  vw=window.innerWidth||390; vh=window.innerHeight||844; dpr=window.devicePixelRatio||1;
+  canvas.width=Math.round(vw*dpr); canvas.height=Math.round(vh*dpr);
+  canvas.style.width=vw+"px"; canvas.style.height=vh+"px";
+  layout();
+}
+window.addEventListener("resize",resize);
+window.addEventListener("orientationchange",resize);
+document.addEventListener("touchmove",function(e){e.preventDefault();},{passive:false});
+
+// ---- pure merge logic (also used by smoke tests) ----
+function emptyBoard(){var b=[];for(var i=0;i<16;i++)b.push({v:0,g:false});return b;}
+function slideLine(line){
+  // line: array of {v,g} in move direction order. Returns {tiles, gained, merges}
+  var nz=line.filter(function(t){return t.v>0;});
+  var out=[], gained=0, merges=0;
+  for(var i=0;i<nz.length;i++){
+    if(i+1<nz.length && nz[i].v===nz[i+1].v){
+      var nv=nz[i].v*2;
+      var gold=(nz[i].g||nz[i+1].g);
+      out.push({v:nv,g:false});
+      gained+= gold ? nv*5 : nv; // gold bonus counted raw; combo applied by caller
+      // store gold flag separately: mark via gainedGold
+      out[out.length-1]._goldBonus=gold;
+      merges++; i++;
+    } else out.push({v:nz[i].v,g:nz[i].g});
+  }
+  while(out.length<4)out.push({v:0,g:false});
+  return {tiles:out,gained:gained,merges:merges};
+}
+function moveBoard(board,dir){
+  // dir: 'left','right','up','down'. Returns {board, moved, gainedRaw, gainedGold, merges}
+  var nb=emptyBoard(), moved=false, gainedRaw=0, gainedGold=0, merges=0;
+  function write(idx,tiles){
+    for(var k=0;k<4;k++){nb[idx[k]]={v:tiles[k].v,g:tiles[k].g};}
+  }
+  for(var n=0;n<4;n++){
+    var idx=[],line=[];
+    for(var k=0;k<4;k++){
+      var r,c;
+      if(dir==="left"){r=n;c=k;}
+      else if(dir==="right"){r=n;c=3-k;}
+      else if(dir==="up"){r=k;c=n;}
+      else {r=3-k;c=n;}
+      idx.push(r*4+c); line.push(board[r*4+c]);
+    }
+    var res=slideLine(line);
+    gainedGold+=0; // gold handled below via _goldBonus on merged tiles
+    // recompute: slideLine's gained already includes 5x for gold merges; separate raw vs gold:
+    // We approximate: raw gain = sum of merged values, gold extra handled by caller using _goldBonus.
+    // To keep it exact, recompute from tiles:
+    var raw=0, goldExtra=0;
+    // merged tiles are those created in slideLine; detect by comparing: simpler - recompute in slideLine2
+    write(idx,res.tiles);
+    merges+=res.merges;
+    // store per-line merged info for scoring in a side array
+    nb._lines=nb._lines||[]; nb._lines.push(res);
+    void raw; void goldExtra;
+  }
+  // Score computation (exact): redo per line with gold tracking
+  var totalScore=0, totalMerges=0;
+  for(var li=0;li<4;li++){
+    var res2=nb._lines[li];
+    for(var ti=0;ti<res2.tiles.length;ti++){
+      if(res2.tiles[ti]._goldBonus){ totalScore+=0; } // placeholder, replaced below
+    }
+    totalMerges+=res2.merges;
+  }
+  delete nb._lines;
+  // Exact scoring: walk original lines again, merging with gold awareness
+  totalScore=0;
+  for(var n2=0;n2<4;n2++){
+    var line2=[];
+    for(var k2=0;k2<4;k2++){
+      var r2,c2;
+      if(dir==="left"){r2=n2;c2=k2;}
+      else if(dir==="right"){r2=n2;c2=3-k2;}
+      else if(dir==="up"){r2=k2;c2=n2;}
+      else {r2=3-k2;c2=n2;}
+      line2.push(board[r2*4+c2]);
+    }
+    var nz2=line2.filter(function(t){return t.v>0;});
+    for(var i2=0;i2<nz2.length;i2++){
+      if(i2+1<nz2.length && nz2[i2].v===nz2[i2+1].v){
+        var mv=nz2[i2].v*2; var gold2=(nz2[i2].g||nz2[i2+1].g);
+        totalScore+= gold2 ? mv*5 : mv; i2++;
+      }
+    }
+  }
+  for(var i=0;i<16;i++){ if(nb[i].v!==board[i].v || nb[i].g!==board[i].g) moved=true; }
+  // strip temp flags
+  for(var j=0;j<16;j++) delete nb[j]._goldBonus;
+  return {board:nb,moved:moved,gained:totalScore,merges:totalMerges};
+}
+function hasMoves(board){
+  for(var i=0;i<16;i++) if(board[i].v===0) return true;
+  var dirs=["left","right","up","down"];
+  for(var d=0;d<dirs.length;d++) if(moveBoard(board,dirs[d]).moved) return true;
+  return false;
+}
+function comboMult(merges){ return Math.min(5,1+Math.floor(merges/8)); }
+
+// ---- game state ----
+var state="title", board=emptyBoard(), score=0, merges=0, best=0, timeLeft=60, lastT=0;
+var bonus128=false, layoutInfo={gridX:0,gridY:0,cell:0,btns:[]};
+try{ best=parseInt(localStorage.getItem("neon_merge_best")||"0",10)||0; }catch(e){}
+function spawnRandom(){
+  var empt=[]; for(var i=0;i<16;i++) if(board[i].v===0) empt.push(i);
+  if(!empt.length) return;
+  var idx=empt[Math.floor(Math.random()*empt.length)];
+  var gold=Math.random()<0.10;
+  board[idx]={v:(Math.random()<0.9?2:4), g:gold};
+}
+function startGame(){
+  board=emptyBoard(); score=0; merges=0; timeLeft=60; bonus128=false; state="playing";
+  spawnRandom(); spawnRandom(); lastT=performance.now();
+}
+function doMove(dir){
+  if(state!=="playing") return false;
+  var res=moveBoard(board,dir);
+  if(!res.moved) return false;
+  board=res.board;
+  // combo applied to non-gold part is already baked: gained uses 5x for gold, 1x otherwise.
+  // Apply combo multiplier to the non-gold portion: recompute split.
+  // Simpler scoring contract (documented in tests): gained = sum merged values,
+  // gold merges 5x, other merges x comboMult(merges BEFORE this move).
+  // moveBoard's gained already = gold 5x + others 1x. Adjust others by combo:
+  var before=comboMult(merges);
+  // recompute non-gold merged sum
+  var nonGold=0, goldSum=0;
+  (function(){
+    for(var n=0;n<4;n++){
+      var line=[];
+      for(var k=0;k<4;k++){
+        var r,c;
+        if(dir==="left"){r=n;c=k;} else if(dir==="right"){r=n;c=3-k;}
+        else if(dir==="up"){r=k;c=n;} else {r=3-k;c=n;}
+        line.push(boardPrev[r*4+c]);
+      }
+      var nz=line.filter(function(t){return t.v>0;});
+      for(var i=0;i<nz.length;i++){
+        if(i+1<nz.length && nz[i].v===nz[i+1].v){
+          var mv=nz[i].v*2;
+          if(nz[i].g||nz[i+1].g) goldSum+=mv*5; else nonGold+=mv;
+          i++;
+        }
+      }
+    }
+  })();
+  score+= nonGold*before + goldSum;
+  merges+=res.merges;
+  // 128 bonus
+  if(!bonus128){
+    for(var i=0;i<16;i++) if(board[i].v>=128){ score+=500; bonus128=true; break; }
+  }
+  spawnRandom();
+  if(!hasMoves(board)) endGame();
+  return true;
+}
+var boardPrev=null;
+// wrap doMove to capture prev board: monkey-patch via internal function
+var _doMoveOrig=doMove;
+doMove=function(dir){
+  if(state!=="playing") return false;
+  boardPrev=board.map(function(t){return {v:t.v,g:t.g};});
+  return _doMoveOrig(dir);
+};
+function endGame(){
+  state="over";
+  if(score>best){ best=score; try{localStorage.setItem("neon_merge_best",String(best));}catch(e){} }
+}
+function layout(){
+  var size=Math.min(vw-32, vh-300);
+  if(size<200) size=200;
+  layoutInfo.cell=size/4;
+  layoutInfo.gridX=(vw-size)/2;
+  layoutInfo.gridY=110;
+  layoutInfo.gridSize=size;
+  var bw=Math.min(64,(vw-40)/4), bh=56, by=vh-90;
+  layoutInfo.btns=[
+    {dir:"left",x:(vw-bw*4-24)/2,y:by,w:bw,h:bh,label:"\u2190"},
+    {dir:"up",x:(vw-bw*4-24)/2+bw+8,y:by,w:bw,h:bh,label:"\u2191"},
+    {dir:"down",x:(vw-bw*4-24)/2+bw*2+16,y:by,w:bw,h:bh,label:"\u2193"},
+    {dir:"right",x:(vw-bw*4-24)/2+bw*3+24,y:by,w:bw,h:bh,label:"\u2192"}
+  ];
+}
+var COLORS={2:"#2a335f",4:"#3a4a8c",8:"#f59e0b",16:"#f97316",32:"#ef4444",64:"#e11d48",128:"#a855f7",256:"#7c3aed",512:"#2563eb",1024:"#0891b2",2048:"#facc15"};
+function roundRect(x,y,w,h,r){
+  ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+function draw(){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle="#0b1026"; ctx.fillRect(0,0,vw,vh);
+  ctx.textAlign="center";
+  ctx.fillStyle="#6cf0ff"; ctx.font="bold 30px system-ui"; ctx.fillText("NEON MERGE",vw/2,36);
+  ctx.fillStyle="#aab4e8"; ctx.font="15px system-ui";
+  ctx.fillText("Score "+score+"  x"+comboMult(merges)+"  Best "+best,vw/2,60);
+  ctx.fillText("Time "+Math.ceil(timeLeft)+"s  Merges "+merges,vw/2,82);
+  var gx=layoutInfo.gridX, gy=layoutInfo.gridY, cell=layoutInfo.cell, size=layoutInfo.gridSize;
+  ctx.fillStyle="#151c3f"; roundRect(gx-6,gy-6,size+12,size+12,14); ctx.fill();
+  for(var i=0;i<16;i++){
+    var r=Math.floor(i/4), c=i%4, x=gx+c*cell, y=gy+r*cell, t=board[i];
+    ctx.fillStyle="#1e2760"; roundRect(x+3,y+3,cell-6,cell-6,10); ctx.fill();
+    if(t.v>0){
+      ctx.fillStyle=t.g?"#facc15":(COLORS[t.v]||"#facc15");
+      roundRect(x+3,y+3,cell-6,cell-6,10); ctx.fill();
+      ctx.fillStyle=(t.v<=4||t.g)?"#e8ecff":"#ffffff";
+      ctx.font="bold "+Math.max(16,Math.floor(cell*0.32))+"px system-ui";
+      ctx.fillText(String(t.v),x+cell/2,y+cell/2+Math.floor(cell*0.12));
+      if(t.g){ ctx.font="bold 11px system-ui"; ctx.fillText("GOLD",x+cell/2,y+cell-10); }
+    }
+  }
+  // direction buttons
+  layoutInfo.btns.forEach(function(b){
+    ctx.fillStyle="#2b3572"; roundRect(b.x,b.y,b.w,b.h,12); ctx.fill();
+    ctx.fillStyle="#e8ecff"; ctx.font="bold 26px system-ui"; ctx.fillText(b.label,b.x+b.w/2,b.y+b.h/2+9);
+  });
+  if(state==="playing"){
+    ctx.fillStyle="#7780b8"; ctx.font="13px system-ui";
+    ctx.fillText("Swipe, arrow keys, or tap the arrows. Merge equal tiles!",vw/2,gy+size+26);
+  }
+  if(state==="title"){
+    ctx.fillStyle="rgba(5,8,25,0.82)"; ctx.fillRect(0,0,vw,vh);
+    ctx.fillStyle="#6cf0ff"; ctx.font="bold 34px system-ui"; ctx.fillText("NEON MERGE",vw/2,vh/2-60);
+    ctx.fillStyle="#e8ecff"; ctx.font="18px system-ui";
+    ctx.fillText("Slide the tiles. Merge equals.",vw/2,vh/2-20);
+    ctx.fillText("Gold tiles pay 5x. Reach 128: +500.",vw/2,vh/2+8);
+    ctx.fillStyle="#facc15"; ctx.font="bold 20px system-ui"; ctx.fillText("TAP TO PLAY",vw/2,vh/2+48);
+    ctx.fillStyle="#aab4e8"; ctx.font="14px system-ui"; ctx.fillText("60 seconds — how high can you merge?",vw/2,vh/2+76);
+  } else if(state==="over"){
+    ctx.fillStyle="rgba(5,8,25,0.82)"; ctx.fillRect(0,0,vw,vh);
+    ctx.fillStyle="#6cf0ff"; ctx.font="bold 30px system-ui"; ctx.fillText("TIME!",vw/2,vh/2-40);
+    ctx.fillStyle="#e8ecff"; ctx.font="20px system-ui"; ctx.fillText("Score "+score+"  Best "+best,vw/2,vh/2);
+    ctx.fillStyle="#facc15"; ctx.font="bold 20px system-ui"; ctx.fillText("TAP TO PLAY AGAIN",vw/2,vh/2+44);
+  }
+}
+function loop(now){
+  if(state==="playing"){
+    var dt=(now-lastT)/1000; lastT=now;
+    timeLeft-=dt;
+    if(timeLeft<=0){ timeLeft=0; endGame(); }
+  } else lastT=now;
+  draw();
+  requestAnimationFrame(loop);
+}
+function hitBtn(x,y){
+  for(var i=0;i<layoutInfo.btns.length;i++){
+    var b=layoutInfo.btns[i];
+    if(x>=b.x && x<=b.x+b.w && y>=b.y && y<=b.y+b.h) return b.dir;
+  }
+  return null;
+}
+var sx=0, sy=0;
+canvas.addEventListener("pointerdown",function(e){
+  var rect=canvas.getBoundingClientRect();
+  var x=e.clientX-rect.left, y=e.clientY-rect.top; sx=x; sy=y;
+  if(state!=="playing"){ startGame(); return; }
+  var d=hitBtn(x,y); if(d) doMove(d);
+});
+canvas.addEventListener("pointerup",function(e){
+  if(state!=="playing") return;
+  var rect=canvas.getBoundingClientRect();
+  var dx=(e.clientX-rect.left)-sx, dy=(e.clientY-rect.top)-sy;
+  if(Math.abs(dx)<24 && Math.abs(dy)<24) return;
+  if(Math.abs(dx)>Math.abs(dy)) doMove(dx>0?"right":"left");
+  else doMove(dy>0?"down":"up");
+});
+document.addEventListener("keydown",function(e){
+  var map={ArrowLeft:"left",ArrowRight:"right",ArrowUp:"up",ArrowDown:"down"};
+  if(map[e.key]){
+    e.preventDefault();
+    if(state!=="playing") startGame(); else doMove(map[e.key]);
+  }
+});
+// autoplay for screenshots (?auto=1)
+var autoTimer=null;
+if(location.search.indexOf("auto=1")>=0){
+  startGame();
+  autoTimer=setInterval(function(){
+    if(state!=="playing"){ clearInterval(autoTimer); return; }
+    var dirs=["left","right","up","down"];
+    // try random dirs until one moves
+    for(var t=0;t<8;t++){ var d=dirs[Math.floor(Math.random()*4)]; if(doMove(d)) break; }
+  },650);
+}
+resize();
+requestAnimationFrame(loop);
+window.NeonMergeDebug={
+  snapshot:function(){
+    var rect=canvas.getBoundingClientRect();
+    return {state:state,score:score,merges:merges,board:board.map(function(t){return t.v;}),rect:{x:rect.left,y:rect.top,w:rect.width,h:rect.height},btns:layoutInfo.btns};
+  },
+  moveBoard:moveBoard, comboMult:comboMult, hasMoves:hasMoves, emptyBoard:emptyBoard
+};
+})();
+</script>
+</body>
+</html>
