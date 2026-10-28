@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Sort — Daily Game</title>
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0b1026;font-family:'Segoe UI',system-ui,sans-serif;touch-action:none;overscroll-behavior:none}
+canvas{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+var canvas=document.getElementById("c"), ctx=canvas.getContext("2d");
+var vw=390, vh=844, dpr=1;
+var COLORS=["#ef4444","#22c55e","#3b82f6","#f59e0b"];
+var COLOR_NAMES=["RED","GREEN","BLUE","GOLD"];
+var TUBES=6, CAP=4;
+function layout(){}
+// ---- pure sort logic (also used by smoke tests) ----
+function dealBoard(rng){
+  rng=rng||Math.random;
+  var balls=[];
+  for(var c=0;c<4;c++) for(var k=0;k<CAP;k++) balls.push(c);
+  // one golden ball: mark by value offset — store separately in gold set
+  for(var i=balls.length-1;i>0;i--){var j=Math.floor(rng()*(i+1));var t=balls[i];balls[i]=balls[j];balls[j]=t;}
+  // 6 tubes: 4 filled (4 balls each) + 2 empty. More forgiving for 60s play.
+  var tubes=[]; for(var ti2=0;ti2<TUBES;ti2++) tubes.push([]);
+  for(var b2=0;b2<balls.length;b2++) tubes[Math.floor(b2/CAP)].push(balls[b2]);
+  var goldTube=Math.floor(rng()*4), goldPos=Math.floor(rng()*CAP);
+  return {tubes:tubes, gold:{tube:goldTube,pos:goldPos}};
+}
+function topColor(tube){ return tube.length? tube[tube.length-1] : null; }
+function canMove(tubes,from,to){
+  if(from===to) return false;
+  if(!tubes[from].length) return false;
+  if(tubes[to].length>=CAP) return false;
+  if(!tubes[to].length) return true;
+  return topColor(tubes[to])===topColor(tubes[from]);
+}
+function moveBall(tubes,from,to){
+  if(!canMove(tubes,from,to)) return false;
+  tubes[to].push(tubes[from].pop());
+  return true;
+}
+function isComplete(tube){
+  if(tube.length!==CAP) return false;
+  for(var i=1;i<CAP;i++) if(tube[i]!==tube[0]) return false;
+  return true;
+}
+function countComplete(tubes){ var n=0; for(var i=0;i<tubes.length;i++) if(isComplete(tubes[i])) n++; return n; }
+function comboMult(completes){ return Math.min(5,1+Math.floor(completes/3)); }
+
+// ---- game state ----
+var state="title", tubes=[], gold={tube:-1,pos:-1}, score=0, completes=0, best=0, timeLeft=60, lastT=0;
+var selected=-1, shuffles=0, boardsCleared=0, layoutInfo={tubes:[],shuffleBtn:null};
+try{ best=parseInt(localStorage.getItem("neon_sort_best")||"0",10)||0; }catch(e){}
+function startGame(){
+  var d=dealBoard(); tubes=d.tubes; gold=d.gold;
+  score=0; completes=0; timeLeft=60; selected=-1; shuffles=0; boardsCleared=0; state="playing";
+  lastT=performance.now();
+}
+function dealNewBoard(){
+  var d=dealBoard(); tubes=d.tubes; gold=d.gold; selected=-1;
+}
+function tapTube(idx){
+  if(state!=="playing") return false;
+  if(selected===-1){
+    if(!tubes[idx].length) return false;
+    if(isComplete(tubes[idx])) return false;
+    selected=idx; return true;
+  }
+  if(idx===selected){ selected=-1; return true; }
+  if(!canMove(tubes,selected,idx)) { selected=-1; return false; }
+  var wasGold = (gold.tube===selected && gold.pos===tubes[selected].length-1);
+  moveBall(tubes,selected,idx);
+  if(wasGold) gold={tube:idx,pos:tubes[idx].length-1};
+  selected=-1;
+  if(isComplete(tubes[idx])){
+    var base=200, mult=comboMult(completes);
+    var pts = wasGold ? base*5 : base*mult;
+    score+=pts; completes++;
+    // clear the completed tube after scoring; it becomes an empty tube
+    tubes[idx]=[];
+    if(gold.tube===idx) gold={tube:-1,pos:-1};
+    if(countComplete(tubes)===0 && tubes.every(function(t){return t.length===0;})){
+      // all tubes empty only if board cleared — handled below
+    }
+    // board cleared? all remaining balls are in complete tubes — impossible since completes clear tubes,
+    // so: board is cleared when every non-empty tube is complete — but completes clear instantly,
+    // so cleared = all tubes empty.
+    var allEmpty=tubes.every(function(t){return t.length===0;});
+    if(allEmpty){ score+=500; boardsCleared++; dealNewBoard(); }
+  }
+  return true;
+}
+function shuffleBoard(){
+  if(state!=="playing") return;
+  shuffles++; selected=-1; dealNewBoard();
+}
+function endGame(){
+  state="over";
+  if(shuffles===0 && score>0) score+=500; // flawless: never shuffled
+  if(score>best){ best=score; try{localStorage.setItem("neon_sort_best",String(best));}catch(e){} }
+}
+function computeLayout(){
+  var cols=3, rows=2;
+  var areaW=Math.min(vw-24, 420), areaH=Math.min(vh-340, 460);
+  var tw=Math.min(104, Math.floor(areaW/cols)-12);
+  var th=Math.min(210, areaH/rows-16);
+  var gapX=12, gapY=18;
+  var totalW=cols*tw+(cols-1)*gapX, totalH=rows*th+(rows-1)*gapY;
+  var x0=(vw-totalW)/2, y0=118;
+  layoutInfo.tubes=[];
+  for(var i=0;i<TUBES;i++){
+    var r=Math.floor(i/cols), c=i%cols;
+    layoutInfo.tubes.push({x:x0+c*(tw+gapX), y:y0+r*(th+gapY), w:tw, h:th});
+  }
+  layoutInfo.shuffleBtn={x:vw/2-110, y:y0+totalH+22, w:220, h:44};
+}
+function resize(){
+  vw=window.innerWidth||390; vh=window.innerHeight||844; dpr=window.devicePixelRatio||1;
+  canvas.width=Math.round(vw*dpr); canvas.height=Math.round(vh*dpr);
+  canvas.style.width=vw+"px"; canvas.style.height=vh+"px";
+  computeLayout();
+}
+window.addEventListener("resize",resize);
+window.addEventListener("orientationchange",resize);
+document.addEventListener("touchmove",function(e){e.preventDefault();},{passive:false});
+function roundRect(x,y,w,h,r){
+  ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+function drawTube(ti){
+  var t=layoutInfo.tubes[ti], balls=tubes[ti]||[];
+  var sel=(selected===ti);
+  ctx.fillStyle=sel?"#facc15":"#2b3572";
+  roundRect(t.x-3,t.y-3,t.w+6,t.h+6,14); ctx.fill();
+  ctx.fillStyle="#151c3f"; roundRect(t.x,t.y,t.w,t.h,12); ctx.fill();
+  var bw=t.w-20, bh=Math.min(38,(t.h-24)/CAP);
+  for(var i=0;i<balls.length;i++){
+    var isGold=(gold.tube===ti && gold.pos===i);
+    var bx=t.x+10, by=t.y+t.h-12-(i+1)*bh+4;
+    ctx.fillStyle=isGold?"#facc15":COLORS[balls[i]];
+    roundRect(bx,by,bw,bh-6,10); ctx.fill();
+    if(isGold){ ctx.fillStyle="#0b1026"; ctx.font="bold 11px system-ui"; ctx.textAlign="center"; ctx.fillText("GOLD",bx+bw/2,by+bh/2+2); }
+  }
+  // tube number
+  ctx.fillStyle="#7780b8"; ctx.font="12px system-ui"; ctx.textAlign="center";
+  ctx.fillText(String(ti+1), t.x+t.w/2, t.y+t.h+16);
+}
+function draw(){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle="#0b1026"; ctx.fillRect(0,0,vw,vh);
+  ctx.textAlign="center";
+  ctx.fillStyle="#6cf0ff"; ctx.font="bold 30px system-ui"; ctx.fillText("NEON SORT",vw/2,36);
+  ctx.fillStyle="#aab4e8"; ctx.font="15px system-ui";
+  ctx.fillText("Score "+score+"  x"+comboMult(completes)+"  Best "+best,vw/2,60);
+  ctx.fillText("Time "+Math.ceil(timeLeft)+"s  Sorted "+completes,vw/2,82);
+  ctx.fillStyle="#7780b8"; ctx.font="13px system-ui";
+  ctx.fillText("Tap a tube, then tap where the ball goes.",vw/2,102);
+  for(var i=0;i<TUBES;i++) drawTube(i);
+  var sb=layoutInfo.shuffleBtn;
+  ctx.fillStyle="#2b3572"; roundRect(sb.x,sb.y,sb.w,sb.h,12); ctx.fill();
+  ctx.fillStyle="#e8ecff"; ctx.font="bold 15px system-ui"; ctx.fillText("SHUFFLE (new board)",sb.x+sb.w/2,sb.y+27);
+  if(state==="title"){
+    ctx.fillStyle="rgba(5,8,25,0.85)"; ctx.fillRect(0,0,vw,vh);
+    ctx.fillStyle="#6cf0ff"; ctx.font="bold 34px system-ui"; ctx.fillText("NEON SORT",vw/2,vh/2-70);
+    ctx.fillStyle="#e8ecff"; ctx.font="18px system-ui";
+    ctx.fillText("Sort every tube to one color.",vw/2,vh/2-30);
+    ctx.fillText("A ball only lands on its own color",vw/2,vh/2-2);
+    ctx.fillText("or an empty tube.",vw/2,vh/2+26);
+    ctx.fillStyle="#facc15"; ctx.font="bold 20px system-ui"; ctx.fillText("TAP TO PLAY",vw/2,vh/2+66);
+    ctx.fillStyle="#aab4e8"; ctx.font="14px system-ui"; ctx.fillText("60 seconds — complete a tube: +200 x combo",vw/2,vh/2+94);
+  } else if(state==="over"){
+    ctx.fillStyle="rgba(5,8,25,0.85)"; ctx.fillRect(0,0,vw,vh);
+    ctx.fillStyle="#6cf0ff"; ctx.font="bold 30px system-ui"; ctx.fillText("TIME!",vw/2,vh/2-40);
+    ctx.fillStyle="#e8ecff"; ctx.font="20px system-ui"; ctx.fillText("Score "+score+"  Best "+best,vw/2,vh/2);
+    ctx.fillStyle="#facc15"; ctx.font="bold 20px system-ui"; ctx.fillText("TAP TO PLAY AGAIN",vw/2,vh/2+44);
+  }
+}
+function loop(now){
+  if(state==="playing"){
+    var dt=(now-lastT)/1000; lastT=now;
+    timeLeft-=dt;
+    if(timeLeft<=0){ timeLeft=0; endGame(); }
+  } else lastT=now;
+  draw();
+  requestAnimationFrame(loop);
+}
+function hitTube(x,y){
+  for(var i=0;i<layoutInfo.tubes.length;i++){
+    var t=layoutInfo.tubes[i];
+    if(x>=t.x && x<=t.x+t.w && y>=t.y && y<=t.y+t.h) return i;
+  }
+  return -1;
+}
+canvas.addEventListener("pointerdown",function(e){
+  var rect=canvas.getBoundingClientRect();
+  var x=e.clientX-rect.left, y=e.clientY-rect.top;
+  if(state!=="playing"){ startGame(); return; }
+  var sb=layoutInfo.shuffleBtn;
+  if(x>=sb.x && x<=sb.x+sb.w && y>=sb.y && y<=sb.y+sb.h){ shuffleBoard(); return; }
+  var ti=hitTube(x,y);
+  if(ti>=0) tapTube(ti);
+});
+if(location.search.indexOf("auto=1")>=0){
+  startGame();
+  setInterval(function(){
+    if(state!=="playing") return;
+    // greedy autoplay: find any legal move
+    for(var f=0;f<TUBES;f++) for(var t=0;t<TUBES;t++){
+      if(canMove(tubes,f,t)){ selected=f; tapTube(t); return; }
+    }
+    shuffleBoard();
+  },700);
+}
+resize();
+requestAnimationFrame(loop);
+window.NeonSortDebug={
+  snapshot:function(){
+    var rect=canvas.getBoundingClientRect();
+    return {state:state,score:score,completes:completes,selected:selected,tubes:tubes.map(function(t){return t.slice();}),gold:gold,rect:{w:rect.width,h:rect.height},tubeRects:layoutInfo.tubes,shuffleBtn:layoutInfo.shuffleBtn};
+  },
+  dealBoard:dealBoard, canMove:canMove, moveBall:moveBall, isComplete:isComplete, comboMult:comboMult
+};
+})();
+</script>
+</body>
+</html>
