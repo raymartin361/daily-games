@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Laser — Daily Game</title>
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0b1026;font-family:'Segoe UI',system-ui,sans-serif;touch-action:none;overscroll-behavior:none}
+canvas{display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function(){
+"use strict";
+var canvas=document.getElementById("c"), ctx=canvas.getContext("2d");
+var vw=390, vh=844, dpr=1;
+var GRID=6, NMIRRORS=7, EMIT_ROW=2;
+var DIRS=[[1,0],[0,1],[-1,0],[0,-1]]; // 0 right, 1 down, 2 left, 3 up
+function layout(){}
+// ---- pure laser logic (also used by smoke tests) ----
+// mirror '/' : right->up, up->right, left->down, down->left
+// mirror '\' : right->down, down->right, left->up, up->left
+function reflect(dir,mirror){
+  if(mirror==="/"){ return [3,2,1,0][dir]; }
+  return [1,0,3,2][dir]; // backslash
+}
+function dealBoard(rng){
+  rng=rng||Math.random;
+  var cells=[];
+  for(var r=0;r<GRID;r++) for(var c=0;c<GRID;c++) cells.push({r:r,c:c});
+  for(var i=cells.length-1;i>0;i--){var j=Math.floor(rng()*(i+1));var t=cells[i];cells[i]=cells[j];cells[j]=t;}
+  var grid=[]; for(var k=0;k<GRID;k++){ grid.push([]); for(var c2=0;c2<GRID;c2++) grid[k].push(null); }
+  var mirrors=[];
+  for(var m=0;m<NMIRRORS;m++){
+    var cell=cells[m];
+    var o=rng()<0.5?"/":"\\";
+    grid[cell.r][cell.c]=o;
+    mirrors.push({r:cell.r,c:cell.c,o:o});
+  }
+  var tcell=cells[NMIRRORS];
+  var target={r:tcell.r,c:tcell.c};
+  var golden=rng()<0.2;
+  return {grid:grid,mirrors:mirrors,target:target,golden:golden};
+}
+// Trace the beam from the left edge at startRow. Returns {hit,loop,path}
+// where path is a list of {r,c} cells the beam center passes through.
+function traceBeam(grid,target,startRow){
+  var r=startRow, c=-1, dir=0;
+  var path=[], seen={}, steps=0, hit=false, loop=false;
+  while(steps<300){
+    steps++;
+    var nr=r+DIRS[dir][1], nc=c+DIRS[dir][0];
+    if(nr<0||nr>=GRID||nc<0||nc>=GRID) break; // exited the grid: miss
+    var key=nr+","+nc+","+dir;
+    if(seen[key]){ loop=true; break; }
+    seen[key]=true;
+    r=nr; c=nc;
+    path.push({r:r,c:c});
+    if(target && r===target.r && c===target.c){ hit=true; break; }
+    var mir=grid[r][c];
+    if(mir) dir=reflect(dir,mir);
+  }
+  if(steps>=300) loop=true;
+  return {hit:hit,loop:loop,path:path};
+}
+function comboMult(hits){ return Math.min(5,1+Math.floor(hits/8)); }
+
+// ---- game state ----
+var state="title", grid=[], mirrors=[], target={r:-1,c:-1}, golden=false;
+var score=0, hits=0, best=0, timeLeft=60, lastT=0, hearts=3, shuffles=0;
+var beam=null, beamUntil=0, flash="", flashUntil=0, muted=false;
+var layoutInfo={grid:{x:0,y:0,cell:0},fireBtn:null,shuffleBtn:null,muteBtn:null};
+try{ best=parseInt(localStorage.getItem("neon_laser_best")||"0",10)||0; }catch(e){}
+function newTarget(){
+  var free=[];
+  for(var r=0;r<GRID;r++) for(var c=0;c<GRID;c++) if(!grid[r][c]) free.push({r:r,c:c});
+  var t=free[Math.floor(Math.random()*free.length)]||{r:0,c:0};
+  target=t; golden=Math.random()<0.2;
+}
+function startGame(){
+  var d=dealBoard(); grid=d.grid; mirrors=d.mirrors; target=d.target; golden=d.golden;
+  score=0; hits=0; timeLeft=60; hearts=3; shuffles=0; beam=null; flash=""; state="playing";
+  lastT=performance.now();
+}
+function shuffleBoard(){
+  if(state!=="playing") return;
+  shuffles++;
+  var d=dealBoard(); grid=d.grid; mirrors=d.mirrors; target=d.target; golden=d.golden;
+  beam=null; flash="RESHUFFLED";
+  flashUntil=performance.now()+900;
+}
+function beep(freq,dur,type){
+  if(muted) return;
+  try{
+    var AC=window.AudioContext||window.webkitAudioContext; if(!AC) return;
+    var ac=new AC(), o=ac.createOscillator(), g=ac.createGain();
+    o.type=type||"sine"; o.frequency.value=freq;
+    g.gain.setValueAtTime(0.12,ac.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001,ac.currentTime+dur);
+    o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime+dur);
+  }catch(e){}
+}
+function fire(){
+  if(state!=="playing") return;
+  var res=traceBeam(grid,target,EMIT_ROW);
+  beam=res; beamUntil=performance.now()+700;
+  if(res.hit){
+    var mult=comboMult(hits);
+    var pts=100*mult*(golden?5:1);
+    score+=pts; hits++;
+    flash="HIT +"+pts;
+    beep(880,0.18,"triangle");
+    try{ if(navigator.vibrate) navigator.vibrate(20); }catch(e){}
+    newTarget();
+  } else {
+    hearts--; hits=0;
+    flash=res.loop?"LOOP! -1 HEART":"MISS! -1 HEART";
+    beep(140,0.25,"sawtooth");
+    try{ if(navigator.vibrate) navigator.vibrate([60,40,60]); }catch(e){}
+    if(hearts<=0){ endGame(); }
+  }
+  flashUntil=performance.now()+1100;
+}
+function rotateMirror(r,c){
+  if(state!=="playing") return false;
+  if(!grid[r]||!grid[r][c]) return false;
+  grid[r][c]=(grid[r][c]==="/")?"\\":"/";
+  for(var i=0;i<mirrors.length;i++) if(mirrors[i].r===r&&mirrors[i].c===c) mirrors[i].o=grid[r][c];
+  beep(520,0.06,"square");
+  return true;
+}
+function endGame(){
+  state="over";
+  if(shuffles===0 && score>0) score+=500; // flawless: never reshuffled
+  if(score>best){ best=score; try{localStorage.setItem("neon_laser_best",String(best));}catch(e){} }
+}
+function computeLayout(){
+  var areaW=Math.min(vw-56,420); // leave room for the emitter triangle left of the grid
+  var cell=Math.floor(areaW/GRID);
+  var gw=cell*GRID;
+  layoutInfo.grid={x:(vw-gw)/2, y:148, cell:cell, w:gw, h:gw};
+  var by=148+gw+24, bw=150, gap=16;
+  layoutInfo.fireBtn={x:vw/2-gap/2-bw, y:by, w:bw, h:52};
+  layoutInfo.shuffleBtn={x:vw/2+gap/2, y:by, w:bw, h:52};
+  layoutInfo.muteBtn={x:vw-52, y:14, w:38, h:38};
+}
+function resize(){
+  vw=window.innerWidth||390; vh=window.innerHeight||844; dpr=window.devicePixelRatio||1;
+  canvas.width=Math.round(vw*dpr); canvas.height=Math.round(vh*dpr);
+  canvas.style.width=vw+"px"; canvas.style.height=vh+"px";
+  computeLayout();
+}
+window.addEventListener("resize",resize);
+window.addEventListener("orientationchange",resize);
+document.addEventListener("touchmove",function(e){e.preventDefault();},{passive:false});
+function roundRect(x,y,w,h,r){
+  ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath();
+}
+function draw(){
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle="#0b1026"; ctx.fillRect(0,0,vw,vh);
+  ctx.textAlign="center";
+  ctx.fillStyle="#6cf0ff"; ctx.font="bold 30px system-ui"; ctx.fillText("NEON LASER",vw/2,36);
+  ctx.fillStyle="#aab4e8"; ctx.font="15px system-ui";
+  ctx.fillText("Score "+score+"  x"+comboMult(hits)+"  Best "+best,vw/2,60);
+  var heartsStr=""; for(var hi=0;hi<3;hi++) heartsStr+=hi<hearts?"♥":"♡";
+  ctx.fillText("Time "+Math.ceil(timeLeft)+"s  Hits "+hits+"  "+heartsStr,vw/2,82);
+  ctx.fillStyle="#7780b8"; ctx.font="13px system-ui";
+  ctx.fillText("Tap a mirror to rotate it — steer the beam to the star!",vw/2,102);
+  // mute button
+  var mb=layoutInfo.muteBtn;
+  ctx.fillStyle="#2b3572"; roundRect(mb.x,mb.y,mb.w,mb.h,10); ctx.fill();
+  ctx.fillStyle="#e8ecff"; ctx.font="bold 18px system-ui"; ctx.fillText(muted?"✕":"♪",mb.x+mb.w/2,mb.y+25);
+  // grid
+  var g=layoutInfo.grid;
+  ctx.fillStyle="#151c3f"; roundRect(g.x-6,g.y-6,g.w+12,g.h+12,14); ctx.fill();
+  for(var r=0;r<GRID;r++) for(var c=0;c<GRID;c++){
+    var x=g.x+c*g.cell, y=g.y+r*g.cell;
+    ctx.strokeStyle="#2b3572"; ctx.lineWidth=1;
+    ctx.strokeRect(x+0.5,y+0.5,g.cell-1,g.cell-1);
+    var mir=grid[r]&&grid[r][c];
+    if(mir){
+      ctx.strokeStyle=mir==="/"? "#6cf0ff":"#ff8cd1"; ctx.lineWidth=4; ctx.lineCap="round";
+      ctx.beginPath();
+      if(mir==="/"){ ctx.moveTo(x+8,y+g.cell-8); ctx.lineTo(x+g.cell-8,y+8); }
+      else { ctx.moveTo(x+8,y+8); ctx.lineTo(x+g.cell-8,y+g.cell-8); }
+      ctx.stroke();
+    }
+  }
+  // emitter
+  var ey=g.y+EMIT_ROW*g.cell+g.cell/2;
+  ctx.fillStyle="#ff8cd1";
+  ctx.beginPath(); ctx.moveTo(g.x-22,ey-10); ctx.lineTo(g.x-22,ey+10); ctx.lineTo(g.x-4,ey); ctx.closePath(); ctx.fill();
+  // target star
+  if(target.r>=0){
+    var tx=g.x+target.c*g.cell+g.cell/2, ty=g.y+target.r*g.cell+g.cell/2;
+    var pulse=1+0.15*Math.sin(performance.now()/180);
+    ctx.fillStyle=golden?"#facc15":"#6cf0ff";
+    ctx.font="bold "+Math.round(g.cell*0.55*pulse)+"px system-ui";
+    ctx.fillText("★",tx,ty+g.cell*0.2);
+    if(golden){ ctx.fillStyle="#0b1026"; ctx.font="bold 9px system-ui"; ctx.fillText("5x",tx,ty+g.cell*0.2); }
+  }
+  // beam
+  if(beam && performance.now()<beamUntil){
+    var pts=[];
+    pts.push({x:g.x-4,y:ey});
+    for(var bi=0;bi<beam.path.length;bi++){
+      var bp=beam.path[bi];
+      pts.push({x:g.x+bp.c*g.cell+g.cell/2, y:g.y+bp.r*g.cell+g.cell/2});
+    }
+    ctx.strokeStyle=beam.hit?"#facc15":"#ef4444"; ctx.lineWidth=4; ctx.lineCap="round"; ctx.lineJoin="round";
+    ctx.shadowColor=ctx.strokeStyle; ctx.shadowBlur=12;
+    ctx.beginPath(); ctx.moveTo(pts[0].x,pts[0].y);
+    for(var pi=1;pi<pts.length;pi++) ctx.lineTo(pts[pi].x,pts[pi].y);
+    ctx.stroke(); ctx.shadowBlur=0;
+  }
+  // flash
+  if(flash && performance.now()<flashUntil){
+    ctx.fillStyle=flash.indexOf("HIT")===0?"#facc15":"#ef4444";
+    ctx.font="bold 22px system-ui"; ctx.fillText(flash,vw/2,g.y+g.h+14);
+  }
+  // buttons
+  var fb=layoutInfo.fireBtn, sb=layoutInfo.shuffleBtn;
+  ctx.fillStyle="#16a34a"; roundRect(fb.x,fb.y,fb.w,fb.h,14); ctx.fill();
+  ctx.fillStyle="#ffffff"; ctx.font="bold 20px system-ui"; ctx.fillText("⚡ FIRE",fb.x+fb.w/2,fb.y+33);
+  ctx.fillStyle="#2b3572"; roundRect(sb.x,sb.y,sb.w,sb.h,14); ctx.fill();
+  ctx.fillStyle="#e8ecff"; ctx.font="bold 16px system-ui"; ctx.fillText("SHUFFLE",sb.x+sb.w/2,sb.y+32);
+  if(state==="title"){
+    ctx.fillStyle="rgba(5,8,25,0.88)"; ctx.fillRect(0,0,vw,vh);
+    ctx.fillStyle="#6cf0ff"; ctx.font="bold 34px system-ui"; ctx.fillText("NEON LASER",vw/2,vh/2-80);
+    ctx.fillStyle="#e8ecff"; ctx.font="18px system-ui";
+    ctx.fillText("Bend the beam. Hit the star.",vw/2,vh/2-38);
+    ctx.fillText("Tap a mirror to rotate it, then FIRE.",vw/2,vh/2-10);
+    ctx.fillText("Misses cost a heart. Golden stars pay 5x.",vw/2,vh/2+18);
+    ctx.fillStyle="#facc15"; ctx.font="bold 20px system-ui"; ctx.fillText("TAP TO PLAY",vw/2,vh/2+62);
+    ctx.fillStyle="#aab4e8"; ctx.font="14px system-ui"; ctx.fillText("60 seconds — 8 chained hits raise your combo to x5",vw/2,vh/2+90);
+  } else if(state==="over"){
+    ctx.fillStyle="rgba(5,8,25,0.88)"; ctx.fillRect(0,0,vw,vh);
+    ctx.fillStyle="#6cf0ff"; ctx.font="bold 30px system-ui"; ctx.fillText("TIME!",vw/2,vh/2-40);
+    ctx.fillStyle="#e8ecff"; ctx.font="20px system-ui"; ctx.fillText("Score "+score+"  Best "+best,vw/2,vh/2);
+    ctx.fillStyle="#facc15"; ctx.font="bold 20px system-ui"; ctx.fillText("TAP TO PLAY AGAIN",vw/2,vh/2+44);
+  }
+}
+function loop(now){
+  if(state==="playing"){
+    var dt=(now-lastT)/1000; lastT=now;
+    timeLeft-=dt;
+    if(timeLeft<=0){ timeLeft=0; endGame(); }
+  } else lastT=now;
+  draw();
+  requestAnimationFrame(loop);
+}
+function cellAt(x,y){
+  var g=layoutInfo.grid;
+  if(x<g.x||x>g.x+g.w||y<g.y||y>g.y+g.h) return null;
+  return {r:Math.floor((y-g.y)/g.cell), c:Math.floor((x-g.x)/g.cell)};
+}
+function inBtn(b,x,y){ return x>=b.x&&x<=b.x+b.w&&y>=b.y&&y<=b.y+b.h; }
+canvas.addEventListener("pointerdown",function(e){
+  var rect=canvas.getBoundingClientRect();
+  var x=e.clientX-rect.left, y=e.clientY-rect.top;
+  if(inBtn(layoutInfo.muteBtn,x,y)){ muted=!muted; return; }
+  if(state!=="playing"){ startGame(); return; }
+  if(inBtn(layoutInfo.fireBtn,x,y)){ fire(); return; }
+  if(inBtn(layoutInfo.shuffleBtn,x,y)){ shuffleBoard(); return; }
+  var cell=cellAt(x,y);
+  if(cell) rotateMirror(cell.r,cell.c);
+});
+if(location.search.indexOf("auto=1")>=0){
+  startGame();
+  setInterval(function(){
+    if(state!=="playing") return;
+    var m=mirrors[Math.floor(Math.random()*mirrors.length)];
+    if(m) rotateMirror(m.r,m.c);
+    fire();
+  },900);
+}
+resize();
+requestAnimationFrame(loop);
+window.NeonLaserDebug={
+  snapshot:function(){
+    var rect=canvas.getBoundingClientRect();
+    return {state:state,score:score,hits:hits,hearts:hearts,shuffles:shuffles,
+      mirrors:mirrors.map(function(m){return {r:m.r,c:m.c,o:m.o};}),
+      target:target,golden:golden,beam:beam,rect:{w:rect.width,h:rect.height},
+      grid:layoutInfo.grid,fireBtn:layoutInfo.fireBtn,shuffleBtn:layoutInfo.shuffleBtn};
+  },
+  dealBoard:dealBoard, traceBeam:traceBeam, reflect:reflect, comboMult:comboMult
+};
+})();
+</script>
+</body>
+</html>
