@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Strike — Daily Game</title>
+<meta name="description" content="Neon Strike — 60 seconds of bowling chaos. Aim, roll, and knock down glowing neon pins — chain big rolls to raise your combo to x5.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Strike — Day 36. Bowling: drag to aim, tap BOWL to roll one ball down
+   the neon lane. Pins knocked score 10 x combo each; rolls of 7+ pins step
+   the combo ladder x1->x5; rolls of 3 or fewer reset it. A strike (all 10)
+   pays a +100 x combo bonus. Every 6th ball is GOLDEN (5x score).
+   60 seconds, best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var StrikeLogic = (function () {
+  function makeRng(seed) {
+    var s = seed >>> 0;
+    return function () {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+  }
+  var W = 480, H = 800;
+  var BOWL = { x: 140, y: 640, w: 200, h: 60 };
+  function clampAim(x) { if (x < 120) return 120; if (x > 360) return 360; return x; }
+  function isGutter(aimX) { return aimX < 140 || aimX > 340; }
+  function isGolden(rollCount) { return rollCount % 6 === 5; } // every 6th ball
+  // 10 pins, triangle pointing at the bowler (front pin nearest the ball).
+  function freshPins() {
+    var rows = [[240], [210, 270], [180, 240, 300], [150, 210, 270, 330]];
+    var ys = [262, 236, 210, 184], pins = [], id = 0;
+    for (var r = 0; r < rows.length; r++) {
+      for (var k = 0; k < rows[r].length; k++) {
+        pins.push({ id: id++, x: rows[r][k], y: ys[r], row: r, standing: true, fall: 0, dx: 0, dy: 0 });
+      }
+    }
+    return pins;
+  }
+  // Pins near the impact point always fall; farther pins fall with
+  // probability falling off with distance. A gutter roll knocks nothing.
+  function knockPins(pins, impactX, rng) {
+    var knocked = 0;
+    for (var i = 0; i < pins.length; i++) {
+      var p = pins[i], d = Math.abs(p.x - impactX);
+      var sure = 30 + (3 - p.row) * 6; // front pins easier to topple
+      var pFall = d <= sure ? 1 : Math.max(0, 1 - (d - sure) / 110);
+      if (rng() < pFall) { p.standing = false; p.fall = 1; knocked++; }
+    }
+    return knocked;
+  }
+  function scoreForRoll(pins, combo, golden) {
+    var s = pins * 10 * combo * (golden ? 5 : 1);
+    if (pins === 10) s += 100 * combo;
+    return s;
+  }
+  function nextCombo(combo, pins) {
+    if (pins >= 7) return combo >= 5 ? 5 : combo + 1;
+    if (pins <= 3) return 1;
+    return combo;
+  }
+  function makeState() {
+    return { screen: "title", score: 0, combo: 1, timeLeft: 60, rollCount: 0,
+             aimX: 240, pins: freshPins(), rolling: false, rollT: 0,
+             lastPins: -1, lastScore: 0, popup: "", popupT: 0, best: 0 };
+  }
+  return { W: W, H: H, BOWL: BOWL, makeRng: makeRng, clampAim: clampAim,
+           isGutter: isGutter, isGolden: isGolden, freshPins: freshPins,
+           knockPins: knockPins, scoreForRoll: scoreForRoll,
+           nextCombo: nextCombo, makeState: makeState };
+})();
+//LOGIC-END
+if (typeof window !== "undefined") window.StrikeLogic = StrikeLogic;
+
+(function () {
+  var L = StrikeLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_strike_best") || "0", 10) || 0; } catch (e) {}
+  var muted = false;
+  try { muted = localStorage.getItem("neon_strike_mute") === "1"; } catch (e) {}
+  var ball = null, auto = /[?&]auto=1/.test(location.search), autoT = 0;
+
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = Math.round(vw * dpr); canvas.height = Math.round(vh * dpr);
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+
+  var AC = null;
+  function tone(f, dur, type, vol) {
+    if (muted) return;
+    try {
+      if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)();
+      if (AC.state === "suspended") AC.resume();
+      var o = AC.createOscillator(), g = AC.createGain();
+      o.type = type || "sine"; o.frequency.setValueAtTime(f, AC.currentTime);
+      g.gain.setValueAtTime(vol || 0.15, AC.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+      o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime + dur);
+    } catch (e) {}
+  }
+  function buzz(ms) { try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) {} }
+
+  function startGame() {
+    S = L.makeState(); S.best = S.best || 0;
+    try { S.best = parseInt(localStorage.getItem("neon_strike_best") || "0", 10) || 0; } catch (e) {}
+    S.screen = "playing"; ball = null; autoT = 0;
+  }
+  function roll() {
+    if (S.screen !== "playing" || S.rolling) return;
+    var golden = L.isGolden(S.rollCount);
+    ball = { t: 0, fromX: 240, toX: S.aimX, golden: golden };
+    S.rolling = true; S.rollT = 0; tone(220, 0.15, "triangle", 0.12);
+  }
+  function resolveRoll() {
+    var impactX = S.aimX;
+    var knocked = L.isGutter(impactX) ? 0 : L.knockPins(S.pins, impactX, Math.random);
+    var golden = ball ? ball.golden : false;
+    var pts = L.scoreForRoll(knocked, S.combo, golden);
+    S.score += pts; S.lastPins = knocked; S.lastScore = pts;
+    S.combo = L.nextCombo(S.combo, knocked);
+    S.rollCount++;
+    S.popup = knocked === 10 ? "STRIKE! +" + pts : knocked === 0 ? "GUTTER!" : "+" + pts + "  (" + knocked + " pins)";
+    S.popupT = 1.4;
+    if (knocked >= 7) { tone(660, 0.2, "sine", 0.15); buzz(30); }
+    else if (knocked === 0) tone(140, 0.25, "sawtooth", 0.1);
+    else tone(440, 0.12, "sine", 0.12);
+    S.rolling = false; ball = null;
+    setTimeout(function () { if (S.screen === "playing") S.pins = L.freshPins(); }, 900);
+    if (S.timeLeft <= 0) endGame();
+  }
+  function endGame() {
+    S.screen = "over";
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_strike_best", String(S.best)); } catch (e) {} }
+  }
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  function onDown(e) {
+    e.preventDefault();
+    if (S.screen === "title") { startGame(); return; }
+    if (S.screen === "over") { startGame(); return; }
+    var w = toWorld(e);
+    var B = L.BOWL;
+    if (w.x >= B.x && w.x <= B.x + B.w && w.y >= B.y && w.y <= B.y + B.h) { roll(); return; }
+    S.aimX = L.clampAim(w.x);
+  }
+  function onMove(e) {
+    if (S.screen !== "playing" || S.rolling) return;
+    if (e.buttons || e.type === "touchmove") { var w = toWorld(e); S.aimX = L.clampAim(w.x); }
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowLeft") S.aimX = L.clampAim(S.aimX - 12);
+    if (e.key === "ArrowRight") S.aimX = L.clampAim(S.aimX + 12);
+    if (e.key === " ") { e.preventDefault(); if (S.screen !== "playing") startGame(); else roll(); }
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_strike_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+
+  function drawPin(p) {
+    ctx.save(); ctx.translate(p.x + p.dx, p.y + p.dy);
+    if (!p.standing) { ctx.rotate(1.2); ctx.globalAlpha = 0.55; }
+    // gradient created AFTER transform, in local coords (Oct 8 lesson)
+    var g = ctx.createLinearGradient(0, -16, 0, 16);
+    g.addColorStop(0, "#ffffff"); g.addColorStop(1, "#ff4fd8");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, -6, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(0, 8, 11, 13, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#070512"; ctx.font = "bold 11px system-ui"; ctx.textAlign = "center";
+    ctx.fillText(String(p.id + 1), 0, 12);
+    ctx.restore();
+  }
+  function draw() {
+    // transform re-applied at the start of every frame (canvas resize resets it)
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.translate(ox, oy); ctx.scale(scale, scale);
+    // lane
+    ctx.fillStyle = "#12082e"; ctx.fillRect(0, 0, L.W, L.H);
+    var lg = ctx.createLinearGradient(150, 0, 330, 0);
+    lg.addColorStop(0, "#1b0f45"); lg.addColorStop(0.5, "#2b1a6e"); lg.addColorStop(1, "#1b0f45");
+    ctx.fillStyle = lg;
+    ctx.beginPath(); ctx.moveTo(170, 620); ctx.lineTo(310, 620); ctx.lineTo(360, 140); ctx.lineTo(120, 140); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "rgba(0,255,255,0.35)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(170, 620); ctx.lineTo(120, 140); ctx.moveTo(310, 620); ctx.lineTo(360, 140); ctx.stroke();
+    // aim line
+    if (S.screen === "playing" && !S.rolling) {
+      ctx.strokeStyle = "rgba(255,210,63,0.8)"; ctx.setLineDash([10, 10]); ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(240, 640); ctx.lineTo(S.aimX, 200); ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = "#ffd23f"; ctx.beginPath(); ctx.arc(S.aimX, 200, 8, 0, Math.PI * 2); ctx.fill();
+    }
+    S.pins.forEach(drawPin);
+    // ball
+    if (ball) {
+      var p = ball.t * 1.0, bx = ball.fromX + (ball.toX - ball.fromX) * p, by = 640 - 440 * p;
+      var r = 26 - 12 * p;
+      var bg = ctx.createLinearGradient(bx - r, by - r, bx + r, by + r);
+      bg.addColorStop(0, ball.golden ? "#fff3a0" : "#7df9ff"); bg.addColorStop(1, ball.golden ? "#ffb400" : "#ff4fd8");
+      ctx.fillStyle = bg; ctx.beginPath(); ctx.arc(bx, by, r, 0, Math.PI * 2); ctx.fill();
+    } else if (S.screen === "playing") {
+      ctx.fillStyle = "#7df9ff"; ctx.beginPath(); ctx.arc(240, 640, 26, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#070512"; ctx.beginPath(); ctx.arc(232, 632, 6, 0, Math.PI * 2); ctx.arc(248, 632, 6, 0, Math.PI * 2); ctx.arc(240, 648, 6, 0, Math.PI * 2); ctx.fill();
+    }
+    // HUD
+    ctx.fillStyle = "#fff"; ctx.textAlign = "left"; ctx.font = "bold 22px system-ui";
+    ctx.fillText("SCORE " + S.score, 16, 36);
+    ctx.textAlign = "right"; ctx.fillText("BEST " + S.best, L.W - 16, 36);
+    ctx.textAlign = "center"; ctx.font = "bold 20px system-ui";
+    ctx.fillStyle = "#ffd23f"; ctx.fillText("x" + S.combo, L.W / 2, 36);
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff4f4f" : "#fff";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 64);
+    if (S.popupT > 0) {
+      ctx.fillStyle = "#3cffa0"; ctx.font = "bold 30px system-ui";
+      ctx.fillText(S.popup, L.W / 2, 480);
+    }
+    // BOWL button
+    if (S.screen === "playing") {
+      var B = L.BOWL;
+      ctx.fillStyle = S.rolling ? "#444" : "#ff4fd8";
+      ctx.beginPath(); ctx.roundRect(B.x, B.y, B.w, B.h, 14); ctx.fill();
+      ctx.fillStyle = "#fff"; ctx.font = "bold 28px system-ui";
+      ctx.fillText(S.rolling ? "ROLLING..." : "BOWL!", L.W / 2, B.y + 39);
+      ctx.font = "16px system-ui"; ctx.fillStyle = "#8a93b8";
+      ctx.fillText("Drag to aim  ·  Ball " + (S.rollCount + 1) + (L.isGolden(S.rollCount) ? " GOLDEN 5x" : ""), L.W / 2, 730);
+      ctx.fillText("M mute", L.W / 2, 758);
+    }
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(0,0,0,0.55)"; ctx.fillRect(0, 0, L.W, L.H);
+      ctx.textAlign = "center"; ctx.fillStyle = "#00f0ff"; ctx.font = "bold 64px system-ui";
+      ctx.fillText("NEON", L.W / 2, 350); ctx.fillStyle = "#ff4fd8"; ctx.fillText("STRIKE", L.W / 2, 418);
+      ctx.fillStyle = "#fff"; ctx.font = "20px system-ui";
+      ctx.fillText("Drag to aim. Tap BOWL to roll.", L.W / 2, 470);
+      ctx.fillText("7+ pins raises your combo to x5.", L.W / 2, 498);
+      ctx.fillText("Every 6th ball is GOLDEN (5x).", L.W / 2, 526);
+      ctx.font = "bold 26px system-ui"; ctx.fillStyle = "#ffd23f";
+      ctx.fillText("TAP TO PLAY", L.W / 2, 590);
+    }
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(0, 0, L.W, L.H);
+      ctx.textAlign = "center"; ctx.fillStyle = "#fff"; ctx.font = "bold 44px system-ui";
+      ctx.fillText("TIME!", L.W / 2, 320);
+      ctx.font = "bold 60px system-ui"; ctx.fillStyle = "#ffd23f";
+      ctx.fillText(String(S.score), L.W / 2, 390);
+      ctx.fillStyle = S.score >= S.best && S.score > 0 ? "#3cffa0" : "#8a93b8";
+      ctx.font = "22px system-ui";
+      ctx.fillText(S.score >= S.best && S.score > 0 ? "NEW BEST!" : "Best: " + S.best, L.W / 2, 440);
+      ctx.fillStyle = "#fff"; ctx.font = "bold 24px system-ui";
+      ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 500);
+    }
+  }
+  var lastT = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - lastT) / 1000 || 0.016); lastT = now;
+    if (auto && S.screen === "title") startGame();
+    if (S.screen === "playing") {
+      if (!S.rolling) S.timeLeft -= dt;
+      if (S.popupT > 0) S.popupT -= dt;
+      if (auto && !S.rolling) { autoT += dt; if (autoT > 0.9) { autoT = 0; S.aimX = 200 + Math.random() * 80; roll(); } }
+      if (S.timeLeft <= 0 && !S.rolling) endGame();
+    }
+    if (ball) {
+      ball.t += dt / 1.1;
+      if (ball.t >= 1) { ball.t = 1; resolveRoll(); }
+    }
+    draw();
+    requestAnimationFrame(frame);
+  }
+  resize();
+  requestAnimationFrame(frame);
+  window.NeonStrike = {
+    logic: L,
+    getState: function () { return { screen: S.screen, score: S.score, combo: S.combo, timeLeft: S.timeLeft, rollCount: S.rollCount, rolling: S.rolling, aimX: S.aimX }; },
+    start: startGame, roll: roll, setAim: function (x) { S.aimX = L.clampAim(x); }
+  };
+})();
+</script>
+</body>
+</html>
