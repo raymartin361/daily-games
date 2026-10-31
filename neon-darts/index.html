@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Darts — Day 37</title>
+<meta name="description" content="Neon Darts — 60 seconds of dart-throwing precision. Tap to throw at the moving target, hit the bullseye for 100, chain hits to x5.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Darts — Day 37. Aiming: a reticle wanders over a neon dartboard.
+   Tap anywhere to throw one dart at the reticle's current spot. Rings pay
+   100/50/30/20/10, a miss resets the combo. Combo ladder x1->x5 steps every
+   4 consecutive scoring throws. Every 5th throw is GOLDEN (5x). 60 seconds,
+   flawless (no misses) pays +500. Best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var DartsLogic = (function () {
+  var W = 480, H = 800, CX = 240, CY = 300, R = 115;
+  function ringScore(dist) {
+    if (dist <= 15) return { points: 100, label: "BULLSEYE!" };
+    if (dist <= 38) return { points: 50, label: "INNER!" };
+    if (dist <= 68) return { points: 30, label: "NICE!" };
+    if (dist <= 95) return { points: 20, label: "ON BOARD!" };
+    if (dist <= 115) return { points: 10, label: "EDGE!" };
+    return { points: 0, label: "MISS!" };
+  }
+  function comboFor(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function scoreFor(base, combo, golden) {
+    return base * combo * (golden ? 5 : 1);
+  }
+  function isGolden(throwIndex) { return throwIndex % 5 === 4; }
+  function reticleAt(t) {
+    var x = CX + Math.sin(t * 1.9) * 78 + Math.sin(t * 3.1) * 28;
+    var y = CY + Math.sin(t * 2.4 + 0.8) * 68 + Math.cos(t * 3.9) * 22;
+    return { x: x, y: y };
+  }
+  function distToBoard(x, y) {
+    var dx = x - CX, dy = y - CY;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  function makeState() {
+    return { screen: "title", timeLeft: 60, score: 0, combo: 1, streak: 0, throws: 0, misses: 0, best: 0 };
+  }
+  return { W: W, H: H, CX: CX, CY: CY, R: R, ringScore: ringScore, comboFor: comboFor, scoreFor: scoreFor, isGolden: isGolden, reticleAt: reticleAt, distToBoard: distToBoard, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = DartsLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_darts_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(ms) { try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_darts_best") || "0", 10) || 0; } catch (e) {}
+  var t = 0, last = 0, dart = null, popup = null, ret = L.reticleAt(0);
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  var autoTimer = 0;
+
+  function start() {
+    S = L.makeState(); S.best = S.best || 0;
+    try { S.best = parseInt(localStorage.getItem("neon_darts_best") || "0", 10) || 0; } catch (e) {}
+    S.screen = "play"; dart = null; popup = null; t = 0;
+  }
+  function endGame() {
+    S.screen = "over";
+    if (S.throws > 0 && S.misses === 0) S.score += 500;
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_darts_best", String(S.best)); } catch (e) {} }
+  }
+  function throwDart() {
+    if (S.screen !== "play" || dart) return;
+    var golden = L.isGolden(S.throws);
+    dart = { x0: L.CX, y0: 730, x1: ret.x, y1: ret.y, p: 0, golden: golden, done: false };
+    tone(600, 0.18, "sine", 0.12, 1400);
+  }
+  function resolveDart() {
+    var d = L.distToBoard(dart.x1, dart.y1);
+    var ring = L.ringScore(d);
+    var idx = S.throws;
+    S.throws++;
+    if (ring.points > 0) {
+      S.streak++;
+      S.combo = L.comboFor(S.streak);
+      var pts = L.scoreFor(ring.points, S.combo, dart.golden);
+      S.score += pts;
+      popup = { text: (dart.golden ? "GOLDEN " : "") + ring.label + " +" + pts, t: 0, golden: dart.golden };
+      tone(ring.points === 100 ? 880 : 660, 0.25, "triangle", 0.18);
+      if (ring.points === 100) { tone(1320, 0.3, "sine", 0.12); buzz(40); }
+    } else {
+      S.misses++; S.streak = 0; S.combo = 1;
+      popup = { text: "MISS! Combo reset", t: 0, golden: false };
+      tone(160, 0.25, "sawtooth", 0.12);
+    }
+    dart.done = true; dart.stickT = 0;
+  }
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  function onTap(e) {
+    if (e && e.preventDefault) e.preventDefault();
+    var p = e ? toWorld(e) : { x: 240, y: 400 };
+    if (S.screen === "play" && p.x > 398 && p.y < 48) {
+      muted = !muted;
+      try { localStorage.setItem("neon_darts_mute", muted ? "1" : "0"); } catch (err) {}
+      return;
+    }
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    throwDart();
+  }
+  canvas.addEventListener("pointerdown", onTap);
+  window.addEventListener("keydown", function (e) {
+    if (e.code === "Space") { e.preventDefault(); onTap(null); }
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_darts_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+  window.NeonDarts = { getState: function () {
+    return { screen: S.screen, score: S.score, throws: S.throws, combo: S.combo, streak: S.streak, misses: S.misses, timeLeft: Math.ceil(S.timeLeft), dartFlying: !!dart && !dart.done, retX: Math.round(ret.x), retY: Math.round(ret.y) };
+  } };
+
+  function drawBoard() {
+    var rings = [
+      { r: 115, c1: "#1a1440", c2: "#2b1f66" },
+      { r: 95, c1: "#ff4d6d", c2: "#ff8fa3" },
+      { r: 68, c1: "#141233", c2: "#241d5e" },
+      { r: 38, c1: "#22d3ee", c2: "#67e8f9" },
+      { r: 15, c1: "#facc15", c2: "#fef08a" }
+    ];
+    ctx.save();
+    ctx.translate(L.CX, L.CY);
+    for (var i = 0; i < rings.length; i++) {
+      var g = ctx.createLinearGradient(0, -rings[i].r, 0, rings[i].r);
+      g.addColorStop(0, rings[i].c1); g.addColorStop(1, rings[i].c2);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(0, 0, rings[i].r, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, rings[i].r, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.font = "bold 13px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+    ctx.fillStyle = "#0b1026"; ctx.fillText("50", 0, -22);
+    ctx.fillStyle = "#e8ecff"; ctx.fillText("30", 0, -49);
+    ctx.fillStyle = "#0b1026"; ctx.fillText("20", 0, -77);
+    ctx.fillStyle = "#e8ecff"; ctx.fillText("10", 0, -101);
+    ctx.restore();
+    // segment lines on the outer ring
+    ctx.save(); ctx.translate(L.CX, L.CY); ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 2;
+    for (var k = 0; k < 8; k++) {
+      var a = k * Math.PI / 4;
+      ctx.beginPath(); ctx.moveTo(Math.cos(a) * 68, Math.sin(a) * 68); ctx.lineTo(Math.cos(a) * 115, Math.sin(a) * 115); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function drawReticle() {
+    if (S.screen !== "play") return;
+    ctx.save(); ctx.translate(ret.x, ret.y);
+    ctx.strokeStyle = "#ff2d78"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0, 0, 22, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-32, 0); ctx.lineTo(-12, 0); ctx.moveTo(12, 0); ctx.lineTo(32, 0);
+    ctx.moveTo(0, -32); ctx.lineTo(0, -12); ctx.moveTo(0, 12); ctx.lineTo(0, 32); ctx.stroke();
+    ctx.fillStyle = "#ff2d78"; ctx.beginPath(); ctx.arc(0, 0, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  function drawDart(x, y, golden) {
+    ctx.save(); ctx.translate(x, y);
+    ctx.fillStyle = golden ? "#facc15" : "#e8ecff";
+    ctx.beginPath(); ctx.moveTo(0, -18); ctx.lineTo(7, 8); ctx.lineTo(0, 14); ctx.lineTo(-7, 8); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = golden ? "#fef08a" : "#22d3ee";
+    ctx.beginPath(); ctx.moveTo(-7, 8); ctx.lineTo(-14, 22); ctx.lineTo(0, 16); ctx.lineTo(14, 22); ctx.lineTo(7, 8); ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = last ? Math.min(0.05, (now - last) / 1000) : 0.016;
+    last = now;
+    if (S.screen === "play") {
+      t += dt;
+      ret = L.reticleAt(t);
+      S.timeLeft -= dt;
+      if (dart && !dart.done) {
+        dart.p += dt / 0.22;
+        if (dart.p >= 1) resolveDart();
+      } else if (dart && dart.done) {
+        dart.stickT += dt;
+        if (dart.stickT > 0.8) dart = null;
+      }
+      if (popup) { popup.t += dt; if (popup.t > 1.2) popup = null; }
+      if (auto) { autoTimer += dt; if (autoTimer > 0.9) { autoTimer = 0; throwDart(); } }
+      if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(); }
+    }
+    // transform re-applied at the start of every frame (canvas resize resets it)
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, vw, vh);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.translate(ox, oy); ctx.scale(scale, scale);
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "center";
+    if (S.screen === "title") {
+      drawBoard();
+      ctx.font = "800 52px 'Segoe UI',sans-serif";
+      ctx.fillStyle = "#ff2d78"; ctx.fillText("NEON", 240, 110);
+      ctx.fillStyle = "#22d3ee"; ctx.fillText("DARTS", 240, 165);
+      ctx.font = "800 28px 'Segoe UI',sans-serif"; ctx.fillStyle = "#facc15";
+      ctx.fillText("TAP TO PLAY", 240, 480);
+      ctx.font = "18px 'Segoe UI',sans-serif"; ctx.fillStyle = "#aab4e8";
+      ctx.fillText("Tap to throw at the moving target!", 240, 520);
+      ctx.fillText("Bullseye = 100 · Miss resets combo", 240, 550);
+      ctx.fillText("Every 5th dart is GOLDEN (5x)", 240, 580);
+      ctx.font = "16px 'Segoe UI',sans-serif"; ctx.fillStyle = "#7780b8";
+      ctx.fillText("Best: " + S.best, 240, 615);
+    } else if (S.screen === "play") {
+      ctx.textAlign = "left"; ctx.font = "800 22px 'Segoe UI',sans-serif"; ctx.fillStyle = "#e8ecff";
+      ctx.fillText("SCORE " + S.score, 16, 34);
+      ctx.textAlign = "right"; ctx.fillText("TIME " + Math.ceil(S.timeLeft), 464, 34);
+      ctx.textAlign = "center"; ctx.fillStyle = "#facc15"; ctx.fillText("x" + S.combo, 240, 34);
+      ctx.fillStyle = muted ? "#7780b8" : "#aab4e8"; ctx.font = "14px 'Segoe UI',sans-serif";
+      ctx.fillText(muted ? "MUTED" : "SOUND", 432, 62);
+      drawBoard(); drawReticle();
+      if (dart) {
+        var dx = dart.x0 + (dart.x1 - dart.x0) * Math.min(1, dart.p);
+        var dy = dart.y0 + (dart.y1 - dart.y0) * Math.min(1, dart.p);
+        drawDart(dx, dy, dart.golden);
+      }
+      ctx.font = "16px 'Segoe UI',sans-serif"; ctx.fillStyle = "#aab4e8";
+      ctx.fillText(L.isGolden(S.throws) ? "NEXT DART: GOLDEN!" : "Tap anywhere to throw", 240, 520);
+      ctx.fillStyle = "#22d3ee"; ctx.font = "800 20px 'Segoe UI',sans-serif";
+      ctx.fillText("THROWS " + S.throws, 240, 560);
+      if (popup) {
+        ctx.font = "800 30px 'Segoe UI',sans-serif";
+        ctx.fillStyle = popup.golden ? "#facc15" : "#e8ecff";
+        ctx.fillText(popup.text, 240, 620 - popup.t * 20);
+      }
+    } else {
+      ctx.font = "800 48px 'Segoe UI',sans-serif"; ctx.fillStyle = "#ff2d78";
+      ctx.fillText("TIME!", 240, 220);
+      ctx.font = "28px 'Segoe UI',sans-serif"; ctx.fillStyle = "#e8ecff";
+      ctx.fillText("Score: " + S.score, 240, 280);
+      ctx.fillText("Throws: " + S.throws + "  Misses: " + S.misses, 240, 320);
+      if (S.throws > 0 && S.misses === 0) { ctx.fillStyle = "#facc15"; ctx.fillText("FLAWLESS +500!", 240, 360); }
+      ctx.fillStyle = "#aab4e8"; ctx.font = "18px 'Segoe UI',sans-serif";
+      ctx.fillText("Best: " + S.best, 240, 400);
+      ctx.font = "800 26px 'Segoe UI',sans-serif"; ctx.fillStyle = "#22d3ee";
+      ctx.fillText("TAP TO PLAY AGAIN", 240, 470);
+    }
+  }
+  resize();
+  if (auto) start();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
