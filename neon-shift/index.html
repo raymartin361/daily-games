@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Shift — Day 38 · Game Off 2026</title>
+<meta name="description" content="Neon Shift — 60 seconds of dimension-shifting. Tap or press SHIFT to swap worlds, dodge blocks that only exist in your world, grab stars that only shine in it. Game Off 2026 theme: SHIFT.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Shift — Day 38, Game Off 2026 entry (theme: SHIFT).
+   A dimension-shifting runner: obstacles and stars each exist in only ONE
+   of two worlds (A = cyan, B = magenta). Tap, click, Space, or the SHIFT key
+   to shift worlds. An obstacle only hurts you in YOUR world; a star only
+   pays in YOUR world. Chain star pickups to climb the combo ladder x1->x5
+   (every 8 chained). Every 6th star is GOLDEN (5x). 3 hearts, 60 seconds,
+   flawless (no crashes) pays +500. Best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var ShiftLogic = (function () {
+  var W = 480, H = 800, PX = 90, PY = 400, PR = 22;
+  function comboFor(streak) {
+    var c = 1 + Math.floor(streak / 8);
+    return c > 5 ? 5 : c;
+  }
+  function scoreFor(base, combo, golden) {
+    return base * combo * (golden ? 5 : 1);
+  }
+  function isGolden(starIndex) { return starIndex % 6 === 5; }
+  function speedAt(elapsed) {
+    var s = 220 + elapsed * 3.4;
+    return s > 430 ? 430 : s;
+  }
+  // Resolve an entity crossing the player line. Returns an event string:
+  // "crash" | "collect" | "ghost" (harmless pass in the other world).
+  function resolve(entity, playerWorld) {
+    if (entity.world !== playerWorld) return "ghost";
+    if (entity.kind === "obstacle") return "crash";
+    return "collect";
+  }
+  function makeState() {
+    return { screen: "title", timeLeft: 60, score: 0, combo: 1, streak: 0,
+      stars: 0, crashes: 0, hearts: 3, world: 0, shifts: 0, best: 0 };
+  }
+  return { W: W, H: H, PX: PX, PY: PY, PR: PR, comboFor: comboFor,
+    scoreFor: scoreFor, isGolden: isGolden, speedAt: speedAt,
+    resolve: resolve, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = ShiftLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_shift_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(ms) { try { if (navigator.vibrate) navigator.vibrate(ms); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_shift_best") || "0", 10) || 0; } catch (e) {}
+  var t = 0, last = 0, elapsed = 0, spawnTimer = 0, starCount = 0;
+  var entities = [], popup = null, flash = 0, autoTimer = 0;
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  var WORLD_COLORS = ["#22d3ee", "#f472b6"];
+  var WORLD_NAMES = ["WORLD A", "WORLD B"];
+
+  function start() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_shift_best") || "0", 10) || 0; } catch (e) {}
+    S.screen = "play"; entities = []; popup = null; flash = 0;
+    elapsed = 0; spawnTimer = 0.4; starCount = 0; t = 0;
+  }
+  function endGame() {
+    S.screen = "over";
+    if (S.stars > 0 && S.crashes === 0) S.score += 500;
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_shift_best", String(S.best)); } catch (e) {} }
+  }
+  function shift() {
+    if (S.screen !== "play") return;
+    S.world = 1 - S.world; S.shifts++;
+    flash = 0.25; tone(500, 0.15, "sine", 0.12, 900);
+  }
+  function spawn() {
+    var kind = Math.random() < 0.55 ? "obstacle" : "star";
+    var e = { x: L.W + 40, kind: kind, world: Math.random() < 0.5 ? 0 : 1, golden: false, done: false };
+    if (kind === "star") { starCount++; e.golden = L.isGolden(starCount - 1); }
+    // Vary vertical position so the run is not a single-line dodge.
+    e.y = 180 + Math.random() * 440;
+    entities.push(e);
+  }
+  function update(dt) {
+    if (S.screen !== "play") return;
+    elapsed += dt; S.timeLeft -= dt;
+    if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(); return; }
+    if (flash > 0) flash -= dt;
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) { spawn(); spawnTimer = 0.75 + Math.random() * 0.5; }
+    var speed = L.speedAt(elapsed);
+    for (var i = entities.length - 1; i >= 0; i--) {
+      var e = entities[i];
+      e.x -= speed * dt;
+      if (!e.done && e.x <= L.PX + 10) {
+        e.done = true;
+        var ev = L.resolve(e, S.world);
+        if (ev === "crash") {
+          S.crashes++; S.hearts--; S.streak = 0; S.combo = 1;
+          popup = { text: "CRASH!", color: "#ff5577", ttl: 1 };
+          tone(160, 0.3, "sawtooth", 0.2, 60); buzz(120);
+          if (S.hearts <= 0) { endGame(); return; }
+        } else if (ev === "collect") {
+          S.stars++; S.streak++;
+          S.combo = L.comboFor(S.streak);
+          var pts = L.scoreFor(100, S.combo, e.golden);
+          S.score += pts;
+          popup = { text: "+" + pts + (e.golden ? " GOLDEN!" : ""), color: e.golden ? "#ffd700" : "#a5f3fc", ttl: 1 };
+          tone(e.golden ? 1200 : 800, 0.15, "sine", 0.12, e.golden ? 1800 : 1200); buzz(20);
+        }
+      }
+      if (e.x < -60) entities.splice(i, 1);
+    }
+    if (popup) { popup.ttl -= dt; if (popup.ttl <= 0) popup = null; }
+    if (auto) autoPlay();
+  }
+  function autoPlay() {
+    // Dodge the nearest solid obstacle; chase the nearest ghosted star.
+    var near = null;
+    for (var i = 0; i < entities.length; i++) {
+      var e = entities[i];
+      if (e.done || e.x < L.PX) continue;
+      if (!near || e.x < near.x) near = e;
+    }
+    if (!near || near.x - L.PX > 230) return;
+    if (near.kind === "obstacle" && near.world === S.world) shift();
+    else if (near.kind === "star" && near.world !== S.world) {
+      var danger = false;
+      for (var j = 0; j < entities.length; j++) {
+        var o = entities[j];
+        if (!o.done && o.kind === "obstacle" && o.world !== S.world && o.x - L.PX < 230) danger = true;
+      }
+      if (!danger) shift();
+    }
+  }
+
+  function drawStar(x, y, r, color) {
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    for (var i = 0; i < 8; i++) {
+      var ang = Math.PI / 4 * i - Math.PI / 2;
+      var rad = (i % 2 === 0) ? r : r * 0.45;
+      var sx = x + Math.cos(ang) * rad, sy = y + Math.sin(ang) * rad;
+      if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+    }
+    ctx.closePath(); ctx.fill();
+  }
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.translate(ox, oy);
+    ctx.scale(scale, scale);
+    var wc = WORLD_COLORS[S.world];
+    var bg = ctx.createLinearGradient(0, 0, 0, L.H);
+    bg.addColorStop(0, "#0b0620"); bg.addColorStop(1, "#120826");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, L.W, L.H);
+    // World tint wash + split hint line
+    ctx.globalAlpha = 0.10; ctx.fillStyle = wc; ctx.fillRect(0, 0, L.W, L.H);
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = wc; ctx.globalAlpha = 0.25; ctx.setLineDash([10, 14]);
+    ctx.beginPath(); ctx.moveTo(0, L.PY); ctx.lineTo(L.W, L.PY); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+    if (flash > 0) { ctx.globalAlpha = flash; ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, L.W, L.H); ctx.globalAlpha = 1; }
+
+    for (var i = 0; i < entities.length; i++) {
+      var e = entities[i], solid = (e.world === S.world), col = WORLD_COLORS[e.world];
+      ctx.globalAlpha = solid ? 1 : 0.28;
+      if (e.kind === "obstacle") {
+        ctx.fillStyle = col;
+        ctx.fillRect(e.x - 20, e.y - 20, 40, 40);
+        ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2;
+        ctx.strokeRect(e.x - 20, e.y - 20, 40, 40);
+      } else {
+        drawStar(e.x, e.y, e.golden ? 22 : 16, e.golden ? "#ffd700" : col);
+      }
+      ctx.globalAlpha = 1;
+    }
+    // Player orb (never looks like what it dodges: a glowing ringed orb).
+    // Hidden on the title screen so it never sits on top of the instructions.
+    if (S.screen !== "title") {
+      var glow = ctx.createRadialGradient(L.PX, L.PY, 2, L.PX, L.PY, 44);
+      glow.addColorStop(0, wc); glow.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = glow; ctx.beginPath(); ctx.arc(L.PX, L.PY, 44, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#ffffff"; ctx.beginPath(); ctx.arc(L.PX, L.PY, L.PR, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = wc; ctx.lineWidth = 4; ctx.beginPath(); ctx.arc(L.PX, L.PY, L.PR + 6, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    // HUD
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 26px 'Segoe UI',system-ui,sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("SCORE " + S.score, 16, 38);
+    ctx.textAlign = "center";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 38);
+    ctx.fillStyle = wc; ctx.fillText(WORLD_NAMES[S.world], L.W / 2, 72);
+    ctx.textAlign = "right"; ctx.fillStyle = "#ff5577";
+    var hearts = ""; for (var h = 0; h < S.hearts; h++) hearts += "♥";
+    ctx.fillText(hearts, L.W - 16, 38);
+    ctx.textAlign = "left"; ctx.fillStyle = "#ffd700";
+    ctx.fillText("x" + S.combo, 16, 72);
+
+    if (popup) {
+      ctx.textAlign = "center"; ctx.fillStyle = popup.color;
+      ctx.font = "bold 34px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(popup.text, L.W / 2, 140);
+    }
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(0,0,0,0.55)"; ctx.fillRect(0, 0, L.W, L.H);
+      ctx.textAlign = "center"; ctx.fillStyle = "#22d3ee";
+      ctx.font = "bold 64px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("NEON", L.W / 2, 250);
+      ctx.fillStyle = "#f472b6"; ctx.fillText("SHIFT", L.W / 2, 320);
+      ctx.fillStyle = "#ffffff"; ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Game Off 2026 · Theme: SHIFT", L.W / 2, 360);
+      ctx.fillText("Tap or press SHIFT to swap worlds.", L.W / 2, 420);
+      ctx.fillText("Dodge blocks in YOUR world.", L.W / 2, 450);
+      ctx.fillText("Grab stars in YOUR world. 60 seconds.", L.W / 2, 480);
+      ctx.fillStyle = "#ffd700"; ctx.font = "bold 24px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TAP TO START", L.W / 2, 560);
+      ctx.fillStyle = "#aaaaaa"; ctx.font = "18px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Best: " + S.best, L.W / 2, 600);
+    } else if (S.screen === "over") {
+      ctx.fillStyle = "rgba(0,0,0,0.6)"; ctx.fillRect(0, 0, L.W, L.H);
+      ctx.textAlign = "center"; ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 52px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TIME!", L.W / 2, 280);
+      ctx.font = "bold 30px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Score: " + S.score, L.W / 2, 340);
+      ctx.fillText("Stars: " + S.stars + "  Shifts: " + S.shifts, L.W / 2, 385);
+      if (S.stars > 0 && S.crashes === 0) { ctx.fillStyle = "#ffd700"; ctx.fillText("FLAWLESS +500!", L.W / 2, 430); }
+      ctx.fillStyle = "#aaaaaa"; ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Best: " + S.best, L.W / 2, 480);
+      ctx.fillStyle = "#ffd700"; ctx.font = "bold 24px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 560);
+    }
+  }
+
+  function onPress() {
+    if (S.screen === "title" || S.screen === "over") start();
+    else shift();
+  }
+  canvas.addEventListener("pointerdown", onPress);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Shift" || e.key === " " || e.key === "Enter") { e.preventDefault(); onPress(); }
+  });
+
+  resize();
+  (function loop(ts) {
+    var now = ts || 0;
+    var dt = last ? Math.min(0.05, (now - last) / 1000) : 0.016;
+    last = now; t += dt;
+    if (S.screen === "title" && auto) { autoTimer += dt; if (autoTimer > 1) { start(); autoTimer = 0; } }
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  })(0);
+
+  window.NeonShift = {
+    getState: function () {
+      return { screen: S.screen, score: S.score, world: S.world, shifts: S.shifts,
+        stars: S.stars, crashes: S.crashes, hearts: S.hearts, combo: S.combo,
+        timeLeft: Math.ceil(S.timeLeft), entities: entities.length };
+    },
+    press: onPress
+  };
+})();
+</script>
+</body>
+</html>
