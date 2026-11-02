@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Chain — Day 39</title>
+<meta name="description" content="Neon Chain — 60 seconds of chain-reaction chaos. Tap an orb to detonate it and chain the blast through every orb it touches. Chains of 8+ pay a MEGA bonus, golden orbs pay 5x.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Chain — Day 39. Chain reaction: orbs drift and bounce around the
+   arena. Tap anywhere to detonate a blast (radius 52). Every orb caught in
+   a blast detonates in turn, so one good tap can chain across the screen.
+   Each popped orb pays 100 x the chain combo (x1->x5 every 4 pops in the
+   chain), golden orbs pay 5x, and a chain of 8+ pays a +500 MEGA bonus.
+   60 seconds, best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var ChainLogic = (function () {
+  var W = 480, H = 800, BLAST_R = 52, ORB_R = 16, ORB_COUNT = 24;
+  var COLORS = ["#6cf0ff", "#b18cff", "#ff8cd1", "#7dff9b", "#ffb84d"];
+  function dist(x1, y1, x2, y2) {
+    var dx = x2 - x1, dy = y2 - y1;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  function inBlast(orb, x, y) { return dist(orb.x, orb.y, x, y) <= BLAST_R + orb.r; }
+  function comboForChain(pops) {
+    var c = 1 + Math.floor(pops / 4);
+    return c > 5 ? 5 : c;
+  }
+  function scoreFor(base, combo, golden) { return base * combo * (golden ? 5 : 1); }
+  function isGoldenSpawn(spawnIndex) { return spawnIndex % 6 === 5; }
+  function makeOrb(x, y, vx, vy, golden, color) {
+    return { x: x, y: y, vx: vx, vy: vy, r: ORB_R, golden: !!golden, color: color || "#6cf0ff", alive: true };
+  }
+  function updateOrb(o, dt) {
+    o.x += o.vx * dt; o.y += o.vy * dt;
+    if (o.x < o.r) { o.x = o.r; o.vx = Math.abs(o.vx); }
+    if (o.x > W - o.r) { o.x = W - o.r; o.vx = -Math.abs(o.vx); }
+    if (o.y < 90 + o.r) { o.y = 90 + o.r; o.vy = Math.abs(o.vy); }
+    if (o.y > H - o.r) { o.y = H - o.r; o.vy = -Math.abs(o.vy); }
+  }
+  // Static BFS chain: every orb reachable from (x,y) through overlapping blasts.
+  function chainReaction(orbs, x, y) {
+    var hit = [], seen = {};
+    var queue = [{ x: x, y: y }];
+    while (queue.length) {
+      var b = queue.shift();
+      for (var i = 0; i < orbs.length; i++) {
+        if (seen[i] || !orbs[i].alive) continue;
+        if (inBlast(orbs[i], b.x, b.y)) { seen[i] = true; hit.push(i); queue.push({ x: orbs[i].x, y: orbs[i].y }); }
+      }
+    }
+    return hit;
+  }
+  function makeState() {
+    return { screen: "title", timeLeft: 60, score: 0, pops: 0, chains: 0, lastChain: 0, bestChain: 0, mega: 0, best: 0 };
+  }
+  return { W: W, H: H, BLAST_R: BLAST_R, ORB_R: ORB_R, ORB_COUNT: ORB_COUNT, COLORS: COLORS, dist: dist, inBlast: inBlast, comboForChain: comboForChain, scoreFor: scoreFor, isGoldenSpawn: isGoldenSpawn, makeOrb: makeOrb, updateOrb: updateOrb, chainReaction: chainReaction, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = ChainLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_chain_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_chain_best") || "0", 10) || 0; } catch (e) {}
+  var orbs = [], blasts = [], particles = [], floats = [];
+  var spawnIndex = 0, chainActive = null, auto = (location.search.indexOf("auto=1") !== -1), autoTimer = 0;
+
+  function randOrb() {
+    var golden = L.isGoldenSpawn(spawnIndex++);
+    var color = golden ? "#ffd94d" : L.COLORS[Math.floor(Math.random() * L.COLORS.length)];
+    return L.makeOrb(40 + Math.random() * (L.W - 80), 140 + Math.random() * (L.H - 200),
+      (Math.random() < 0.5 ? -1 : 1) * (30 + Math.random() * 50),
+      (Math.random() < 0.5 ? -1 : 1) * (30 + Math.random() * 50), golden, color);
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_chain_best") || "0", 10) || 0; } catch (e) {}
+    orbs = []; spawnIndex = 0; blasts = []; particles = []; floats = []; chainActive = null;
+    for (var i = 0; i < L.ORB_COUNT; i++) orbs.push(randOrb());
+    window.__chainState = S; window.__chainOrbs = orbs;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame() {
+    S.screen = "over";
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_chain_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+  }
+  function detonate(x, y) {
+    if (S.screen !== "playing") return;
+    blasts.push({ x: x, y: y, t: 0 });
+    if (!chainActive) chainActive = { pops: 0, megaPaid: false };
+    var fired = false;
+    // Immediate first blast: pop orbs in range now, queue their blasts.
+    for (var i = 0; i < orbs.length; i++) {
+      if (orbs[i].alive && L.inBlast(orbs[i], x, y)) { popOrb(orbs[i]); blasts.push({ x: orbs[i].x, y: orbs[i].y, t: -0.12 }); fired = true; }
+    }
+    if (!fired) { chainActive = null; floats.push({ x: x, y: y, text: "FIZZLE", t: 0 }); }
+    else { tone(180, 0.25, "sawtooth", 0.2, 60); buzz(30); }
+  }
+  function popOrb(o) {
+    o.alive = false;
+    var chain = chainActive || { pops: 0, megaPaid: false };
+    var combo = L.comboForChain(chain.pops);
+    var pts = L.scoreFor(100, combo, o.golden);
+    S.score += pts; S.pops++; chain.pops++;
+    floats.push({ x: o.x, y: o.y, text: "+" + pts + (o.golden ? " GOLD!" : ""), t: 0, golden: o.golden });
+    for (var i = 0; i < 10; i++) particles.push({ x: o.x, y: o.y, vx: (Math.random() - 0.5) * 260, vy: (Math.random() - 0.5) * 260, t: 0, color: o.color });
+    if (chain.pops >= 8 && !chain.megaPaid) { chain.megaPaid = true; S.score += 500; S.mega++; floats.push({ x: o.x, y: o.y - 30, text: "MEGA CHAIN +500!", t: 0, golden: true }); tone(880, 0.3, "triangle", 0.25, 1320); }
+    chainActive = chain;
+  }
+  function toWorld(cx, cy) { return { x: (cx - ox) / scale, y: (cy - oy) / scale }; }
+  function onTap(cx, cy) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    var w = toWorld(cx, cy);
+    detonate(w.x, w.y);
+  }
+  canvas.addEventListener("pointerdown", function (e) { onTap(e.clientX, e.clientY); });
+  window.addEventListener("keydown", function (e) { if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_chain_mute", muted ? "1" : "0"); } catch (err) {} } });
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (S.screen === "playing") {
+      S.timeLeft -= dt;
+      for (var i = 0; i < orbs.length; i++) if (orbs[i].alive) L.updateOrb(orbs[i], dt);
+      // Blast propagation: each queued blast fires when its timer reaches 0.
+      for (var b = 0; b < blasts.length; b++) {
+        blasts[b].t += dt;
+        if (blasts[b].t >= 0 && !blasts[b].fired) {
+          blasts[b].fired = true;
+          for (var j = 0; j < orbs.length; j++) {
+            if (orbs[j].alive && L.inBlast(orbs[j], blasts[b].x, blasts[b].y)) { popOrb(orbs[j]); blasts.push({ x: orbs[j].x, y: orbs[j].y, t: -0.12 }); }
+          }
+        }
+      }
+      blasts = blasts.filter(function (bl) { return bl.t < 0.45; });
+      // Chain closes when no pending blasts remain.
+      if (chainActive && !blasts.some(function (bl) { return bl.t < 0; })) {
+        S.chains++; S.lastChain = chainActive.pops;
+        if (chainActive.pops > S.bestChain) S.bestChain = chainActive.pops;
+        chainActive = null;
+      }
+      // Replenish: keep the arena full (never mid-chain, or a chain could feed forever).
+      if (!chainActive) {
+        var alive = 0; for (var k = 0; k < orbs.length; k++) if (orbs[k].alive) alive++;
+        while (alive < L.ORB_COUNT) { orbs.push(randOrb()); alive++; }
+      }
+      if (auto) { autoTimer += dt; if (autoTimer > 0.8) { autoTimer = 0; var tgt = null; for (var a = 0; a < orbs.length; a++) if (orbs[a].alive) { tgt = orbs[a]; break; } if (tgt) detonate(tgt.x, tgt.y); } }
+      if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(); }
+    }
+    for (var p = 0; p < particles.length; p++) { particles[p].t += dt; particles[p].x += particles[p].vx * dt; particles[p].y += particles[p].vy * dt; }
+    particles = particles.filter(function (pt) { return pt.t < 0.6; });
+    for (var f = 0; f < floats.length; f++) { floats[f].t += dt; floats[f].y -= 30 * dt; }
+    floats = floats.filter(function (fl) { return fl.t < 1.2; });
+    draw();
+    requestAnimationFrame(frame);
+  }
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.save(); ctx.translate(ox, oy); ctx.scale(scale, scale);
+    // Arena
+    ctx.strokeStyle = "#2b3572"; ctx.lineWidth = 2; ctx.strokeRect(8, 84, L.W - 16, L.H - 92);
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 26px system-ui, sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("SCORE " + S.score, 16, 36);
+    ctx.textAlign = "right"; ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W - 16, 36);
+    ctx.textAlign = "left"; ctx.font = "16px system-ui, sans-serif"; ctx.fillStyle = "#aab4e8";
+    ctx.fillText("POPS " + S.pops + "  BEST CHAIN " + S.bestChain + "  BEST " + S.best, 16, 64);
+    if (chainActive) { ctx.fillStyle = "#ffd94d"; ctx.font = "bold 18px system-ui, sans-serif"; ctx.fillText("CHAIN x" + L.comboForChain(chainActive.pops) + " (" + chainActive.pops + ")", 16, 108); }
+    for (var i = 0; i < orbs.length; i++) {
+      var o = orbs[i]; if (!o.alive) continue;
+      var g = ctx.createLinearGradient(0, o.y - o.r, 0, o.y + o.r);
+      g.addColorStop(0, "#ffffff"); g.addColorStop(0.35, o.color); g.addColorStop(1, "#1a1040");
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255,.85)"; ctx.beginPath(); ctx.arc(o.x - 5, o.y - 6, 4, 0, Math.PI * 2); ctx.fill();
+      if (o.golden) { ctx.strokeStyle = "#ffd94d"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(o.x, o.y, o.r + 4, 0, Math.PI * 2); ctx.stroke(); }
+    }
+    for (var b = 0; b < blasts.length; b++) {
+      if (blasts[b].t < 0) continue;
+      var bt = Math.min(1, blasts[b].t / 0.4);
+      ctx.strokeStyle = "rgba(255,217,77," + (1 - bt) + ")"; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.arc(blasts[b].x, blasts[b].y, L.BLAST_R * (0.3 + 0.7 * bt), 0, Math.PI * 2); ctx.stroke();
+    }
+    for (var p = 0; p < particles.length; p++) {
+      ctx.globalAlpha = 1 - particles[p].t / 0.6; ctx.fillStyle = particles[p].color;
+      ctx.fillRect(particles[p].x - 2, particles[p].y - 2, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "center";
+    for (var f = 0; f < floats.length; f++) {
+      ctx.globalAlpha = 1 - floats[f].t / 1.2; ctx.fillStyle = floats[f].golden ? "#ffd94d" : "#e8ecff";
+      ctx.font = "bold 20px system-ui, sans-serif"; ctx.fillText(floats[f].text, Math.max(70, Math.min(L.W - 70, floats[f].x)), floats[f].y);
+    }
+    ctx.globalAlpha = 1;
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(7,5,18,.72)"; ctx.fillRect(0, 0, L.W, L.H);
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 52px system-ui, sans-serif"; ctx.fillText("NEON CHAIN", L.W / 2, 250);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "20px system-ui, sans-serif";
+      ctx.fillText("Tap an orb — the blast chains", L.W / 2, 310);
+      ctx.fillText("through every orb it touches!", L.W / 2, 340);
+      ctx.fillStyle = "#ffd94d"; ctx.fillText("Chains of 8+ pay MEGA +500", L.W / 2, 380);
+      ctx.fillStyle = "#aab4e8"; ctx.fillText("Golden orbs pay 5x · 60 seconds", L.W / 2, 410);
+      ctx.fillStyle = "#ffffff"; ctx.font = "bold 28px system-ui, sans-serif"; ctx.fillText("TAP TO PLAY", L.W / 2, 500);
+      ctx.fillStyle = "#aab4e8"; ctx.font = "16px system-ui, sans-serif"; ctx.fillText("Best: " + S.best, L.W / 2, 540);
+    }
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(7,5,18,.78)"; ctx.fillRect(0, 0, L.W, L.H);
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 44px system-ui, sans-serif"; ctx.fillText("TIME UP!", L.W / 2, 280);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 30px system-ui, sans-serif"; ctx.fillText("Score: " + S.score, L.W / 2, 340);
+      ctx.font = "20px system-ui, sans-serif"; ctx.fillText("Pops: " + S.pops + "  Best chain: " + S.bestChain, L.W / 2, 380);
+      ctx.fillText("MEGA chains: " + S.mega + "  Best: " + S.best, L.W / 2, 410);
+      ctx.fillStyle = "#ffffff"; ctx.font = "bold 26px system-ui, sans-serif"; ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 490);
+    }
+    ctx.restore();
+  }
+  reset();
+  if (auto) start();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
