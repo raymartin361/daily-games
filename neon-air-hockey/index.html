@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Air Hockey — Day 40</title>
+<meta name="description" content="Neon Air Hockey — 60 seconds of neon air hockey chaos. Drag your paddle, smash the puck into the top goal, chain goals to raise your combo to x5, golden pucks pay 5x. 3 hearts.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Air Hockey — Day 40. Drag the cyan paddle (bottom half) to smash
+   the puck into the top goal. The magenta AI paddle guards the top.
+   A player goal pays 100 x combo; every 4th consecutive goal without
+   conceding raises the combo (x1->x5); every 5th puck is GOLDEN (5x).
+   An opponent goal costs a heart and resets the streak. 60 seconds,
+   3 hearts, flawless (no goals conceded) +500. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var AirLogic = (function () {
+  var W = 480, H = 800, TOP = 84, BOTTOM = 800, GOAL_W = 160;
+  var PUCK_R = 14, PAD_R = 26, BASE_SPEED = 320;
+  function goalX0() { return (W - GOAL_W) / 2; }
+  function goalX1() { return (W + GOAL_W) / 2; }
+  function inGoalX(x) { return x >= goalX0() && x <= goalX1(); }
+  function goalFor(puck) {
+    if (puck.y - puck.r <= TOP && inGoalX(puck.x)) return "player";
+    if (puck.y + puck.r >= BOTTOM && inGoalX(puck.x)) return "opponent";
+    return "none";
+  }
+  function comboForStreak(streakBefore) {
+    var c = 1 + Math.floor(streakBefore / 4);
+    return c > 5 ? 5 : c;
+  }
+  function scoreFor(base, combo, golden) { return base * combo * (golden ? 5 : 1); }
+  function isGoldenPuck(spawnIndex) { return spawnIndex % 5 === 4; }
+  function clampPlayer(p) {
+    p.x = Math.max(PAD_R + 4, Math.min(W - PAD_R - 4, p.x));
+    p.y = Math.max(H / 2, Math.min(H - PAD_R - 4, p.y));
+    return p;
+  }
+  function clampAI(p) {
+    p.x = Math.max(PAD_R + 4, Math.min(W - PAD_R - 4, p.x));
+    p.y = Math.max(TOP + PAD_R, Math.min(H / 2, p.y));
+    return p;
+  }
+  function dist(x1, y1, x2, y2) { var dx = x2 - x1, dy = y2 - y1; return Math.sqrt(dx * dx + dy * dy); }
+  function paddleHit(puck, pad) { return dist(puck.x, puck.y, pad.x, pad.y) < puck.r + PAD_R; }
+  function makeState() {
+    return { screen: "title", timeLeft: 60, score: 0, goals: 0, conceded: 0, hearts: 3, streak: 0, best: 0, spawnIndex: 0 };
+  }
+  return { W: W, H: H, TOP: TOP, BOTTOM: BOTTOM, GOAL_W: GOAL_W, PUCK_R: PUCK_R, PAD_R: PAD_R, BASE_SPEED: BASE_SPEED, goalX0: goalX0, goalX1: goalX1, inGoalX: inGoalX, goalFor: goalFor, comboForStreak: comboForStreak, scoreFor: scoreFor, isGoldenPuck: isGoldenPuck, clampPlayer: clampPlayer, clampAI: clampAI, dist: dist, paddleHit: paddleHit, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = AirLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_air_hockey_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_air_hockey_best") || "0", 10) || 0; } catch (e) {}
+  var player = { x: 240, y: 700 }, ai = { x: 240, y: 180 };
+  var puck = null, particles = [], floats = [], dragging = false;
+  var auto = (location.search.indexOf("auto=1") !== -1);
+
+  function serve(dirY) {
+    var golden = L.isGoldenPuck(S.spawnIndex);
+    var speed = Math.min(520, L.BASE_SPEED + S.goals * 10);
+    var ang = (Math.random() - 0.5) * 0.9;
+    puck = { x: L.W / 2, y: L.H / 2, r: L.PUCK_R, vx: Math.sin(ang) * speed, vy: dirY * Math.cos(ang) * speed, golden: golden };
+    window.__airPuck = puck;
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_air_hockey_best") || "0", 10) || 0; } catch (e) {}
+    player = { x: 240, y: 700 }; ai = { x: 240, y: 180 };
+    particles = []; floats = []; dragging = false;
+    serve(1);
+    window.__airState = S; window.__airPlayer = player; window.__airAI = ai;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(flawless) {
+    if (flawless) { S.score += 500; floats.push({ x: 240, y: 300, text: "FLAWLESS +500!", t: 0, golden: true }); }
+    S.screen = "over";
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_air_hockey_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+  }
+  function onGoal(kind) {
+    if (kind === "player") {
+      var combo = L.comboForStreak(S.streak);
+      var pts = L.scoreFor(100, combo, puck.golden);
+      S.score += pts; S.goals++; S.streak++;
+      floats.push({ x: 240, y: 300, text: "GOAL +" + pts + (puck.golden ? " GOLD!" : ""), t: 0, golden: puck.golden });
+      tone(880, 0.25, "triangle", 0.25, 1320); buzz(40);
+      S.spawnIndex++; serve(-1);
+    } else {
+      S.conceded++; S.hearts--; S.streak = 0;
+      floats.push({ x: 240, y: 300, text: "CONCEDED -1 HEART", t: 0, golden: false });
+      tone(180, 0.3, "sawtooth", 0.2, 90); buzz(80);
+      if (S.hearts <= 0) { puck = null; endGame(false); return; }
+      S.spawnIndex++; serve(1);
+    }
+  }
+  function bouncePuckOffPad(pad) {
+    var dx = puck.x - pad.x, dy = puck.y - pad.y;
+    var d = Math.sqrt(dx * dx + dy * dy) || 1;
+    var nx = dx / d, ny = dy / d;
+    // Push out of overlap, then reflect along the normal.
+    puck.x = pad.x + nx * (puck.r + L.PAD_R + 1);
+    puck.y = pad.y + ny * (puck.r + L.PAD_R + 1);
+    var speed = Math.sqrt(puck.vx * puck.vx + puck.vy * puck.vy) || L.BASE_SPEED;
+    var dot = puck.vx * nx + puck.vy * ny;
+    if (dot < 0) { puck.vx -= 2 * dot * nx; puck.vy -= 2 * dot * ny; }
+    // Ensure the puck leaves the paddle (avoid sticking on a slow hit).
+    var ndot = puck.vx * nx + puck.vy * ny;
+    if (ndot < 60) { puck.vx += (60 - ndot) * nx; puck.vy += (60 - ndot) * ny; }
+    var ns = Math.sqrt(puck.vx * puck.vx + puck.vy * puck.vy);
+    puck.vx = puck.vx / ns * Math.max(speed, 280); puck.vy = puck.vy / ns * Math.max(speed, 280);
+    tone(520, 0.08, "square", 0.12); buzz(15);
+  }
+  function toWorld(cx, cy) { return { x: (cx - ox) / scale, y: (cy - oy) / scale }; }
+  function movePlayerTo(cx, cy) {
+    var w = toWorld(cx, cy);
+    player.x = w.x; player.y = w.y; L.clampPlayer(player);
+    window.__airPlayer = player;
+  }
+  canvas.addEventListener("pointerdown", function (e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    dragging = true; movePlayerTo(e.clientX, e.clientY);
+  });
+  canvas.addEventListener("pointermove", function (e) { if (dragging && S.screen === "playing") movePlayerTo(e.clientX, e.clientY); });
+  window.addEventListener("pointerup", function () { dragging = false; });
+  window.addEventListener("keydown", function (e) { if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_air_hockey_mute", muted ? "1" : "0"); } catch (err) {} } });
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (S.screen === "playing" && puck) {
+      S.timeLeft -= dt;
+      // AI paddle: chase the puck when it is in the top half, else centre.
+      var tx = (puck.y < L.H / 2) ? puck.x : L.W / 2;
+      var ty = (puck.y < L.H / 2) ? Math.min(puck.y, 320) : 180;
+      var aspeed = 320 * dt;
+      if (ai.x < tx) ai.x = Math.min(tx, ai.x + aspeed); else ai.x = Math.max(tx, ai.x - aspeed);
+      if (ai.y < ty) ai.y = Math.min(ty, ai.y + aspeed); else ai.y = Math.max(ty, ai.y - aspeed);
+      L.clampAI(ai);
+      if (auto) {
+        // Autoplay: player paddle shadows the puck in the bottom half.
+        var ax = puck.x, ay = Math.max(520, Math.min(720, puck.y));
+        player.x += (ax - player.x) * Math.min(1, dt * 10);
+        player.y += (ay - player.y) * Math.min(1, dt * 10);
+        L.clampPlayer(player);
+      }
+      puck.x += puck.vx * dt; puck.y += puck.vy * dt;
+      // Side walls.
+      if (puck.x - puck.r < 8) { puck.x = 8 + puck.r; puck.vx = Math.abs(puck.vx); }
+      if (puck.x + puck.r > L.W - 8) { puck.x = L.W - 8 - puck.r; puck.vx = -Math.abs(puck.vx); }
+      // Top / bottom walls, except inside the goal mouth.
+      if (puck.y - puck.r <= L.TOP && !L.inGoalX(puck.x)) { puck.y = L.TOP + puck.r; puck.vy = Math.abs(puck.vy); }
+      if (puck.y + puck.r >= L.BOTTOM && !L.inGoalX(puck.x)) { puck.y = L.BOTTOM - puck.r; puck.vy = -Math.abs(puck.vy); }
+      // Paddle collisions.
+      if (L.paddleHit(puck, player)) bouncePuckOffPad(player);
+      if (puck && L.paddleHit(puck, ai)) bouncePuckOffPad(ai);
+      var g = puck ? L.goalFor(puck) : "none";
+      if (g !== "none") onGoal(g);
+      if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(S.conceded === 0); }
+    }
+    for (var p = 0; p < particles.length; p++) { particles[p].t += dt; particles[p].x += particles[p].vx * dt; particles[p].y += particles[p].vy * dt; }
+    particles = particles.filter(function (pt) { return pt.t < 0.6; });
+    for (var f = 0; f < floats.length; f++) { floats[f].t += dt; floats[f].y -= 30 * dt; }
+    floats = floats.filter(function (fl) { return fl.t < 1.2; });
+    draw();
+    requestAnimationFrame(frame);
+  }
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.save(); ctx.translate(ox, oy); ctx.scale(scale, scale);
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 26px system-ui, sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("SCORE " + S.score, 16, 36);
+    ctx.textAlign = "right"; ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W - 16, 36);
+    ctx.textAlign = "left"; ctx.font = "16px system-ui, sans-serif"; ctx.fillStyle = "#aab4e8";
+    ctx.fillText("GOALS " + S.goals + "  x" + L.comboForStreak(S.streak) + "  BEST " + S.best, 16, 64);
+    ctx.fillStyle = "#ff6b81"; ctx.fillText("♥".repeat(Math.max(0, S.hearts)), 16, 84 - 4);
+    // Table
+    ctx.strokeStyle = "#2b3572"; ctx.lineWidth = 2; ctx.strokeRect(8, L.TOP, L.W - 16, L.H - L.TOP);
+    ctx.strokeStyle = "#3a4a9e"; ctx.beginPath(); ctx.moveTo(8, L.H / 2); ctx.lineTo(L.W - 8, L.H / 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(L.W / 2, L.H / 2, 60, 0, Math.PI * 2); ctx.stroke();
+    // Goals
+    ctx.fillStyle = "#ffd94d"; ctx.fillRect(L.goalX0(), L.TOP - 6, L.GOAL_W, 6);
+    ctx.fillStyle = "#6cf0ff"; ctx.fillRect(L.goalX0(), L.BOTTOM - 0, L.GOAL_W, 0);
+    ctx.strokeStyle = "#ffd94d"; ctx.strokeRect(L.goalX0(), L.TOP, L.GOAL_W, 14);
+    ctx.strokeStyle = "#6cf0ff"; ctx.strokeRect(L.goalX0(), L.BOTTOM - 14, L.GOAL_W, 14);
+    // Puck
+    if (puck) {
+      var g = ctx.createLinearGradient(0, puck.y - puck.r, 0, puck.y + puck.r);
+      g.addColorStop(0, "#ffffff"); g.addColorStop(0.35, puck.golden ? "#ffd94d" : "#ff8cd1"); g.addColorStop(1, "#1a1040");
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(puck.x, puck.y, puck.r, 0, Math.PI * 2); ctx.fill();
+      if (puck.golden) { ctx.strokeStyle = "#ffd94d"; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(puck.x, puck.y, puck.r + 4, 0, Math.PI * 2); ctx.stroke(); }
+    }
+    // Paddles (gradients created after the transform, in local coords)
+    function drawPad(pad, color) {
+      var gg = ctx.createLinearGradient(0, pad.y - L.PAD_R, 0, pad.y + L.PAD_R);
+      gg.addColorStop(0, "#ffffff"); gg.addColorStop(0.35, color); gg.addColorStop(1, "#1a1040");
+      ctx.fillStyle = gg; ctx.beginPath(); ctx.arc(pad.x, pad.y, L.PAD_R, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255,.9)"; ctx.beginPath(); ctx.arc(pad.x, pad.y, 10, 0, Math.PI * 2); ctx.fill();
+    }
+    drawPad(ai, "#ff5da2"); drawPad(player, "#22d3ee");
+    ctx.textAlign = "center";
+    for (var f = 0; f < floats.length; f++) {
+      ctx.globalAlpha = 1 - floats[f].t / 1.2; ctx.fillStyle = floats[f].golden ? "#ffd94d" : "#e8ecff";
+      ctx.font = "bold 20px system-ui, sans-serif"; ctx.fillText(floats[f].text, Math.max(90, Math.min(L.W - 90, floats[f].x)), floats[f].y);
+    }
+    ctx.globalAlpha = 1;
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(7,5,18,.72)"; ctx.fillRect(0, 0, L.W, L.H);
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 40px system-ui, sans-serif"; ctx.fillText("NEON AIR HOCKEY", L.W / 2, 250);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "20px system-ui, sans-serif";
+      ctx.fillText("Drag your paddle — smash the puck", L.W / 2, 310);
+      ctx.fillText("into the TOP goal!", L.W / 2, 340);
+      ctx.fillStyle = "#ffd94d"; ctx.fillText("Chain goals to raise combo to x5", L.W / 2, 380);
+      ctx.fillStyle = "#aab4e8"; ctx.fillText("Golden pucks pay 5x · 3 hearts · 60s", L.W / 2, 410);
+      ctx.fillStyle = "#ffffff"; ctx.font = "bold 28px system-ui, sans-serif"; ctx.fillText("TAP TO PLAY", L.W / 2, 500);
+      ctx.fillStyle = "#aab4e8"; ctx.font = "16px system-ui, sans-serif"; ctx.fillText("Best: " + S.best, L.W / 2, 540);
+    }
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(7,5,18,.78)"; ctx.fillRect(0, 0, L.W, L.H);
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 44px system-ui, sans-serif"; ctx.fillText("TIME UP!", L.W / 2, 280);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 30px system-ui, sans-serif"; ctx.fillText("Score: " + S.score, L.W / 2, 340);
+      ctx.font = "20px system-ui, sans-serif"; ctx.fillText("Goals: " + S.goals + "  Conceded: " + S.conceded, L.W / 2, 380);
+      ctx.fillText("Best: " + S.best, L.W / 2, 410);
+      ctx.fillStyle = "#ffffff"; ctx.font = "bold 26px system-ui, sans-serif"; ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 490);
+    }
+    ctx.restore();
+  }
+  reset();
+  if (auto) start();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
