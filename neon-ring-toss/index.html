@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Ring Toss — Day 41</title>
+<meta name="description" content="Neon Ring Toss — 60 seconds of neon ring-toss chaos. Drag to aim, release to toss a glowing ring onto the drifting pegs — centre peg pays 100, chain 4 scoring rings to raise your combo to x5, every 6th ring is GOLDEN (5x).">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Ring Toss — Day 41. Drag to aim from the launch pad, release to
+   toss a glowing ring at the drifting pegs. Landing within 48px of a peg
+   scores its value x combo; every 4th consecutive scoring ring raises the
+   combo (x1->x5); every 6th ring is GOLDEN (5x). A miss resets the streak.
+   60 seconds, flawless (no misses) +500. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var RingLogic = (function () {
+  var W = 480, H = 800, HUD = 84, CAPTURE = 48, LAUNCH_X = 240, LAUNCH_Y = 680, PEG_Y = 260;
+  var PEGS = [
+    { x: 60, v: 20 }, { x: 150, v: 50 }, { x: 240, v: 100 },
+    { x: 330, v: 50 }, { x: 420, v: 20 }
+  ];
+  function pegX(peg, t) { return peg.x + Math.sin(t * 1.1 + peg.x * 0.01) * 28; }
+  function pegPositions(t) {
+    return PEGS.map(function (p) { return { x: pegX(p, t), y: PEG_Y, v: p.v }; });
+  }
+  function comboForStreak(streakBefore) {
+    var c = 1 + Math.floor(streakBefore / 4);
+    return c > 5 ? 5 : c;
+  }
+  function isGoldenRing(throwIndex) { return throwIndex % 6 === 5; }
+  function nearestPeg(landingX, pegs) {
+    var best = null, bestD = 1e9;
+    for (var i = 0; i < pegs.length; i++) {
+      var d = Math.abs(landingX - pegs[i].x);
+      if (d < bestD) { bestD = d; best = pegs[i]; }
+    }
+    return { peg: best, dist: bestD };
+  }
+  function scoreRing(landingX, pegs, streakBefore, golden) {
+    var n = nearestPeg(landingX, pegs);
+    if (n.dist > CAPTURE) return { pts: 0, hit: false, value: 0, peg: null };
+    var combo = comboForStreak(streakBefore);
+    return { pts: n.peg.v * combo * (golden ? 5 : 1), hit: true, value: n.peg.v, peg: n.peg, combo: combo };
+  }
+  function clampAim(x) { return Math.max(20, Math.min(W - 20, x)); }
+  function makeState() {
+    return { screen: "title", timeLeft: 60, score: 0, rings: 0, hits: 0, misses: 0, streak: 0, best: 0 };
+  }
+  return { W: W, H: H, HUD: HUD, CAPTURE: CAPTURE, LAUNCH_X: LAUNCH_X, LAUNCH_Y: LAUNCH_Y, PEG_Y: PEG_Y, PEGS: PEGS, pegX: pegX, pegPositions: pegPositions, comboForStreak: comboForStreak, isGoldenRing: isGoldenRing, nearestPeg: nearestPeg, scoreRing: scoreRing, clampAim: clampAim, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = RingLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_ring_toss_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_ring_toss_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, aiming = false, aimX = 240, ring = null, floats = [], particles = [];
+  var auto = (location.search.indexOf("auto=1") !== -1), autoTimer = 0;
+
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_ring_toss_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; aiming = false; aimX = 240; ring = null; floats = []; particles = []; autoTimer = 0;
+    window.__ringState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(flawless) {
+    if (flawless && S.rings > 0) { S.score += 500; floats.push({ x: 240, y: 340, text: "FLAWLESS +500!", t: 0, golden: true }); }
+    S.screen = "over";
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_ring_toss_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+  }
+  function throwRing() {
+    if (ring) return;
+    var golden = L.isGoldenRing(S.rings);
+    ring = { t: 0, dur: 0.55, fromX: L.LAUNCH_X, fromY: L.LAUNCH_Y, toX: aimX, golden: golden };
+    S.rings++;
+    window.__ringState = S;
+  }
+  function landRing() {
+    var pegs = L.pegPositions(elapsed);
+    var res = L.scoreRing(ring.toX, pegs, S.streak, ring.golden);
+    if (res.hit) {
+      S.score += res.pts; S.hits++; S.streak++;
+      floats.push({ x: ring.toX, y: L.PEG_Y - 60, text: "+" + res.pts + (ring.golden ? " GOLD!" : ""), t: 0, golden: ring.golden });
+      for (var i = 0; i < 12; i++) particles.push({ x: ring.toX, y: L.PEG_Y, vx: (Math.random() - 0.5) * 240, vy: -Math.random() * 200, t: 0 });
+      tone(880, 0.25, "triangle", 0.25, 1320); buzz(40);
+    } else {
+      S.misses++; S.streak = 0;
+      floats.push({ x: ring.toX, y: L.PEG_Y - 60, text: "MISS", t: 0, golden: false });
+      tone(180, 0.3, "sawtooth", 0.2, 90); buzz(80);
+    }
+    ring = null;
+    window.__ringState = S;
+  }
+  function toWorld(cx, cy) { return { x: (cx - ox) / scale, y: (cy - oy) / scale }; }
+  canvas.addEventListener("pointerdown", function (e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    aiming = true; aimX = L.clampAim(toWorld(e.clientX, e.clientY).x);
+  });
+  canvas.addEventListener("pointermove", function (e) {
+    if (aiming && S.screen === "playing") aimX = L.clampAim(toWorld(e.clientX, e.clientY).x);
+  });
+  window.addEventListener("pointerup", function () {
+    if (aiming && S.screen === "playing") throwRing();
+    aiming = false;
+  });
+  window.addEventListener("keydown", function (e) { if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_ring_toss_mute", muted ? "1" : "0"); } catch (err) {} } });
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (S.screen === "playing") {
+      elapsed += dt; S.timeLeft -= dt;
+      if (auto) {
+        autoTimer += dt;
+        if (autoTimer > 1.0 && !ring) { autoTimer = 0; aimX = L.pegPositions(elapsed)[2].x; throwRing(); }
+      }
+      if (ring) {
+        ring.t += dt;
+        if (ring.t >= ring.dur) landRing();
+      }
+      if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(S.misses === 0); }
+    }
+    for (var p = 0; p < particles.length; p++) { particles[p].t += dt; particles[p].x += particles[p].vx * dt; particles[p].y += particles[p].vy * dt; }
+    particles = particles.filter(function (pt) { return pt.t < 0.6; });
+    for (var f = 0; f < floats.length; f++) { floats[f].t += dt; floats[f].y -= 30 * dt; }
+    floats = floats.filter(function (fl) { return fl.t < 1.2; });
+    draw();
+    requestAnimationFrame(frame);
+  }
+  function ringPos() {
+    if (!ring) return null;
+    var t = Math.min(1, ring.t / ring.dur);
+    var x = ring.fromX + (ring.toX - ring.fromX) * t;
+    var y = ring.fromY + (L.PEG_Y - ring.fromY) * t - Math.sin(Math.PI * t) * 120;
+    return { x: x, y: y, t: t };
+  }
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.save(); ctx.translate(ox, oy); ctx.scale(scale, scale);
+    // Backboard
+    var bg = ctx.createLinearGradient(0, 0, 0, 800);
+    bg.addColorStop(0, "#0d1233"); bg.addColorStop(1, "#070512");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, 480, 800);
+    // HUD
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 28px system-ui"; ctx.textAlign = "left";
+    ctx.fillText("SCORE " + S.score, 16, 40);
+    ctx.textAlign = "center";
+    var combo = L.comboForStreak(S.streak);
+    ctx.fillStyle = combo > 1 ? "#ffd75e" : "#aab4e8";
+    ctx.fillText("x" + combo, 240, 40);
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "right";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", 464, 40);
+    ctx.fillStyle = "#7780b8"; ctx.font = "16px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("RINGS " + S.rings + "  •  HITS " + S.hits + "  •  BEST " + S.best, 240, 68);
+    // Peg board
+    var pegs = L.pegPositions(elapsed);
+    ctx.fillStyle = "#151c3f"; ctx.fillRect(16, 180, 448, 130);
+    for (var i = 0; i < pegs.length; i++) {
+      var pg = pegs[i];
+      ctx.beginPath(); ctx.arc(pg.x, pg.y, 30, 0, Math.PI * 2);
+      ctx.fillStyle = pg.v === 100 ? "#ffd75e" : "#2b3572"; ctx.fill();
+      ctx.beginPath(); ctx.arc(pg.x, pg.y, 12, 0, Math.PI * 2);
+      ctx.fillStyle = pg.v === 100 ? "#7a4d00" : "#6cf0ff"; ctx.fill();
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 18px system-ui"; ctx.textAlign = "center";
+      ctx.fillText(String(pg.v), pg.x, pg.y + 52);
+    }
+    // Aim preview
+    if (S.screen === "playing" && aiming && !ring) {
+      ctx.fillStyle = "rgba(108,240,255,0.7)";
+      for (var d = 0; d <= 10; d++) {
+        var tt = d / 10;
+        var ax = L.LAUNCH_X + (aimX - L.LAUNCH_X) * tt;
+        var ay = L.LAUNCH_Y + (L.PEG_Y - L.LAUNCH_Y) * tt - Math.sin(Math.PI * tt) * 120;
+        ctx.beginPath(); ctx.arc(ax, ay, 4, 0, Math.PI * 2); ctx.fill();
+      }
+    }
+    // Launch pad
+    ctx.beginPath(); ctx.arc(L.LAUNCH_X, L.LAUNCH_Y, 34, 0, Math.PI * 2);
+    ctx.fillStyle = "#151c3f"; ctx.fill();
+    ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 15px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("TOSS", L.LAUNCH_X, L.LAUNCH_Y + 5);
+    // Flying ring
+    var rp = ringPos();
+    if (rp) {
+      ctx.beginPath(); ctx.arc(rp.x, rp.y, 22, 0, Math.PI * 2);
+      ctx.strokeStyle = ring.golden ? "#ffd75e" : "#ff8cd1"; ctx.lineWidth = 8; ctx.stroke();
+    }
+    // Next-ring preview
+    if (S.screen === "playing" && !ring) {
+      var goldenNext = L.isGoldenRing(S.rings);
+      ctx.beginPath(); ctx.arc(L.LAUNCH_X, L.LAUNCH_Y - 58, 18, 0, Math.PI * 2);
+      ctx.strokeStyle = goldenNext ? "#ffd75e" : "#ff8cd1"; ctx.lineWidth = 6; ctx.stroke();
+      if (goldenNext) { ctx.fillStyle = "#ffd75e"; ctx.font = "bold 14px system-ui"; ctx.fillText("GOLDEN NEXT!", L.LAUNCH_X, L.LAUNCH_Y - 88); }
+    }
+    for (var q = 0; q < particles.length; q++) {
+      ctx.fillStyle = "rgba(255,215,94," + (1 - particles[q].t / 0.6) + ")";
+      ctx.fillRect(particles[q].x - 3, particles[q].y - 3, 6, 6);
+    }
+    ctx.textAlign = "center";
+    for (var fl = 0; fl < floats.length; fl++) {
+      ctx.fillStyle = floats[fl].golden ? "#ffd75e" : "#e8ecff";
+      ctx.font = "bold 26px system-ui";
+      ctx.fillText(floats[fl].text, floats[fl].x, floats[fl].y);
+    }
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.fillStyle = "#ff8cd1"; ctx.font = "bold 52px system-ui";
+      ctx.fillText("NEON", 240, 300);
+      ctx.fillStyle = "#6cf0ff";
+      ctx.fillText("RING TOSS", 240, 360);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "22px system-ui";
+      ctx.fillText("Drag to aim, release to toss!", 240, 420);
+      ctx.fillText("Land rings on the drifting pegs.", 240, 452);
+      ctx.fillText("Centre peg pays 100. Chain 4 hits", 240, 484);
+      ctx.fillText("for combo up to x5. Every 6th", 240, 516);
+      ctx.fillText("ring is GOLDEN (5x). 60 seconds!", 240, 548);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 24px system-ui";
+      ctx.fillText("TAP TO PLAY", 240, 620);
+      ctx.fillStyle = "#aab4e8"; ctx.font = "16px system-ui";
+      ctx.fillText("Best: " + S.best, 240, 660);
+    }
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.fillStyle = "#ff8cd1"; ctx.font = "bold 44px system-ui";
+      ctx.fillText("TIME!", 240, 320);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 34px system-ui";
+      ctx.fillText("Score: " + S.score, 240, 380);
+      ctx.font = "22px system-ui";
+      ctx.fillText("Rings: " + S.rings + "  Hits: " + S.hits, 240, 424);
+      ctx.fillText("Best: " + S.best, 240, 456);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 24px system-ui";
+      ctx.fillText("TAP TO PLAY AGAIN", 240, 520);
+    }
+    ctx.restore();
+  }
+  window.__ringState = S;
+  if (auto) start();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
