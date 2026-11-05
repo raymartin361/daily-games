@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Claw — Day 42</title>
+<meta name="description" content="Neon Claw — 60 seconds of neon claw-machine chaos. Drag to slide the claw, tap to DROP and grab glowing prizes — chain 4 grabs to raise your combo to x5, golden prizes pay 5x, and bombs cost a heart.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Claw — Day 42. A neon claw machine: the claw slides along the rail
+   (auto-slides; drag to position it), tap or press Space to DROP. The claw
+   grabs the nearest prize under it, carries it to the chute, and scores
+   value x combo; every 4th consecutive successful grab raises the combo
+   (x1->x5); golden prizes pay 5x; bombs cost a heart (3 hearts). Empty
+   grabs reset the streak. 60 seconds, flawless (no bombs, no empty grabs)
+   +500. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var ClawLogic = (function () {
+  var W = 480, H = 800, HUD = 84, RAIL_Y = 130, PIT_Y = 700, FLOOR_Y = 762;
+  var GRAB_DX = 36, GRAB_DY = 60, CLAW_MIN_X = 56, CLAW_MAX_X = 424, CHUTE_X = 48;
+  var SLIDE_SPEED = 170, DROP_SPEED = 520, CARRY_SPEED = 240;
+  function comboForStreak(streakBefore) {
+    var c = 1 + Math.floor(streakBefore / 4);
+    return c > 5 ? 5 : c;
+  }
+  function prizePoints(prize, streakBefore) {
+    if (!prize || prize.type === "bomb") return 0;
+    var base = prize.type === "star" ? 200 : 100;
+    return base * comboForStreak(streakBefore) * (prize.type === "gold" ? 5 : 1);
+  }
+  function makePrizes(rnd) {
+    rnd = rnd || Math.random;
+    var types = ["common", "common", "common", "common", "common", "common",
+      "common", "common", "common", "star", "star", "gold", "bomb", "bomb"];
+    var slots = [];
+    for (var i = 0; i < 7; i++) slots.push({ x: 66 + i * 58, y: 655 });
+    for (var j = 0; j < 7; j++) slots.push({ x: 66 + j * 58, y: 730 });
+    var prizes = [];
+    for (var k = 0; k < slots.length; k++) {
+      var s = slots[k];
+      prizes.push({ x: s.x + (rnd() - 0.5) * 16, y: s.y + (rnd() - 0.5) * 10,
+        r: 22, type: types[k], id: k });
+    }
+    return prizes;
+  }
+  function nearestPrize(clawX, clawTipY, prizes) {
+    var best = null, bestD = 1e9;
+    for (var i = 0; i < prizes.length; i++) {
+      var p = prizes[i];
+      var dx = Math.abs(p.x - clawX), dy = Math.abs(p.y - clawTipY);
+      if (dx <= GRAB_DX && dy <= GRAB_DY && dx < bestD) { bestD = dx; best = p; }
+    }
+    return best;
+  }
+  function clampClawX(x) { return Math.max(CLAW_MIN_X, Math.min(CLAW_MAX_X, x)); }
+  function makeState() {
+    return { screen: "title", timeLeft: 60, score: 0, grabs: 0, scored: 0,
+      bombs: 0, empty: 0, streak: 0, hearts: 3, best: 0 };
+  }
+  return { W: W, H: H, HUD: HUD, RAIL_Y: RAIL_Y, PIT_Y: PIT_Y, FLOOR_Y: FLOOR_Y,
+    GRAB_DX: GRAB_DX, GRAB_DY: GRAB_DY, CLAW_MIN_X: CLAW_MIN_X, CLAW_MAX_X: CLAW_MAX_X,
+    CHUTE_X: CHUTE_X, SLIDE_SPEED: SLIDE_SPEED, DROP_SPEED: DROP_SPEED,
+    CARRY_SPEED: CARRY_SPEED, comboForStreak: comboForStreak,
+    prizePoints: prizePoints, makePrizes: makePrizes, nearestPrize: nearestPrize,
+    clampClawX: clampClawX, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = ClawLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_claw_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_claw_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, prizes = L.makePrizes(), clawX = 240, clawY = L.RAIL_Y;
+  var phase = "idle", phaseT = 0, slideDir = 1, slideHold = 0, carried = null;
+  var floats = [], particles = [], shake = 0, respawnT = 0, nextId = 100;
+  var auto = (location.search.indexOf("auto=1") !== -1), autoTimer = 0;
+  var downX = 0, downY = 0, downT = 0, dragging = false;
+
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_claw_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; prizes = L.makePrizes(); clawX = 240; clawY = L.RAIL_Y;
+    phase = "idle"; phaseT = 0; slideDir = 1; slideHold = 0; carried = null;
+    floats = []; particles = []; shake = 0; respawnT = 0; nextId = 100; autoTimer = 0;
+    window.__clawState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(flawless) {
+    if (flawless && S.scored > 0) { S.score += 500; floats.push({ x: 240, y: 340, text: "FLAWLESS +500!", t: 0, golden: true }); }
+    S.screen = "over";
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_claw_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+  }
+  function dropClaw() {
+    if (S.screen !== "playing" || phase !== "idle") return;
+    phase = "drop"; phaseT = 0; tone(300, 0.3, "sawtooth", 0.08, 180);
+  }
+  function doGrab() {
+    var p = L.nearestPrize(clawX, L.PIT_Y, prizes);
+    S.grabs++;
+    if (p) {
+      prizes = prizes.filter(function (q) { return q !== p; });
+      carried = p;
+      if (p.type === "bomb") {
+        S.bombs++; S.streak = 0; S.hearts--; shake = 0.4;
+        floats.push({ x: clawX, y: 560, text: "BOMB! -1 ♥", t: 0, golden: false });
+        tone(140, 0.4, "sawtooth", 0.25, 60); buzz(120);
+        if (S.hearts <= 0) { S.hearts = 0; }
+      } else {
+        tone(520, 0.15, "triangle", 0.2, 780);
+      }
+    } else {
+      S.empty++; S.streak = 0;
+      floats.push({ x: clawX, y: 560, text: "EMPTY!", t: 0, golden: false });
+      tone(180, 0.25, "sawtooth", 0.15, 90);
+    }
+    phase = "rise"; phaseT = 0;
+    window.__clawState = S;
+  }
+  function deliver() {
+    var p = carried; carried = null;
+    if (p && p.type !== "bomb") {
+      var pts = L.prizePoints(p, S.streak);
+      S.score += pts; S.scored++; S.streak++;
+      floats.push({ x: L.CHUTE_X + 30, y: 300, text: "+" + pts + (p.type === "gold" ? " GOLD!" : ""), t: 0, golden: p.type === "gold" });
+      for (var i = 0; i < 12; i++) particles.push({ x: L.CHUTE_X, y: 320, vx: (Math.random() - 0.5) * 240, vy: -Math.random() * 200, t: 0 });
+      tone(880, 0.25, "triangle", 0.25, 1320); buzz(40);
+    } else if (p && p.type === "bomb") {
+      floats.push({ x: L.CHUTE_X + 30, y: 300, text: "SAFE!", t: 0, golden: false });
+    }
+    respawnT = 1.2;
+    phase = "return"; phaseT = 0;
+    window.__clawState = S;
+  }
+  function spawnReplacement() {
+    var types = ["common", "common", "common", "common", "star", "gold", "bomb"];
+    var type = types[Math.floor(Math.random() * types.length)];
+    var rowY = Math.random() < 0.5 ? 655 : 730;
+    prizes.push({ x: 66 + Math.random() * 348, y: rowY, r: 22, type: type, id: nextId++ });
+  }
+  function toWorld(cx, cy) { return { x: (cx - ox) / scale, y: (cy - oy) / scale }; }
+  canvas.addEventListener("pointerdown", function (e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    var w = toWorld(e.clientX, e.clientY);
+    downX = w.x; downY = w.y; downT = performance.now(); dragging = true;
+    clawX = L.clampClawX(w.x); slideHold = 1.5;
+  });
+  canvas.addEventListener("pointermove", function (e) {
+    if (!dragging || S.screen !== "playing") return;
+    var w = toWorld(e.clientX, e.clientY);
+    clawX = L.clampClawX(w.x); slideHold = 1.5;
+  });
+  window.addEventListener("pointerup", function (e) {
+    if (!dragging) return;
+    dragging = false;
+    if (S.screen !== "playing") return;
+    var moved = Math.abs((e.clientX - ox) / scale - downX) + Math.abs((e.clientY - oy) / scale - downY);
+    if (moved < 12 && performance.now() - downT < 400) dropClaw();
+  });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_claw_mute", muted ? "1" : "0"); } catch (err) {} }
+    if (S.screen !== "playing") return;
+    if (e.key === " " || e.key === "Enter") { e.preventDefault(); dropClaw(); }
+    if (e.key === "ArrowLeft") { clawX = L.clampClawX(clawX - 24); slideHold = 1.5; }
+    if (e.key === "ArrowRight") { clawX = L.clampClawX(clawX + 24); slideHold = 1.5; }
+  });
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (S.screen === "playing") {
+      elapsed += dt; S.timeLeft -= dt;
+      if (slideHold > 0) slideHold -= dt;
+      if (phase === "idle") {
+        if (slideHold <= 0) {
+          clawX += slideDir * L.SLIDE_SPEED * dt;
+          if (clawX >= L.CLAW_MAX_X) { clawX = L.CLAW_MAX_X; slideDir = -1; }
+          if (clawX <= L.CLAW_MIN_X) { clawX = L.CLAW_MIN_X; slideDir = 1; }
+        }
+        if (auto) {
+          autoTimer += dt;
+          var near = L.nearestPrize(clawX, L.PIT_Y, prizes);
+          if (near && Math.abs(near.x - clawX) < 24) { autoTimer = 0; dropClaw(); }
+          else if (autoTimer > 2.5) { autoTimer = 0; dropClaw(); }
+        }
+      } else if (phase === "drop") {
+        clawY += L.DROP_SPEED * dt;
+        if (clawY >= L.PIT_Y) { clawY = L.PIT_Y; phase = "grab"; phaseT = 0; }
+      } else if (phase === "grab") {
+        phaseT += dt;
+        if (phaseT >= 0.28) doGrab();
+      } else if (phase === "rise") {
+        clawY -= L.DROP_SPEED * dt;
+        if (clawY <= L.RAIL_Y) { clawY = L.RAIL_Y; phase = carried ? "carry" : "idle"; phaseT = 0; }
+      } else if (phase === "carry") {
+        clawX -= L.CARRY_SPEED * dt;
+        if (clawX <= L.CHUTE_X) { clawX = L.CHUTE_X; phase = "deliver"; phaseT = 0; }
+      } else if (phase === "deliver") {
+        phaseT += dt;
+        if (phaseT >= 0.3) deliver();
+      } else if (phase === "return") {
+        clawX += L.CARRY_SPEED * dt;
+        if (clawX >= 240) { clawX = 240; phase = "idle"; phaseT = 0; }
+      }
+      if (respawnT > 0) { respawnT -= dt; if (respawnT <= 0) spawnReplacement(); }
+      if (S.hearts <= 0) { S.timeLeft = 0; endGame(false); }
+      else if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(S.bombs === 0 && S.empty === 0); }
+    }
+    if (shake > 0) shake -= dt;
+    for (var p = 0; p < particles.length; p++) { particles[p].t += dt; particles[p].x += particles[p].vx * dt; particles[p].y += particles[p].vy * dt; }
+    particles = particles.filter(function (pt) { return pt.t < 0.6; });
+    for (var f = 0; f < floats.length; f++) { floats[f].t += dt; floats[f].y -= 30 * dt; }
+    floats = floats.filter(function (fl) { return fl.t < 1.2; });
+    draw();
+    requestAnimationFrame(frame);
+  }
+  function prizeColor(type) {
+    if (type === "gold") return "#ffd75e";
+    if (type === "star") return "#ffe98a";
+    if (type === "bomb") return "#ff4d6d";
+    return null;
+  }
+  function drawPrize(p, t) {
+    var c = prizeColor(p.type);
+    var pulse = 1 + Math.sin(t * 3 + p.id) * 0.06;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * pulse, 0, Math.PI * 2);
+    if (c) { ctx.fillStyle = c; ctx.fill(); }
+    else {
+      var g = ctx.createRadialGradient(p.x - 6, p.y - 8, 2, p.x, p.y, p.r);
+      var cols = ["#6cf0ff", "#ff8cd1", "#b18cff"];
+      var col = cols[p.id % 3];
+      g.addColorStop(0, "#ffffff"); g.addColorStop(0.35, col); g.addColorStop(1, "#2b3572");
+      ctx.fillStyle = g; ctx.fill();
+    }
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r * 0.55, 0, Math.PI * 2);
+    ctx.fillStyle = p.type === "bomb" ? "#3a0a14" : "rgba(255,255,255,0.85)"; ctx.fill();
+    if (p.type === "bomb") {
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 20px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("!", p.x, p.y + 7);
+    } else if (p.type === "gold") {
+      ctx.fillStyle = "#7a4d00"; ctx.font = "bold 16px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("★", p.x, p.y + 6);
+    }
+  }
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.save();
+    if (shake > 0) ctx.translate((Math.random() - 0.5) * 10, (Math.random() - 0.5) * 10);
+    ctx.translate(ox, oy); ctx.scale(scale, scale);
+    // Machine interior
+    var bg = ctx.createLinearGradient(0, 0, 0, 800);
+    bg.addColorStop(0, "#0d1233"); bg.addColorStop(1, "#070512");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, 480, 800);
+    // HUD
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 28px system-ui"; ctx.textAlign = "left";
+    ctx.fillText("SCORE " + S.score, 16, 40);
+    ctx.textAlign = "center";
+    var combo = L.comboForStreak(S.streak);
+    ctx.fillStyle = combo > 1 ? "#ffd75e" : "#aab4e8";
+    ctx.fillText("x" + combo, 240, 40);
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "right";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", 464, 40);
+    ctx.fillStyle = "#7780b8"; ctx.font = "16px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("GRABS " + S.grabs + "  •  BEST " + S.best, 240, 68);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ff4d6d"; ctx.font = "bold 22px system-ui";
+    var hearts = "";
+    for (var h = 0; h < 3; h++) hearts += (h < S.hearts ? "♥" : "♡");
+    ctx.fillText(hearts, 16, 76);
+    // Chute (left)
+    ctx.fillStyle = "#151c3f"; ctx.fillRect(8, 240, 84, 300);
+    ctx.strokeStyle = "#ffd75e"; ctx.lineWidth = 3; ctx.strokeRect(8, 240, 84, 300);
+    ctx.fillStyle = "#ffd75e"; ctx.font = "bold 15px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("PRIZE", 50, 268);
+    ctx.fillText("CHUTE", 50, 288);
+    ctx.fillStyle = "#6cf0ff"; ctx.font = "20px system-ui";
+    ctx.fillText("▼", 50, 520);
+    // Rail
+    ctx.fillStyle = "#2b3572"; ctx.fillRect(0, 118, 480, 14);
+    ctx.fillStyle = "#6cf0ff"; ctx.fillRect(0, 118, 480, 3);
+    // Pit floor
+    ctx.fillStyle = "#151c3f"; ctx.fillRect(16, 748, 448, 36);
+    ctx.fillStyle = "#2b3572"; ctx.fillRect(16, 748, 448, 4);
+    // Prizes
+    for (var i = 0; i < prizes.length; i++) drawPrize(prizes[i], elapsed);
+    // Cable + claw
+    ctx.strokeStyle = "#7780b8"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.moveTo(clawX, L.RAIL_Y + 7); ctx.lineTo(clawX, clawY - 14); ctx.stroke();
+    var open = (phase === "grab") ? 0.4 : 1;
+    ctx.fillStyle = "#c7cdea";
+    ctx.beginPath(); ctx.arc(clawX, clawY - 8, 16, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "#ffd75e"; ctx.lineWidth = 5; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(clawX - 12, clawY - 4);
+    ctx.lineTo(clawX - 12 - 10 * open, clawY + 18); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(clawX + 12, clawY - 4);
+    ctx.lineTo(clawX + 12 + 10 * open, clawY + 18); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(clawX - 12 - 10 * open, clawY + 18);
+    ctx.lineTo(clawX - 6 - 4 * open, clawY + 26); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(clawX + 12 + 10 * open, clawY + 18);
+    ctx.lineTo(clawX + 6 + 4 * open, clawY + 26); ctx.stroke();
+    // Carried prize under the claw
+    if (carried) drawPrize({ x: clawX, y: clawY + 34, r: 20, type: carried.type, id: carried.id }, elapsed);
+    // Hint
+    if (S.screen === "playing" && phase === "idle") {
+      ctx.fillStyle = "#aab4e8"; ctx.font = "17px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("DRAG to slide • TAP to DROP", 280, 108);
+    }
+    for (var q = 0; q < particles.length; q++) {
+      ctx.fillStyle = "rgba(255,215,94," + (1 - particles[q].t / 0.6) + ")";
+      ctx.fillRect(particles[q].x - 3, particles[q].y - 3, 6, 6);
+    }
+    ctx.textAlign = "center";
+    for (var fl = 0; fl < floats.length; fl++) {
+      ctx.fillStyle = floats[fl].golden ? "#ffd75e" : "#e8ecff";
+      ctx.font = "bold 26px system-ui";
+      ctx.fillText(floats[fl].text, floats[fl].x, floats[fl].y);
+    }
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 52px system-ui";
+      ctx.fillText("NEON", 240, 300);
+      ctx.fillStyle = "#ff8cd1";
+      ctx.fillText("CLAW", 240, 360);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "22px system-ui";
+      ctx.fillText("Drag to slide the claw,", 240, 420);
+      ctx.fillText("tap to DROP and grab prizes!", 240, 452);
+      ctx.fillText("Chain 4 grabs for combo up to x5.", 240, 484);
+      ctx.fillText("Golden prizes pay 5x. Bombs cost", 240, 516);
+      ctx.fillText("a heart. 60 seconds!", 240, 548);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 24px system-ui";
+      ctx.fillText("TAP TO PLAY", 240, 620);
+      ctx.fillStyle = "#aab4e8"; ctx.font = "16px system-ui";
+      ctx.fillText("Best: " + S.best, 240, 660);
+    }
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.fillStyle = "#ff8cd1"; ctx.font = "bold 44px system-ui";
+      ctx.fillText("TIME!", 240, 320);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 34px system-ui";
+      ctx.fillText("Score: " + S.score, 240, 380);
+      ctx.font = "22px system-ui";
+      ctx.fillText("Grabs: " + S.grabs + "  Scored: " + S.scored, 240, 424);
+      ctx.fillText("Best: " + S.best, 240, 456);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 24px system-ui";
+      ctx.fillText("TAP TO PLAY AGAIN", 240, 520);
+    }
+    ctx.restore();
+  }
+  window.__clawState = S;
+  window.__clawDebug = { get clawX() { return clawX; }, get phase() { return phase; },
+    get prizes() { return prizes; }, get carried() { return carried; } };
+  if (auto) start();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
