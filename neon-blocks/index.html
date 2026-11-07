@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Blocks — Day 43</title>
+<meta name="description" content="Neon Blocks — 60 seconds of falling-block puzzle chaos. Drag to slide, tap to rotate, swipe down to slam pieces into the well — clear lines to chain your combo to x5, golden pieces pay 5x, and 10 lines earns a +500 LINE RUSH.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Blocks — Day 43. A neon falling-block puzzle: tetrominoes drop into a
+   10x20 well. Drag sideways to slide, tap to rotate, swipe down (or Down
+   key) to slam a piece home. Clearing lines pays 100/300/500/800 x combo;
+   combo climbs x1->x5 every 4 lines cleared; every 6th piece is GOLDEN and
+   any line it touches pays 5x; 10 total lines earns a +500 LINE RUSH bonus.
+   Speed ramps as the 60 seconds run down. Stack to the top and it's over. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var BlocksLogic = (function () {
+  var W = 480, H = 800, COLS = 10, ROWS = 20, CELL = 30;
+  var WELL_X = 90, WELL_Y = 140;
+  var LINE_BASE = [0, 100, 300, 500, 800];
+  var SHAPES = [
+    { name: "I", size: 4, color: 0, cells: [[0, 1], [1, 1], [2, 1], [3, 1]] },
+    { name: "O", size: 2, color: 1, cells: [[0, 0], [1, 0], [0, 1], [1, 1]] },
+    { name: "T", size: 3, color: 2, cells: [[1, 0], [0, 1], [1, 1], [2, 1]] },
+    { name: "S", size: 3, color: 3, cells: [[1, 0], [2, 0], [0, 1], [1, 1]] },
+    { name: "Z", size: 3, color: 4, cells: [[0, 0], [1, 0], [1, 1], [2, 1]] },
+    { name: "J", size: 3, color: 5, cells: [[0, 0], [0, 1], [1, 1], [2, 1]] },
+    { name: "L", size: 3, color: 6, cells: [[2, 0], [0, 1], [1, 1], [2, 1]] }
+  ];
+  var COLORS = ["#22d3ee", "#facc15", "#c084fc", "#4ade80", "#f87171", "#60a5fa", "#fb923c"];
+  function emptyGrid() {
+    var g = [];
+    for (var y = 0; y < ROWS; y++) { var row = []; for (var x = 0; x < COLS; x++) row.push(0); g.push(row); }
+    return g;
+  }
+  function collides(grid, cells, px, py) {
+    for (var i = 0; i < cells.length; i++) {
+      var cx = px + cells[i][0], cy = py + cells[i][1];
+      if (cx < 0 || cx >= COLS || cy >= ROWS) return true;
+      if (cy >= 0 && grid[cy][cx] !== 0) return true;
+    }
+    return false;
+  }
+  function rotateCells(cells, size) {
+    var out = [];
+    for (var i = 0; i < cells.length; i++) out.push([size - 1 - cells[i][1], cells[i][0]]);
+    return out;
+  }
+  function tryRotate(grid, piece) {
+    var rot = rotateCells(piece.cells, piece.size);
+    var kicks = [[0, 0], [-1, 0], [1, 0], [-2, 0], [2, 0], [0, -1]];
+    for (var k = 0; k < kicks.length; k++) {
+      var nx = piece.x + kicks[k][0], ny = piece.y + kicks[k][1];
+      if (!collides(grid, rot, nx, ny)) return { cells: rot, x: nx, y: ny };
+    }
+    return null;
+  }
+  function spawnPiece(rnd, count) {
+    rnd = rnd || Math.random;
+    var s = SHAPES[Math.floor(rnd() * SHAPES.length)];
+    var cells = [];
+    for (var i = 0; i < s.cells.length; i++) cells.push([s.cells[i][0], s.cells[i][1]]);
+    return { shape: s.name, size: s.size, color: s.color,
+      cells: cells, x: s.size === 4 ? 3 : 3, y: s.size === 4 ? -1 : 0,
+      gold: (count % 6 === 5) };
+  }
+  function lockPiece(grid, piece) {
+    var overflow = false;
+    var val = piece.color + 1 + (piece.gold ? 10 : 0);
+    for (var i = 0; i < piece.cells.length; i++) {
+      var cx = piece.x + piece.cells[i][0], cy = piece.y + piece.cells[i][1];
+      if (cy < 0) { overflow = true; continue; }
+      grid[cy][cx] = val;
+    }
+    return overflow;
+  }
+  function clearLines(grid) {
+    var cleared = 0, gold = false;
+    for (var y = ROWS - 1; y >= 0; y--) {
+      var full = true;
+      for (var x = 0; x < COLS; x++) { if (grid[y][x] === 0) { full = false; break; } }
+      if (full) {
+        for (var gx = 0; gx < COLS; gx++) { if (grid[y][gx] >= 10) gold = true; }
+        grid.splice(y, 1);
+        var row = []; for (var rx = 0; rx < COLS; rx++) row.push(0);
+        grid.unshift(row);
+        cleared++; y++;
+      }
+    }
+    return { cleared: cleared, gold: gold };
+  }
+  function comboForLines(totalLines) {
+    var c = 1 + Math.floor(totalLines / 4);
+    return c > 5 ? 5 : c;
+  }
+  function linePoints(n, combo, gold) {
+    if (n <= 0 || n > 4) return 0;
+    return LINE_BASE[n] * combo * (gold ? 5 : 1);
+  }
+  function dropInterval(elapsed) {
+    var ms = 650 - elapsed * 7;
+    return ms < 240 ? 240 : ms;
+  }
+  function ghostDrop(grid, piece) {
+    var y = piece.y;
+    while (!collides(grid, piece.cells, piece.x, y + 1)) y++;
+    return y;
+  }
+  function makeState() {
+    return { screen: "title", timeLeft: 60, score: 0, lines: 0, pieces: 0,
+      rotations: 0, best: 0, stackedOut: false, lineRush: false };
+  }
+  return { W: W, H: H, COLS: COLS, ROWS: ROWS, CELL: CELL, WELL_X: WELL_X,
+    WELL_Y: WELL_Y, LINE_BASE: LINE_BASE, SHAPES: SHAPES, COLORS: COLORS,
+    emptyGrid: emptyGrid, collides: collides, rotateCells: rotateCells,
+    tryRotate: tryRotate, spawnPiece: spawnPiece, lockPiece: lockPiece,
+    clearLines: clearLines, comboForLines: comboForLines,
+    linePoints: linePoints, dropInterval: dropInterval, ghostDrop: ghostDrop,
+    makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = BlocksLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_blocks_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_blocks_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, grid = L.emptyGrid(), cur = null, next = null;
+  var spawnCount = 0, dropAcc = 0, floats = [], particles = [];
+  var auto = (location.search.indexOf("auto=1") !== -1), autoT = 0, autoTarget = 3;
+  var downX = 0, downY = 0, downT = 0, dragging = false, lastCellX = 0, movedTotal = 0;
+
+  function newPiece() {
+    cur = next || L.spawnPiece(Math.random, spawnCount);
+    next = L.spawnPiece(Math.random, spawnCount + 1);
+    spawnCount++;
+    dropAcc = 0;
+    if (L.collides(grid, cur.cells, cur.x, cur.y)) {
+      S.stackedOut = true; S.timeLeft = 0; endGame();
+    }
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_blocks_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; grid = L.emptyGrid(); spawnCount = 0; dropAcc = 0;
+    floats = []; particles = []; autoT = 0; autoTarget = 3;
+    next = null; newPiece();
+    window.__blocksState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame() {
+    S.screen = "over";
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_blocks_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    window.__blocksState = S;
+  }
+  function doRotate() {
+    if (S.screen !== "playing" || !cur) return false;
+    var r = L.tryRotate(grid, cur);
+    if (r) { cur.cells = r.cells; cur.x = r.x; cur.y = r.y; S.rotations++; tone(440, 0.06, "square", 0.08); return true; }
+    return false;
+  }
+  function doMove(dx) {
+    if (S.screen !== "playing" || !cur) return false;
+    if (!L.collides(grid, cur.cells, cur.x + dx, cur.y)) { cur.x += dx; return true; }
+    return false;
+  }
+  function doStepDown() {
+    if (S.screen !== "playing" || !cur) return false;
+    if (!L.collides(grid, cur.cells, cur.x, cur.y + 1)) { cur.y++; dropAcc = 0; return true; }
+    return false;
+  }
+  function hardDrop() {
+    if (S.screen !== "playing" || !cur) return;
+    cur.y = L.ghostDrop(grid, cur);
+    lockCurrent();
+  }
+  function lockCurrent() {
+    var overflow = L.lockPiece(grid, cur);
+    S.pieces++;
+    var res = L.clearLines(grid);
+    if (res.cleared > 0) {
+      var before = S.lines;
+      S.lines += res.cleared;
+      var pts = L.linePoints(res.cleared, L.comboForLines(before), res.gold);
+      S.score += pts;
+      var wx = L.WELL_X + L.COLS * L.CELL / 2;
+      floats.push({ x: wx, y: L.WELL_Y + 120, text: "+" + pts + (res.gold ? " GOLD!" : "") + (res.cleared >= 4 ? " TETRIS!" : ""), t: 0, golden: res.gold || res.cleared >= 4 });
+      for (var i = 0; i < 14; i++) particles.push({ x: wx + (Math.random() - 0.5) * 200, y: L.WELL_Y + 160, vx: (Math.random() - 0.5) * 260, vy: -Math.random() * 220, t: 0 });
+      tone(660, 0.15, "triangle", 0.22, 990); buzz(30);
+      if (!S.lineRush && S.lines >= 10) {
+        S.lineRush = true; S.score += 500;
+        floats.push({ x: wx, y: L.WELL_Y + 200, text: "LINE RUSH +500!", t: 0, golden: true });
+        tone(880, 0.3, "triangle", 0.25, 1320);
+      }
+    } else {
+      tone(180, 0.05, "square", 0.06);
+    }
+    window.__blocksState = S;
+    if (overflow) { S.stackedOut = true; S.timeLeft = 0; endGame(); return; }
+    newPiece();
+  }
+  function toWorld(cx, cy) { return { x: (cx - ox) / scale, y: (cy - oy) / scale }; }
+  canvas.addEventListener("pointerdown", function (e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    var w = toWorld(e.clientX, e.clientY);
+    downX = w.x; downY = w.y; downT = performance.now(); dragging = true;
+    lastCellX = Math.floor((w.x - L.WELL_X) / L.CELL); movedTotal = 0;
+  });
+  canvas.addEventListener("pointermove", function (e) {
+    if (!dragging || S.screen !== "playing" || !cur) return;
+    var w = toWorld(e.clientX, e.clientY);
+    var cellX = Math.floor((w.x - L.WELL_X) / L.CELL);
+    if (cellX !== lastCellX) {
+      var dx = cellX > lastCellX ? 1 : -1;
+      if (doMove(dx)) { lastCellX = cellX; movedTotal += Math.abs(dx); }
+      else lastCellX = cellX;
+    }
+    var dy = w.y - downY;
+    if (dy > 70 && performance.now() - downT < 500) { dragging = false; hardDrop(); }
+  });
+  window.addEventListener("pointerup", function (e) {
+    if (!dragging) return;
+    dragging = false;
+    if (S.screen !== "playing") return;
+    var w = toWorld(e.clientX, e.clientY);
+    var moved = Math.abs(w.x - downX) + Math.abs(w.y - downY);
+    if (moved < 12 && performance.now() - downT < 400) doRotate();
+  });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_blocks_mute", muted ? "1" : "0"); } catch (err) {} }
+    if (S.screen === "title" || S.screen === "over") { if (e.key === " " || e.key === "Enter") { e.preventDefault(); start(); } return; }
+    if (e.key === "ArrowLeft") { e.preventDefault(); doMove(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); doMove(1); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); doStepDown(); }
+    else if (e.key === "ArrowUp" || e.key === " ") { e.preventDefault(); doRotate(); }
+  });
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (S.screen === "playing") {
+      elapsed += dt; S.timeLeft -= dt;
+      dropAcc += dt * 1000;
+      var interval = L.dropInterval(elapsed);
+      if (auto) interval = Math.min(interval, 260);
+      if (dropAcc >= interval) {
+        dropAcc = 0;
+        if (cur && !L.collides(grid, cur.cells, cur.x, cur.y + 1)) cur.y++;
+        else if (cur) lockCurrent();
+      }
+      if (auto && cur) {
+        autoT += dt;
+        if (autoT > 0.45) {
+          autoT = 0;
+          if (Math.random() < 0.25) doRotate();
+          if (cur.x < autoTarget) doMove(1);
+          else if (cur.x > autoTarget) doMove(-1);
+          else if (Math.random() < 0.6) hardDrop();
+          if (Math.random() < 0.2) autoTarget = Math.floor(Math.random() * 7);
+        }
+      }
+      if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(); }
+    }
+    for (var p = 0; p < particles.length; p++) { particles[p].t += dt; particles[p].x += particles[p].vx * dt; particles[p].y += particles[p].vy * dt; }
+    particles = particles.filter(function (pt) { return pt.t < 0.6; });
+    for (var f = 0; f < floats.length; f++) { floats[f].t += dt; floats[f].y -= 30 * dt; }
+    floats = floats.filter(function (fl) { return fl.t < 1.2; });
+    draw();
+    requestAnimationFrame(frame);
+  }
+  function cellColor(v) {
+    if (v >= 10) return "#ffd75e";
+    return L.COLORS[v - 1] || "#888";
+  }
+  function drawCell(px, py, v, ghost) {
+    var x = L.WELL_X + px * L.CELL, y = L.WELL_Y + py * L.CELL;
+    if (ghost) {
+      ctx.strokeStyle = "rgba(232,236,255,0.5)"; ctx.lineWidth = 2;
+      ctx.strokeRect(x + 2, y + 2, L.CELL - 4, L.CELL - 4);
+      return;
+    }
+    var g = ctx.createRadialGradient(x + 9, y + 8, 2, x + L.CELL / 2, y + L.CELL / 2, L.CELL * 0.75);
+    g.addColorStop(0, "#ffffff"); g.addColorStop(0.3, cellColor(v)); g.addColorStop(1, "#1a1440");
+    ctx.fillStyle = g;
+    ctx.fillRect(x + 1, y + 1, L.CELL - 2, L.CELL - 2);
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 1;
+    ctx.strokeRect(x + 1.5, y + 1.5, L.CELL - 3, L.CELL - 3);
+    if (v >= 10) {
+      ctx.fillStyle = "#7a4d00"; ctx.font = "bold 16px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("★", x + L.CELL / 2, y + L.CELL / 2 + 6);
+    }
+  }
+  function drawPiece(p, ghost) {
+    if (!p) return;
+    for (var i = 0; i < p.cells.length; i++) {
+      var px = p.x + p.cells[i][0], py = p.y + p.cells[i][1];
+      if (py < 0) continue;
+      if (ghost) drawCell(px, py, 0, true);
+      else drawCell(px, py, p.color + 1 + (p.gold ? 10 : 0), false);
+    }
+  }
+  function draw() {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.save();
+    ctx.translate(ox, oy); ctx.scale(scale, scale);
+    var bg = ctx.createLinearGradient(0, 0, 0, 800);
+    bg.addColorStop(0, "#0d1233"); bg.addColorStop(1, "#070512");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, 480, 800);
+    // HUD
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 28px system-ui"; ctx.textAlign = "left";
+    ctx.fillText("SCORE " + S.score, 16, 40);
+    ctx.textAlign = "center";
+    var combo = L.comboForLines(S.lines);
+    ctx.fillStyle = combo > 1 ? "#ffd75e" : "#aab4e8";
+    ctx.fillText("x" + combo, 240, 40);
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "right";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", 464, 40);
+    ctx.fillStyle = "#7780b8"; ctx.font = "16px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("LINES " + S.lines + "  •  BEST " + S.best, 240, 68);
+    // Well frame
+    ctx.fillStyle = "#0a0e24";
+    ctx.fillRect(L.WELL_X - 4, L.WELL_Y - 4, L.COLS * L.CELL + 8, L.ROWS * L.CELL + 8);
+    ctx.strokeStyle = "#2b3572"; ctx.lineWidth = 2;
+    ctx.strokeRect(L.WELL_X - 4, L.WELL_Y - 4, L.COLS * L.CELL + 8, L.ROWS * L.CELL + 8);
+    ctx.strokeStyle = "rgba(43,53,114,0.5)"; ctx.lineWidth = 1;
+    for (var gx = 1; gx < L.COLS; gx++) {
+      ctx.beginPath(); ctx.moveTo(L.WELL_X + gx * L.CELL, L.WELL_Y); ctx.lineTo(L.WELL_X + gx * L.CELL, L.WELL_Y + L.ROWS * L.CELL); ctx.stroke();
+    }
+    for (var gy = 1; gy < L.ROWS; gy++) {
+      ctx.beginPath(); ctx.moveTo(L.WELL_X, L.WELL_Y + gy * L.CELL); ctx.lineTo(L.WELL_X + L.COLS * L.CELL, L.WELL_Y + gy * L.CELL); ctx.stroke();
+    }
+    // Locked cells
+    for (var y = 0; y < L.ROWS; y++)
+      for (var x = 0; x < L.COLS; x++)
+        if (grid[y][x] !== 0) drawCell(x, y, grid[y][x], false);
+    // Ghost + current piece
+    if (S.screen === "playing" && cur) {
+      var gy2 = L.ghostDrop(grid, cur);
+      if (gy2 !== cur.y) drawPiece({ cells: cur.cells, x: cur.x, y: gy2, color: cur.color, gold: cur.gold }, true);
+      drawPiece(cur, false);
+    }
+    // Next preview (right of well)
+    ctx.fillStyle = "#151c3f"; ctx.fillRect(396, 150, 76, 92);
+    ctx.strokeStyle = "#2b3572"; ctx.lineWidth = 2; ctx.strokeRect(396, 150, 76, 92);
+    ctx.fillStyle = "#aab4e8"; ctx.font = "bold 13px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("NEXT", 434, 168);
+    if (next) {
+      var nc = 13;
+      for (var ni = 0; ni < next.cells.length; ni++) {
+        var nx = 396 + 38 + (next.cells[ni][0] - next.size / 2) * nc + nc / 2 - 6;
+        var ny = 184 + next.cells[ni][1] * nc;
+        var ng = ctx.createRadialGradient(nx + 3, ny + 3, 1, nx + nc / 2, ny + nc / 2, nc);
+        var col = next.gold ? "#ffd75e" : L.COLORS[next.color];
+        ng.addColorStop(0, "#ffffff"); ng.addColorStop(0.35, col); ng.addColorStop(1, "#1a1440");
+        ctx.fillStyle = ng; ctx.fillRect(nx, ny, nc - 1, nc - 1);
+      }
+    }
+    // Speed meter (left of well)
+    ctx.fillStyle = "#aab4e8"; ctx.font = "bold 13px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("SPEED", 46, 168);
+    var spd = 1 - (L.dropInterval(elapsed) - 240) / (650 - 240);
+    ctx.fillStyle = "#151c3f"; ctx.fillRect(30, 178, 32, 120);
+    ctx.fillStyle = spd > 0.66 ? "#ff4d6d" : "#6cf0ff";
+    ctx.fillRect(30, 178 + 120 * (1 - spd), 32, 120 * spd);
+    ctx.strokeStyle = "#2b3572"; ctx.lineWidth = 2; ctx.strokeRect(30, 178, 32, 120);
+    // Hint
+    if (S.screen === "playing") {
+      ctx.fillStyle = "#aab4e8"; ctx.font = "17px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("DRAG to slide • TAP to rotate • SWIPE ↓ to slam", 240, 776);
+    }
+    for (var q = 0; q < particles.length; q++) {
+      ctx.fillStyle = "rgba(255,215,94," + (1 - particles[q].t / 0.6) + ")";
+      ctx.fillRect(particles[q].x - 3, particles[q].y - 3, 6, 6);
+    }
+    ctx.textAlign = "center";
+    for (var fl = 0; fl < floats.length; fl++) {
+      ctx.fillStyle = floats[fl].golden ? "#ffd75e" : "#e8ecff";
+      ctx.font = "bold 26px system-ui";
+      ctx.fillText(floats[fl].text, floats[fl].x, floats[fl].y);
+    }
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 52px system-ui";
+      ctx.fillText("NEON", 240, 300);
+      ctx.fillStyle = "#ff8cd1";
+      ctx.fillText("BLOCKS", 240, 360);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "22px system-ui";
+      ctx.fillText("Drag to slide, tap to rotate,", 240, 420);
+      ctx.fillText("swipe down to slam pieces home.", 240, 452);
+      ctx.fillText("Clear lines to raise your combo", 240, 484);
+      ctx.fillText("to x5. Golden pieces pay 5x.", 240, 516);
+      ctx.fillText("10 lines = LINE RUSH +500!", 240, 548);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 24px system-ui";
+      ctx.fillText("TAP TO PLAY", 240, 620);
+      ctx.fillStyle = "#aab4e8"; ctx.font = "16px system-ui";
+      ctx.fillText("Best: " + S.best, 240, 660);
+    }
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.fillStyle = "#ff8cd1"; ctx.font = "bold 44px system-ui";
+      ctx.fillText(S.stackedOut ? "STACKED OUT!" : "TIME!", 240, 320);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 34px system-ui";
+      ctx.fillText("Score: " + S.score, 240, 380);
+      ctx.font = "22px system-ui";
+      ctx.fillText("Lines: " + S.lines + "  Pieces: " + S.pieces, 240, 424);
+      ctx.fillText("Best: " + S.best, 240, 456);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 24px system-ui";
+      ctx.fillText("TAP TO PLAY AGAIN", 240, 520);
+    }
+    ctx.restore();
+  }
+  window.__blocksState = S;
+  window.__blocksDebug = { get rotations() { return S.rotations; },
+    get grid() { return grid; }, get cur() { return cur; },
+    get pieces() { return S.pieces; }, get lines() { return S.lines; } };
+  if (auto) start();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
