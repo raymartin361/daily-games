@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Flappy — Day 45</title>
+<meta name="description" content="Neon Flappy — 60 seconds of neon flappy chaos. Tap to flap through the glowing pipe gates — clear a gate for 100 x combo, chain 8 clears to raise your combo to x5, golden gates pay 5x, stars in the gaps pay 50. 3 hearts, 60 seconds.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Flappy — Day 45. A neon flappy game: tap (or Space) to flap the bird
+   through glowing pipe gates. Clearing a gate pays 100 x combo, combo climbs
+   x1->x5 every 8 chained clears; every 6th gate is GOLDEN (5x). Stars float
+   in the gaps for +50 x combo. Hitting a pipe or the floor costs a heart
+   (3 hearts); the bird resets to mid-air with brief invulnerability.
+   Flawless (no hearts lost) pays +500. Speed and gap difficulty ramp over
+   the 60 seconds. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var FlappyLogic = (function () {
+  var W = 480, H = 800, BIRD_X = 120, BIRD_R = 15;
+  var GRAV = 2200, FLAP_V = -640, MAX_FALL = 1200;
+  var PIPE_W = 64, PIPE_SPACING = 290, FLOOR_Y = 800;
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 8);
+    return c > 5 ? 5 : c;
+  }
+  function pipePoints(combo, gold) { return 100 * combo * (gold ? 5 : 1); }
+  function starPoints(combo) { return 50 * combo; }
+  function speedAt(elapsed) {
+    var s = 180 + elapsed * 2;
+    return s > 300 ? 300 : s;
+  }
+  function gapAt(elapsed) {
+    var g = 210 - elapsed * 0.8;
+    return g < 160 ? 160 : g;
+  }
+  function makeBird() {
+    return { x: BIRD_X, y: 400, vy: 0, inv: 0, flaps: 0 };
+  }
+  function flapBird(b) {
+    b.vy = FLAP_V; b.flaps++;
+    return true;
+  }
+  function stepBird(b, dt) {
+    b.vy += GRAV * dt;
+    if (b.vy > MAX_FALL) b.vy = MAX_FALL;
+    b.y += b.vy * dt;
+    if (b.y - BIRD_R < 0) { b.y = BIRD_R; if (b.vy < 0) b.vy = 0; }
+    if (b.y + BIRD_R >= FLOOR_Y) return "floor";
+    return "air";
+  }
+  function circleRect(cx, cy, r, rx, ry, rw, rh) {
+    var nx = Math.max(rx, Math.min(cx, rx + rw));
+    var ny = Math.max(ry, Math.min(cy, ry + rh));
+    var dx = cx - nx, dy = cy - ny;
+    return dx * dx + dy * dy < r * r;
+  }
+  function hitPipe(b, p) {
+    var gapTop = p.gapY - p.gap / 2, gapBot = p.gapY + p.gap / 2;
+    if (circleRect(b.x, b.y, BIRD_R, p.x, -40, PIPE_W, gapTop + 40)) return true;
+    if (circleRect(b.x, b.y, BIRD_R, p.x, gapBot, PIPE_W, H - gapBot + 40)) return true;
+    return false;
+  }
+  function pipePassed(b, p) {
+    return !p.scored && p.x + PIPE_W < b.x;
+  }
+  function makePipe(rnd, x, elapsed) {
+    var gap = gapAt(elapsed);
+    var gapY = 160 + gap / 2 + rnd() * (H - 320 - gap);
+    return { x: x, gapY: gapY, gap: gap, gold: false, scored: false };
+  }
+  function collectStars(b, stars) {
+    var got = [];
+    var rr = (BIRD_R + 13) * (BIRD_R + 13);
+    for (var i = 0; i < stars.length; i++) {
+      var s = stars[i];
+      if (s.taken) continue;
+      var dx = s.x - b.x, dy = s.y - b.y;
+      if (dx * dx + dy * dy < rr) { s.taken = true; got.push(s); }
+    }
+    return got;
+  }
+  function makeState() {
+    return { screen: "title", timeLeft: 60, score: 0, gates: 0, stars: 0,
+      streak: 0, hearts: 3, best: 0, flawless: false, flaps: 0, hits: 0 };
+  }
+  return { W: W, H: H, BIRD_X: BIRD_X, BIRD_R: BIRD_R, GRAV: GRAV,
+    FLAP_V: FLAP_V, MAX_FALL: MAX_FALL, PIPE_W: PIPE_W,
+    PIPE_SPACING: PIPE_SPACING, FLOOR_Y: FLOOR_Y,
+    comboForStreak: comboForStreak, pipePoints: pipePoints,
+    starPoints: starPoints, speedAt: speedAt, gapAt: gapAt,
+    makeBird: makeBird, flapBird: flapBird, stepBird: stepBird,
+    hitPipe: hitPipe, pipePassed: pipePassed, makePipe: makePipe,
+    collectStars: collectStars, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = FlappyLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_flappy_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_flappy_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, bird = L.makeBird();
+  var pipes = [], stars = [], pipeSeq = 0, lastPipeX = 0;
+  var floats = [], particles = [], trail = [];
+  var auto = (location.search.indexOf("auto=1") !== -1), autoT = 0;
+
+  function spawnPipe(x) {
+    var p = L.makePipe(Math.random, x, elapsed);
+    p.gold = (pipeSeq % 6 === 5);
+    pipeSeq++;
+    pipes.push(p);
+    stars.push({ x: x + L.PIPE_W / 2, y: p.gapY, taken: false });
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_flappy_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; bird = L.makeBird();
+    pipes = []; stars = []; pipeSeq = 0;
+    floats = []; particles = []; trail = []; autoT = 0;
+    spawnPipe(520); lastPipeX = 520;
+    window.__flappyState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame() {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.hearts === 3) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_flappy_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    window.__flappyState = S;
+  }
+  function doFlap() {
+    if (S.screen !== "playing") return 0;
+    L.flapBird(bird);
+    S.flaps++;
+    tone(520, 0.08, "square", 0.1, 780);
+    for (var i = 0; i < 4; i++)
+      particles.push({ x: bird.x - 10, y: bird.y + 8, vx: -40 - Math.random() * 60, vy: 40 + Math.random() * 60, t: 0, gold: false });
+    return 1;
+  }
+  function damage() {
+    if (bird.inv > 0 || S.screen !== "playing") return;
+    S.hearts--; S.hits++; S.streak = 0;
+    tone(140, 0.25, "sawtooth", 0.2, 70); buzz(70);
+    if (S.hearts <= 0) { endGame(); return; }
+    bird.y = 400; bird.vy = 0; bird.inv = 1.5;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  canvas.addEventListener("pointerdown", function (e) {
+    e.preventDefault();
+    if (S.screen === "title" || S.screen === "over") { start(); doFlap(); return; }
+    doFlap();
+  });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_flappy_mute", muted ? "1" : "0"); } catch (err) {} }
+    if (S.screen === "title" || S.screen === "over") { if (e.key === " " || e.key === "Enter") { e.preventDefault(); start(); doFlap(); } return; }
+    if (e.key === " " || e.key === "ArrowUp") { e.preventDefault(); doFlap(); }
+  });
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (S.screen === "playing") {
+      elapsed += dt; S.timeLeft -= dt;
+      var speed = L.speedAt(elapsed);
+      var res = L.stepBird(bird, dt);
+      if (bird.inv > 0) bird.inv -= dt;
+      for (var pi = 0; pi < pipes.length; pi++) pipes[pi].x -= speed * dt;
+      for (var si = 0; si < stars.length; si++) stars[si].x -= speed * dt;
+      if (pipes.length === 0 || pipes[pipes.length - 1].x < 520 - L.PIPE_SPACING) {
+        spawnPipe(520);
+      }
+      var cut = -120;
+      pipes = pipes.filter(function (p) { return p.x + L.PIPE_W > cut; });
+      stars = stars.filter(function (s) { return !s.taken && s.x > cut; });
+      for (var pj = 0; pj < pipes.length; pj++) {
+        var p = pipes[pj];
+        if (L.pipePassed(bird, p)) {
+          p.scored = true;
+          var combo = L.comboForStreak(S.streak);
+          var pts = L.pipePoints(combo, p.gold);
+          S.score += pts; S.gates++; S.streak++;
+          addFloat(bird.x + 60, bird.y - 30, "+" + pts + (p.gold ? " GOLD GATE!" : ""), p.gold);
+          tone(p.gold ? 1320 : 880, 0.12, "triangle", 0.18, p.gold ? 1760 : 1100);
+          buzz(12);
+        }
+      }
+      var got = L.collectStars(bird, stars);
+      for (var gi = 0; gi < got.length; gi++) {
+        var combo2 = L.comboForStreak(S.streak);
+        var pts2 = L.starPoints(combo2);
+        S.score += pts2; S.stars++; S.streak++;
+        addFloat(got[gi].x, got[gi].y - 20, "+" + pts2, false);
+        tone(1100, 0.09, "triangle", 0.15, 1500);
+      }
+      if (bird.inv <= 0) {
+        var hit = false;
+        for (var hi = 0; hi < pipes.length; hi++) {
+          if (L.hitPipe(bird, pipes[hi])) { hit = true; break; }
+        }
+        if (hit) damage();
+        else if (res === "floor") damage();
+      } else if (res === "floor") {
+        bird.y = L.FLOOR_Y - L.BIRD_R; bird.vy = 0;
+      }
+      if (auto) {
+        autoT += dt;
+        if (autoT > 0.1) {
+          autoT = 0;
+          var target = null;
+          for (var ai = 0; ai < pipes.length; ai++) {
+            if (pipes[ai].x + L.PIPE_W > bird.x - 20) { target = pipes[ai]; break; }
+          }
+          if (target && bird.y > target.gapY + 6) doFlap();
+          else if (!target && bird.y > 420) doFlap();
+        }
+      }
+      trail.push({ x: bird.x, y: bird.y, t: 0 });
+      if (trail.length > 12) trail.shift();
+      if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(); }
+    }
+    for (var p2 = 0; p2 < particles.length; p2++) { particles[p2].t += dt; particles[p2].x += particles[p2].vx * dt; particles[p2].y += particles[p2].vy * dt; particles[p2].vy += 500 * dt; }
+    particles = particles.filter(function (pt) { return pt.t < 0.6; });
+    for (var t2 = 0; t2 < trail.length; t2++) trail[t2].t += dt;
+    trail = trail.filter(function (tr) { return tr.t < 0.25; });
+    for (var f = 0; f < floats.length; f++) { floats[f].t += dt; floats[f].y -= 30 * dt; }
+    floats = floats.filter(function (fl) { return fl.t < 1.2; });
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+
+  function draw(now) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.save();
+    ctx.translate(ox, oy); ctx.scale(scale, scale);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, 480, 800); ctx.clip();
+    var bg = ctx.createLinearGradient(0, 0, 0, 800);
+    bg.addColorStop(0, "#0d1233"); bg.addColorStop(0.6, "#1a0f38"); bg.addColorStop(1, "#070512");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, 480, 800);
+    // Parallax stars
+    ctx.fillStyle = "rgba(255,255,255,0.7)";
+    for (var si = 0; si < 40; si++) {
+      var sx = ((si * 127 + 37) % 480 + 480) % 480;
+      var sy = ((si * 53) % 760) + 20;
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+    // Parallax skyline
+    for (var bi = 0; bi < 8; bi++) {
+      var bw = 70;
+      var bx = ((bi * 90) % 720 + 720) % 720 - 120;
+      var bh = 90 + ((bi * 37) % 140);
+      ctx.fillStyle = "#120d2e";
+      ctx.fillRect(bx, 800 - bh, bw, bh);
+      ctx.fillStyle = "rgba(108,240,255,0.25)";
+      for (var wi = 0; wi < 3; wi++) ctx.fillRect(bx + 12 + wi * 20, 800 - bh + 18 + ((bi + wi) % 3) * 30, 8, 10);
+    }
+    // Pipes
+    for (var pi = 0; pi < pipes.length; pi++) {
+      var p = pipes[pi];
+      var gapTop = p.gapY - p.gap / 2, gapBot = p.gapY + p.gap / 2;
+      var col = p.gold ? "#ffd75e" : "#ff4dd2";
+      var colDark = p.gold ? "#7a5c00" : "#5c0a4e";
+      ctx.fillStyle = colDark;
+      ctx.fillRect(p.x, -40, L.PIPE_W, gapTop + 40);
+      ctx.fillRect(p.x, gapBot, L.PIPE_W, 800 - gapBot + 40);
+      ctx.fillStyle = col;
+      ctx.fillRect(p.x + 4, -40, L.PIPE_W - 8, gapTop + 40);
+      ctx.fillRect(p.x + 4, gapBot, L.PIPE_W - 8, 800 - gapBot + 40);
+      ctx.fillStyle = p.gold ? "#fff7cc" : "#ff9de2";
+      ctx.fillRect(p.x, gapTop - 18, L.PIPE_W, 18);
+      ctx.fillRect(p.x, gapBot, L.PIPE_W, 18);
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.fillRect(p.x + 10, -40, 6, gapTop + 40);
+      ctx.fillRect(p.x + 10, gapBot, 6, 800 - gapBot + 40);
+    }
+    // Stars in gaps
+    for (var sti = 0; sti < stars.length; sti++) {
+      var st = stars[sti];
+      if (st.taken) continue;
+      var pulse = 1 + 0.15 * Math.sin(now / 150 + st.x);
+      var sg = ctx.createRadialGradient(st.x - 3, st.y - 4, 1, st.x, st.y, 14 * pulse);
+      sg.addColorStop(0, "#ffffff");
+      sg.addColorStop(0.35, "#ffd75e");
+      sg.addColorStop(1, "#7a4d00");
+      ctx.fillStyle = sg;
+      ctx.beginPath(); ctx.arc(st.x, st.y, 12 * pulse, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#fff7cc";
+      ctx.font = "bold 12px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("★", st.x, st.y + 4);
+    }
+    // Trail
+    for (var tri = 0; tri < trail.length; tri++) {
+      var tr = trail[tri];
+      ctx.fillStyle = "rgba(108,240,255," + (0.3 * (1 - tr.t / 0.25)) + ")";
+      ctx.beginPath(); ctx.arc(tr.x, tr.y, 9, 0, Math.PI * 2); ctx.fill();
+    }
+    // Bird (hidden on the title screen so it never overlaps the instructions)
+    if (S.screen !== "over" && S.screen !== "title") {
+      var tilt = bird.vy > 0 ? Math.min(0.5, bird.vy / 2400) : Math.max(-0.4, bird.vy / 2400);
+      ctx.save();
+      ctx.translate(bird.x, bird.y);
+      ctx.rotate(tilt);
+      if (bird.inv > 0 && Math.floor(now / 90) % 2 === 0) ctx.globalAlpha = 0.4;
+      var wingY = Math.sin(now / 90) * 6;
+      ctx.fillStyle = "#ff8cd1";
+      ctx.beginPath(); ctx.ellipse(-8, wingY, 12, 6, -0.5, 0, Math.PI * 2); ctx.fill();
+      var bg2 = ctx.createRadialGradient(-5, -6, 2, 0, 0, 19);
+      bg2.addColorStop(0, "#ffffff"); bg2.addColorStop(0.35, "#6cf0ff"); bg2.addColorStop(1, "#0a4d6e");
+      ctx.fillStyle = bg2;
+      ctx.beginPath(); ctx.arc(0, 0, L.BIRD_R, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#ffb020";
+      ctx.beginPath(); ctx.moveTo(12, -2); ctx.lineTo(24, 2); ctx.lineTo(12, 6); ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath(); ctx.arc(5, -5, 4.5, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#0b1026";
+      ctx.beginPath(); ctx.arc(6.5, -5, 2.2, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.restore();
+    }
+    // Particles
+    for (var qi = 0; qi < particles.length; qi++) {
+      ctx.fillStyle = particles[qi].gold ? "rgba(255,215,94," + (1 - particles[qi].t / 0.6) + ")"
+        : "rgba(108,240,255," + (1 - particles[qi].t / 0.6) + ")";
+      ctx.fillRect(particles[qi].x - 3, particles[qi].y - 3, 6, 6);
+    }
+    // Floats (world coords)
+    ctx.textAlign = "center";
+    for (var fi = 0; fi < floats.length; fi++) {
+      ctx.fillStyle = floats[fi].golden ? "#ffd75e" : "#e8ecff";
+      ctx.font = "bold 22px system-ui";
+      ctx.fillText(floats[fi].text, floats[fi].x, floats[fi].y);
+    }
+    ctx.restore(); // clip
+    // HUD (screen coords)
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 28px system-ui"; ctx.textAlign = "left";
+    ctx.fillText("SCORE " + S.score, 16, 40);
+    ctx.textAlign = "center";
+    var combo = L.comboForStreak(S.streak);
+    ctx.fillStyle = combo > 1 ? "#ffd75e" : "#aab4e8";
+    ctx.fillText("x" + combo, 240, 40);
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "right";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", 464, 40);
+    ctx.fillStyle = "#7780b8"; ctx.font = "16px system-ui"; ctx.textAlign = "center";
+    ctx.fillText("GATES " + S.gates + "  •  BEST " + S.best, 240, 68);
+    ctx.textAlign = "right";
+    for (var hi = 0; hi < 3; hi++) {
+      ctx.fillStyle = hi < S.hearts ? "#ff4d6d" : "#33395e";
+      ctx.font = "22px system-ui";
+      ctx.fillText("♥", 464 - (2 - hi) * 28, 96);
+    }
+    if (S.screen === "playing") {
+      ctx.fillStyle = "#aab4e8"; ctx.font = "17px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("TAP to flap — thread the gates!", 240, 776);
+    }
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 52px system-ui"; ctx.textAlign = "center";
+      ctx.fillText("NEON", 240, 300);
+      ctx.fillStyle = "#ff8cd1";
+      ctx.fillText("FLAPPY", 240, 360);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "22px system-ui";
+      ctx.fillText("Tap to flap through the glowing", 240, 420);
+      ctx.fillText("pipe gates. Clear a gate for", 240, 452);
+      ctx.fillText("100 x combo — chain 8 clears", 240, 484);
+      ctx.fillText("to raise your combo to x5.", 240, 516);
+      ctx.fillText("Golden gates pay 5x. 3 hearts.", 240, 548);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 24px system-ui";
+      ctx.fillText("TAP TO PLAY", 240, 620);
+      ctx.fillStyle = "#aab4e8"; ctx.font = "16px system-ui";
+      ctx.fillText("Best: " + S.best, 240, 660);
+    }
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.fillStyle = "#ff8cd1"; ctx.font = "bold 44px system-ui"; ctx.textAlign = "center";
+      ctx.fillText(S.hearts <= 0 ? "CLIPPED!" : "TIME!", 240, 320);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 34px system-ui";
+      ctx.fillText("Score: " + S.score, 240, 380);
+      ctx.font = "22px system-ui";
+      ctx.fillText("Gates: " + S.gates + "  Stars: " + S.stars, 240, 424);
+      ctx.fillText("Best: " + S.best + (S.flawless ? "  •  FLAWLESS +500!" : ""), 240, 456);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 24px system-ui";
+      ctx.fillText("TAP TO PLAY AGAIN", 240, 520);
+    }
+    ctx.restore();
+  }
+  window.__flappyState = S;
+  window.__flappyDebug = {
+    get gates() { return S.gates; },
+    get score() { return S.score; },
+    get flaps() { return S.flaps; },
+    get hearts() { return S.hearts; },
+    get screen() { return S.screen; },
+    get birdY() { return Math.round(bird.y); },
+    get stars() { return S.stars; }
+  };
+  reset();
+  if (auto) start();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
