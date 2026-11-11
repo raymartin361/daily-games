@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Penalty — Day 47</title>
+<meta name="description" content="Neon Penalty — 60 seconds of neon penalty-shootout chaos. Drag to aim, release to shoot — corners beat the keeper, but the longer you hold your aim the more he reads you. Golden balls pay 5x.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Penalty — Day 47. A neon penalty shootout: drag anywhere to aim the
+   reticle, release to shoot. The longer you hold your aim the steadier it
+   gets (wobble shrinks 26 -> 4px) — but the keeper reads you and drifts
+   toward your aim point the longer you hold, so snap shots at the corners
+   beat him while patient shots get saved. Goal = 100 x combo, combo climbs
+   x1->x5 every 4 consecutive goals; every 6th ball is GOLDEN (5x). Posts,
+   saves and misses reset the combo. Flawless (no save/miss/post) pays +500.
+   60 seconds. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var PenaltyLogic = (function () {
+  var W = 480, H = 800;
+  var GOAL = { x0: 60, x1: 420, y0: 110, y1: 250 };
+  var KEEPER_HOME = { x: 240, y: 232 };
+  var BALL_SPOT = { x: 240, y: 700 };
+  var FLIGHT_T = 0.35, RESET_T = 0.8;
+  var WOBBLE_MAX = 26, WOBBLE_MIN = 4, WOBBLE_TIME = 1.2;
+  var READ_SPEED = 55, READ_CAP = 120;
+  var REACTION = 0.12, DIVE_SPEED = 520;
+  var SAVE_R = 34, POST_R = 12;
+  var AIM = { x0: 30, x1: 450, y0: 80, y1: 280 };
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function goalPoints(combo, gold) { return 100 * combo * (gold ? 5 : 1); }
+  function wobbleForHold(holdT) {
+    if (holdT <= 0) return WOBBLE_MAX;
+    var w = WOBBLE_MAX - (WOBBLE_MAX - WOBBLE_MIN) * (holdT / WOBBLE_TIME);
+    return w < WOBBLE_MIN ? WOBBLE_MIN : w;
+  }
+  function applyWobble(x, y, r, rng) {
+    rng = rng || Math.random;
+    var a = rng() * Math.PI * 2, d = rng() * r;
+    return { x: x + Math.cos(a) * d, y: y + Math.sin(a) * d };
+  }
+  function clampReticle(x, y) {
+    return {
+      x: Math.max(AIM.x0, Math.min(AIM.x1, x)),
+      y: Math.max(AIM.y0, Math.min(AIM.y1, y))
+    };
+  }
+  function keeperDrift(kx, targetX, dt) {
+    var dir = targetX > kx ? 1 : (targetX < kx ? -1 : 0);
+    var nx = kx + dir * READ_SPEED * dt;
+    if (dir > 0 && nx > targetX) nx = targetX;
+    if (dir < 0 && nx < targetX) nx = targetX;
+    var lo = KEEPER_HOME.x - READ_CAP, hi = KEEPER_HOME.x + READ_CAP;
+    if (nx < lo) nx = lo;
+    if (nx > hi) nx = hi;
+    return nx;
+  }
+  function keeperDivePos(sx, sy, tx, ty, t, speed, reaction) {
+    speed = speed === undefined ? DIVE_SPEED : speed;
+    reaction = reaction === undefined ? REACTION : reaction;
+    if (t <= reaction) return { x: sx, y: sy };
+    var dx = tx - sx, dy = ty - sy;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    var travel = speed * (t - reaction);
+    if (travel >= dist) return { x: tx, y: ty };
+    return { x: sx + dx / dist * travel, y: sy + dy / dist * travel };
+  }
+  function isPost(t) {
+    var inY = t.y >= GOAL.y0 - POST_R && t.y <= GOAL.y1 + POST_R;
+    var inX = t.x >= GOAL.x0 - POST_R && t.x <= GOAL.x1 + POST_R;
+    if (!inX || !inY) return false;
+    if (Math.abs(t.x - GOAL.x0) <= POST_R) return true;
+    if (Math.abs(t.x - GOAL.x1) <= POST_R) return true;
+    if (Math.abs(t.y - GOAL.y0) <= POST_R) return true;
+    return false;
+  }
+  function resolveShot(t, glove) {
+    if (t.x < GOAL.x0 || t.x > GOAL.x1 || t.y < GOAL.y0 || t.y > GOAL.y1) return "miss";
+    if (isPost(t)) return "post";
+    var dx = glove.x - t.x, dy = glove.y - t.y;
+    if (dx * dx + dy * dy < SAVE_R * SAVE_R) return "save";
+    return "goal";
+  }
+  function nextShotGold(shotSeq) { return shotSeq % 6 === 5; }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, timeLeft: 60,
+      streak: 0, shots: 0, goals: 0, saves: 0, misses: 0, posts: 0, flawless: false };
+  }
+  return {
+    W: W, H: H, GOAL: GOAL, KEEPER_HOME: KEEPER_HOME, BALL_SPOT: BALL_SPOT,
+    FLIGHT_T: FLIGHT_T, RESET_T: RESET_T, WOBBLE_MAX: WOBBLE_MAX,
+    WOBBLE_MIN: WOBBLE_MIN, WOBBLE_TIME: WOBBLE_TIME, READ_SPEED: READ_SPEED,
+    READ_CAP: READ_CAP, REACTION: REACTION, DIVE_SPEED: DIVE_SPEED,
+    SAVE_R: SAVE_R, POST_R: POST_R, AIM: AIM,
+    comboForStreak: comboForStreak, goalPoints: goalPoints,
+    wobbleForHold: wobbleForHold, applyWobble: applyWobble,
+    clampReticle: clampReticle, keeperDrift: keeperDrift,
+    keeperDivePos: keeperDivePos, isPost: isPost, resolveShot: resolveShot,
+    nextShotGold: nextShotGold, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = PenaltyLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_penalty_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_penalty_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, shotSeq = 0, phase = "ready";
+  var phaseT = 0, flightT = 0, resetT = 0;
+  var aiming = false, aimHoldT = 0, aimStart = 0;
+  var reticle = { x: 240, y: 180 };
+  var ball = { x: L.BALL_SPOT.x, y: L.BALL_SPOT.y, flying: false };
+  var keeper = { x: L.KEEPER_HOME.x, y: L.KEEPER_HOME.y, px: L.KEEPER_HOME.x, py: L.KEEPER_HOME.y, diving: false, diveT: 0 };
+  var shot = null; // {target, gold, result}
+  var particles = [], floats = [];
+  var auto = (location.search.indexOf("auto=1") !== -1), autoT = 0, autoAimT = -1;
+
+  function curGold() { return L.nextShotGold(shotSeq); }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_penalty_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; shotSeq = 0; phase = "ready"; phaseT = 0;
+    aiming = false; aimHoldT = 0; reticle = { x: 240, y: 180 };
+    ball = { x: L.BALL_SPOT.x, y: L.BALL_SPOT.y, flying: false };
+    keeper = { x: L.KEEPER_HOME.x, y: L.KEEPER_HOME.y, px: L.KEEPER_HOME.x, py: L.KEEPER_HOME.y, diving: false, diveT: 0 };
+    shot = null; particles = []; floats = []; autoT = 0; autoAimT = -1;
+    window.__penaltyState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame() {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.shots > 0 && S.saves === 0 && S.misses === 0 && S.posts === 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_penalty_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__penaltyState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function shoot() {
+    if (S.screen !== "playing" || phase !== "ready") return 0;
+    var holdT = aiming ? aimHoldT : 0;
+    var wob = L.wobbleForHold(holdT);
+    var target = L.applyWobble(reticle.x, reticle.y, wob);
+    var gold = curGold();
+    shot = { target: target, gold: gold, result: null };
+    S.shots++; shotSeq++;
+    phase = "flying"; flightT = 0;
+    keeper.diving = true; keeper.diveT = 0;
+    keeper.diveSpeed = L.DIVE_SPEED * (0.92 + Math.random() * 0.16);
+    aiming = false;
+    tone(180, 0.1, "square", 0.2, 90); buzz(15);
+    return 1;
+  }
+  function resolveFlight() {
+    var glove = { x: keeper.x, y: keeper.y };
+    var res = L.resolveShot(shot.target, glove);
+    shot.result = res;
+    var combo = L.comboForStreak(S.streak);
+    if (res === "goal") {
+      var pts = L.goalPoints(combo, shot.gold);
+      S.score += pts; S.goals++; S.streak++;
+      addFloat(shot.target.x, shot.target.y - 30, "+" + pts + (shot.gold ? " GOLD!" : ""), shot.gold);
+      burst(shot.target.x, shot.target.y, shot.gold ? "#ffd75e" : "#6cf0ff", 14);
+      tone(523, 0.1, "triangle", 0.2); tone(659, 0.1, "triangle", 0.2);
+      setTimeout(function () { tone(784, 0.18, "triangle", 0.2); }, 90);
+      buzz(25);
+    } else if (res === "save") {
+      S.saves++; S.streak = 0;
+      addFloat(240, 330, "SAVED!", false);
+      tone(140, 0.25, "sawtooth", 0.2, 70); buzz(60);
+    } else if (res === "post") {
+      S.posts++; S.streak = 0;
+      addFloat(shot.target.x, shot.target.y - 30, "OFF THE POST!", false);
+      burst(shot.target.x, shot.target.y, "#ffffff", 8);
+      tone(1200, 0.12, "square", 0.15, 900); buzz(40);
+    } else {
+      S.misses++; S.streak = 0;
+      addFloat(240, 330, "WIDE!", false);
+      tone(160, 0.2, "sawtooth", 0.15, 90);
+    }
+    phase = "reset"; resetT = 0;
+    window.__penaltyState = S;
+  }
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  canvas.addEventListener("pointerdown", function (e) {
+    e.preventDefault();
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    if (phase !== "ready") return;
+    var p = toWorld(e);
+    reticle = L.clampReticle(p.x, p.y);
+    aiming = true; aimHoldT = 0; aimStart = performance.now();
+  });
+  canvas.addEventListener("pointermove", function (e) {
+    if (!aiming || S.screen !== "playing" || phase !== "ready") return;
+    var p = toWorld(e);
+    reticle = L.clampReticle(p.x, p.y);
+  });
+  function endAim(e) {
+    if (!aiming) return;
+    aiming = false;
+    if (S.screen === "playing" && phase === "ready") shoot();
+  }
+  canvas.addEventListener("pointerup", endAim);
+  canvas.addEventListener("pointercancel", function () { aiming = false; });
+  window.addEventListener("pointerup", function () { if (aiming) endAim(); });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_penalty_mute", muted ? "1" : "0"); } catch (err) {} }
+    if (S.screen === "title" || S.screen === "over") { if (e.key === " " || e.key === "Enter") { e.preventDefault(); start(); } return; }
+    if (phase !== "ready") return;
+    if (e.key === "ArrowLeft") { e.preventDefault(); if (!aiming) { aiming = true; aimHoldT = 0; } reticle.x = Math.max(L.AIM.x0, reticle.x - 10); }
+    if (e.key === "ArrowRight") { e.preventDefault(); if (!aiming) { aiming = true; aimHoldT = 0; } reticle.x = Math.min(L.AIM.x1, reticle.x + 10); }
+    if (e.key === "ArrowUp") { e.preventDefault(); if (!aiming) { aiming = true; aimHoldT = 0; } reticle.y = Math.max(L.AIM.y0, reticle.y - 10); }
+    if (e.key === "ArrowDown") { e.preventDefault(); if (!aiming) { aiming = true; aimHoldT = 0; } reticle.y = Math.min(L.AIM.y1, reticle.y + 10); }
+    if (e.key === " ") { e.preventDefault(); shoot(); }
+  });
+
+  var CORNERS = [
+    { x: 85, y: 128 }, { x: 395, y: 128 },
+    { x: 82, y: 232 }, { x: 398, y: 232 },
+    { x: 110, y: 125 }, { x: 370, y: 125 }
+  ];
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (S.screen === "playing") {
+      elapsed += dt; S.timeLeft -= dt;
+      if (aiming && phase === "ready") {
+        aimHoldT += dt;
+        keeper.x = L.keeperDrift(keeper.x, reticle.x, dt);
+        keeper.px = keeper.x; keeper.py = keeper.y;
+      }
+      if (phase === "flying" && shot) {
+        flightT += dt;
+        keeper.diveT += dt;
+        var kp = L.keeperDivePos(keeper.px, keeper.py, shot.target.x, shot.target.y, keeper.diveT, keeper.diveSpeed);
+        keeper.x = kp.x; keeper.y = kp.y;
+        var k = Math.min(1, flightT / L.FLIGHT_T);
+        var e = 1 - (1 - k) * (1 - k);
+        ball.x = L.BALL_SPOT.x + (shot.target.x - L.BALL_SPOT.x) * e;
+        ball.y = L.BALL_SPOT.y + (shot.target.y - L.BALL_SPOT.y) * e;
+        ball.flying = true;
+        if (flightT >= L.FLIGHT_T) { ball.x = shot.target.x; ball.y = shot.target.y; resolveFlight(); }
+      } else if (phase === "reset") {
+        resetT += dt;
+        var rk = Math.min(1, resetT / L.RESET_T);
+        ball.x = L.BALL_SPOT.x; ball.y = L.BALL_SPOT.y;
+        ball.flying = false;
+        keeper.x += (L.KEEPER_HOME.x - keeper.x) * Math.min(1, dt * 6);
+        keeper.y += (L.KEEPER_HOME.y - keeper.y) * Math.min(1, dt * 6);
+        keeper.px = keeper.x; keeper.py = keeper.y;
+        if (resetT >= L.RESET_T) { phase = "ready"; keeper.diving = false; }
+      }
+      if (auto && phase === "ready" && !aiming) {
+        autoT += dt;
+        if (autoT > 1.1) {
+          autoT = 0;
+          var c = CORNERS[Math.floor(Math.random() * CORNERS.length)];
+          reticle = { x: c.x, y: c.y };
+          aiming = true; aimHoldT = 0.4;
+          shoot();
+        }
+      }
+      if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(); }
+    }
+    for (var pi = 0; pi < particles.length; pi++) {
+      particles[pi].t += dt;
+      particles[pi].x += particles[pi].vx * dt;
+      particles[pi].y += particles[pi].vy * dt;
+      particles[pi].vy += 400 * dt;
+    }
+    particles = particles.filter(function (p) { return p.t < 0.6; });
+    for (var f2 = 0; f2 < floats.length; f2++) { floats[f2].t += dt; floats[f2].y -= 30 * dt; }
+    floats = floats.filter(function (f) { return f.t < 1.2; });
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+
+  function drawBall(x, y, r, gold) {
+    var g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.1, x, y, r);
+    if (gold) {
+      g.addColorStop(0, "#fffbe0"); g.addColorStop(0.4, "#ffe95e"); g.addColorStop(1, "#8a6d00");
+    } else {
+      g.addColorStop(0, "#ffffff"); g.addColorStop(0.55, "#e8ecff"); g.addColorStop(1, "#8a93b8");
+    }
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = gold ? "#fff7cc" : "#4a5578";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(x, y, r - 0.5, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = gold ? "#7a5c00" : "#232a45";
+    ctx.beginPath(); ctx.arc(x, y, r * 0.28, 0, Math.PI * 2); ctx.fill();
+  }
+  function draw(now) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.save();
+    ctx.translate(ox, oy); ctx.scale(scale, scale);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, 480, 800); ctx.clip();
+    var bg = ctx.createLinearGradient(0, 0, 0, 800);
+    bg.addColorStop(0, "#0d1233"); bg.addColorStop(0.45, "#12233f"); bg.addColorStop(1, "#0a2e1e");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, 480, 800);
+    // crowd dots in the stands
+    var crowdCols = ["#ff4dd2", "#6cf0ff", "#ffd75e", "#7cfc66", "#ff8c42"];
+    for (var ci = 0; ci < 90; ci++) {
+      var cx = ((ci * 97 + 31) % 480 + 480) % 480;
+      var cy = 62 + ((ci * 41) % 40);
+      ctx.fillStyle = crowdCols[ci % crowdCols.length];
+      ctx.globalAlpha = 0.5;
+      ctx.fillRect(cx, cy, 4, 4);
+    }
+    ctx.globalAlpha = 1;
+    // pitch stripes
+    for (var st = 0; st < 5; st++) {
+      ctx.fillStyle = st % 2 ? "rgba(255,255,255,0.03)" : "rgba(255,255,255,0.07)";
+      ctx.fillRect(0, 300 + st * 100, 480, 100);
+    }
+    // penalty box + arc
+    ctx.strokeStyle = "rgba(255,255,255,0.35)";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(90, 260, 300, 130);
+    ctx.beginPath(); ctx.arc(240, 390, 90, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+    // penalty spot
+    ctx.fillStyle = "rgba(255,255,255,0.6)";
+    ctx.beginPath(); ctx.arc(L.BALL_SPOT.x, L.BALL_SPOT.y, 4, 0, Math.PI * 2); ctx.fill();
+    // goal: net + frame
+    ctx.fillStyle = "rgba(108,240,255,0.08)";
+    ctx.fillRect(L.GOAL.x0, L.GOAL.y0, L.GOAL.x1 - L.GOAL.x0, L.GOAL.y1 - L.GOAL.y0);
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.lineWidth = 1;
+    for (var nx = L.GOAL.x0 + 30; nx < L.GOAL.x1; nx += 30) {
+      ctx.beginPath(); ctx.moveTo(nx, L.GOAL.y0); ctx.lineTo(nx, L.GOAL.y1); ctx.stroke();
+    }
+    for (var ny = L.GOAL.y0 + 28; ny < L.GOAL.y1; ny += 28) {
+      ctx.beginPath(); ctx.moveTo(L.GOAL.x0, ny); ctx.lineTo(L.GOAL.x1, ny); ctx.stroke();
+    }
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 6;
+    ctx.beginPath();
+    ctx.moveTo(L.GOAL.x0, L.GOAL.y1); ctx.lineTo(L.GOAL.x0, L.GOAL.y0);
+    ctx.lineTo(L.GOAL.x1, L.GOAL.y0); ctx.lineTo(L.GOAL.x1, L.GOAL.y1);
+    ctx.stroke();
+    ctx.strokeStyle = "#ffd75e";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(L.GOAL.x0, L.GOAL.y1); ctx.lineTo(L.GOAL.x0, L.GOAL.y0);
+    ctx.lineTo(L.GOAL.x1, L.GOAL.y0); ctx.lineTo(L.GOAL.x1, L.GOAL.y1);
+    ctx.stroke();
+    // HUD
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#6cf0ff";
+    ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("SCORE " + S.score, 14, 26);
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e5e" : "#ffffff";
+    ctx.font = "bold 28px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", 240, 26);
+    ctx.fillStyle = "#ff5e7a";
+    ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "right";
+    ctx.fillText("GOALS " + S.goals + "/" + S.shots, 466, 26);
+    ctx.fillStyle = "#9a8fd0";
+    ctx.font = "14px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("BEST " + S.best + "   COMBO x" + L.comboForStreak(S.streak), 14, 52);
+    // keeper
+    var lean = 0;
+    if (keeper.diving && shot) lean = (shot.target.x - keeper.px) > 0 ? 0.5 : -0.5;
+    else if (aiming) lean = (reticle.x - keeper.x) > 0 ? 0.12 : -0.12;
+    ctx.save();
+    ctx.translate(keeper.x, keeper.y);
+    ctx.rotate(lean);
+    ctx.fillStyle = "#ff4dd2";
+    ctx.beginPath(); ctx.arc(0, -26, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#ff4dd2";
+    ctx.fillRect(-13, -16, 26, 34);
+    ctx.fillStyle = "#ff8cdd";
+    ctx.fillRect(-13, -16, 26, 8);
+    ctx.fillStyle = "#ffd75e";
+    ctx.beginPath(); ctx.arc(-20, -6, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(20, -6, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#2a2350";
+    ctx.fillRect(-12, 18, 9, 16);
+    ctx.fillRect(3, 18, 9, 16);
+    ctx.restore();
+    ctx.fillStyle = "rgba(255,77,210,0.25)";
+    ctx.beginPath(); ctx.ellipse(keeper.x, keeper.y + 36, 26, 6, 0, 0, Math.PI * 2); ctx.fill();
+    // aim guide + reticle
+    if (S.screen === "playing" && phase === "ready") {
+      var wob = L.wobbleForHold(aiming ? aimHoldT : 0);
+      if (aiming) {
+        ctx.strokeStyle = "rgba(255,255,255,0.35)";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 8]);
+        ctx.beginPath(); ctx.moveTo(L.BALL_SPOT.x, L.BALL_SPOT.y); ctx.lineTo(reticle.x, reticle.y); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.strokeStyle = curGold() ? "#ffd75e" : "#6cf0ff";
+      ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(reticle.x, reticle.y, wob + 8, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(reticle.x - wob - 18, reticle.y); ctx.lineTo(reticle.x - wob - 4, reticle.y);
+      ctx.moveTo(reticle.x + wob + 4, reticle.y); ctx.lineTo(reticle.x + wob + 18, reticle.y);
+      ctx.moveTo(reticle.x, reticle.y - wob - 18); ctx.lineTo(reticle.x, reticle.y - wob - 4);
+      ctx.moveTo(reticle.x, reticle.y + wob + 4); ctx.lineTo(reticle.x, reticle.y + wob + 18);
+      ctx.stroke();
+      ctx.fillStyle = curGold() ? "#ffd75e" : "#6cf0ff";
+      ctx.beginPath(); ctx.arc(reticle.x, reticle.y, 3, 0, Math.PI * 2); ctx.fill();
+      if (!aiming) {
+        ctx.fillStyle = "#9a8fd0";
+        ctx.font = "16px 'Segoe UI',system-ui,sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText("DRAG TO AIM — RELEASE TO SHOOT", 240, 480);
+        ctx.fillText("Hold to steady your aim… but the keeper reads you!", 240, 506);
+      }
+    }
+    // ball
+    var ballR = ball.flying ? 14 - 4 * (flightT / L.FLIGHT_T) : 14;
+    drawBall(ball.x, ball.y, ballR < 9 ? 9 : ballR, shot && phase !== "ready" ? shot.gold : curGold());
+    // particles
+    for (var pj = 0; pj < particles.length; pj++) {
+      ctx.globalAlpha = 1 - particles[pj].t / 0.6;
+      ctx.fillStyle = particles[pj].color;
+      ctx.beginPath(); ctx.arc(particles[pj].x, particles[pj].y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // floats
+    ctx.textAlign = "center";
+    for (var fj = 0; fj < floats.length; fj++) {
+      ctx.globalAlpha = 1 - floats[fj].t / 1.2;
+      ctx.fillStyle = floats[fj].golden ? "#ffd75e" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(floats[fj].text, floats[fj].x, floats[fj].y);
+    }
+    ctx.globalAlpha = 1;
+    // title / game over overlays
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#6cf0ff";
+      ctx.font = "bold 54px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("NEON", 240, 250);
+      ctx.fillStyle = "#ff4dd2";
+      ctx.fillText("PENALTY", 240, 310);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Drag to aim — release to shoot", 240, 380);
+      ctx.fillText("Corners beat the keeper", 240, 412);
+      ctx.fillStyle = "#ffd75e";
+      ctx.fillText("Golden balls pay 5x", 240, 444);
+      ctx.fillStyle = "#9a8fd0";
+      ctx.font = "17px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Hold to steady your aim — but the", 240, 480);
+      ctx.fillText("longer you hold, the more he reads you!", 240, 506);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 24px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TAP TO START", 240, 580);
+      if (S.best > 0) {
+        ctx.fillStyle = "#ffd75e";
+        ctx.font = "18px 'Segoe UI',system-ui,sans-serif";
+        ctx.fillText("BEST " + S.best, 240, 620);
+      }
+    }
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(7,5,18,0.78)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ff4dd2";
+      ctx.font = "bold 46px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TIME'S UP!", 240, 300);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 34px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("SCORE " + S.score, 240, 360);
+      ctx.fillStyle = "#ffd75e";
+      ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Goals " + S.goals + " of " + S.shots + " shots", 240, 400);
+      if (S.flawless) ctx.fillText("FLAWLESS! +500 bonus", 240, 432);
+      ctx.fillStyle = "#9a8fd0";
+      ctx.fillText("BEST " + S.best, 240, 466);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 24px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TAP TO PLAY AGAIN", 240, 540);
+    }
+    ctx.restore();
+    ctx.restore();
+  }
+
+  window.__penaltyState = S;
+  window.__penaltyDebug = {
+    get phase() { return phase; },
+    get aiming() { return aiming; },
+    get keeperX() { return keeper.x; },
+    get reticle() { return { x: reticle.x, y: reticle.y }; },
+    get shot() { return shot ? { target: shot.target, result: shot.result, gold: shot.gold } : null; }
+  };
+  reset();
+  if (auto) start();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
