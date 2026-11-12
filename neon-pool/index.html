@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Pool — Day 48</title>
+<meta name="description" content="Neon Pool — 60 seconds of neon pool chaos. Drag back and release to shoot the cue ball — pocket glowing balls to score, chain pockets to raise your combo to x5, golden shots pay 5x, and scratching the cue ball costs a heart.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Pool — Day 48. A neon pool table: drag back anywhere and release to
+   shoot the cue ball. Pocket glowing balls for 100 x combo; combo climbs
+   x1->x5 every 4 consecutive pocketing shots (a shot with no pocket resets
+   the streak). Every 6th shot is GOLDEN (5x on every pocket that shot).
+   Scratch the cue ball into a pocket and you lose a heart (3 hearts;
+   0 hearts ends the run). Clear all 7 balls for +250 and a fresh rack.
+   Flawless (no scratches) pays +500. 60 seconds. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var PoolLogic = (function () {
+  var W = 480, H = 800;
+  var TABLE = { x0: 40, y0: 180, x1: 440, y1: 700 };
+  var POCKETS = [
+    { x: 40, y: 180 }, { x: 440, y: 180 },
+    { x: 40, y: 440 }, { x: 440, y: 440 },
+    { x: 40, y: 700 }, { x: 440, y: 700 }
+  ];
+  var BALL_R = 11, POCKET_R = 24;
+  var CUE_SPOT = { x: 240, y: 620 };
+  var RACK_APEX = { x: 240, y: 300 };
+  var MAX_SPEED = 900, MIN_DRAG = 12, DRAG_SCALE = 5;
+  var DECEL = 320, STOP_SPEED = 8, CUSHION_E = 0.72, BALL_E = 0.96;
+  var BALL_COLORS = ["#ff4dd2", "#6cf0ff", "#ffd75e", "#7cfc66", "#ff8c42", "#b18cff", "#ff5e5e"];
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function pocketPoints(combo, gold) { return 100 * combo * (gold ? 5 : 1); }
+  function nextShotGold(shotSeq) { return shotSeq % 6 === 5; }
+  function rackBalls() {
+    var balls = [], rows = [1, 2, 3, 1], rowH = 24, colW = 23, idx = 0;
+    for (var r = 0; r < rows.length; r++) {
+      for (var c = 0; c < rows[r]; c++) {
+        balls.push({
+          x: RACK_APEX.x + (c - (rows[r] - 1) / 2) * colW,
+          y: RACK_APEX.y + r * rowH,
+          vx: 0, vy: 0, color: BALL_COLORS[idx % BALL_COLORS.length], id: idx
+        });
+        idx++;
+      }
+    }
+    return balls;
+  }
+  function pocketIndexFor(b) {
+    for (var i = 0; i < POCKETS.length; i++) {
+      var dx = b.x - POCKETS[i].x, dy = b.y - POCKETS[i].y;
+      if (dx * dx + dy * dy < POCKET_R * POCKET_R) return i;
+    }
+    return -1;
+  }
+  function bounceCushion(b) {
+    var hit = false;
+    if (b.x - BALL_R < TABLE.x0) { b.x = TABLE.x0 + BALL_R; if (b.vx < 0) { b.vx = -b.vx * CUSHION_E; hit = true; } }
+    if (b.x + BALL_R > TABLE.x1) { b.x = TABLE.x1 - BALL_R; if (b.vx > 0) { b.vx = -b.vx * CUSHION_E; hit = true; } }
+    if (b.y - BALL_R < TABLE.y0) { b.y = TABLE.y0 + BALL_R; if (b.vy < 0) { b.vy = -b.vy * CUSHION_E; hit = true; } }
+    if (b.y + BALL_R > TABLE.y1) { b.y = TABLE.y1 - BALL_R; if (b.vy > 0) { b.vy = -b.vy * CUSHION_E; hit = true; } }
+    return hit;
+  }
+  function stepBall(b, dt) {
+    var sp = Math.hypot(b.vx, b.vy);
+    if (sp <= 0) return;
+    var ns = sp - DECEL * dt;
+    if (ns <= STOP_SPEED) { b.vx = 0; b.vy = 0; return; }
+    var f = ns / sp;
+    b.vx *= f; b.vy *= f;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+  }
+  function collideBalls(a, b) {
+    var dx = b.x - a.x, dy = b.y - a.y;
+    var min = 2 * BALL_R, d2 = dx * dx + dy * dy;
+    if (d2 >= min * min || d2 === 0) return false;
+    var d = Math.sqrt(d2), nx = dx / d, ny = dy / d;
+    var overlap = (min - d) / 2;
+    a.x -= nx * overlap; a.y -= ny * overlap;
+    b.x += nx * overlap; b.y += ny * overlap;
+    var rvx = b.vx - a.vx, rvy = b.vy - a.vy;
+    var vn = rvx * nx + rvy * ny;
+    if (vn >= 0) return false;
+    var j = -(1 + BALL_E) * vn / 2;
+    a.vx -= j * nx; a.vy -= j * ny;
+    b.vx += j * nx; b.vy += j * ny;
+    return true;
+  }
+  function shotFromDrag(sx, sy, ex, ey) {
+    var dx = ex - sx, dy = ey - sy;
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (len < MIN_DRAG) return null;
+    var sp = Math.min(MAX_SPEED, len * DRAG_SCALE);
+    return { vx: -dx / len * sp, vy: -dy / len * sp, power: sp / MAX_SPEED };
+  }
+  function ghostAim(cue, ball, pocket) {
+    var dx = pocket.x - ball.x, dy = pocket.y - ball.y;
+    var d = Math.sqrt(dx * dx + dy * dy) || 1;
+    return { x: ball.x - dx / d * 2 * BALL_R, y: ball.y - dy / d * 2 * BALL_R };
+  }
+  function nearestPocket(ball) {
+    var best = POCKETS[0], bd = Infinity;
+    for (var i = 0; i < POCKETS.length; i++) {
+      var dx = POCKETS[i].x - ball.x, dy = POCKETS[i].y - ball.y;
+      var d = dx * dx + dy * dy;
+      if (d < bd) { bd = d; best = POCKETS[i]; }
+    }
+    return best;
+  }
+  function firstHit(cue, dir, balls) {
+    var step = 6, maxDist = 320;
+    for (var d = BALL_R + 2; d <= maxDist; d += step) {
+      var x = cue.x + dir.x * d, y = cue.y + dir.y * d;
+      if (x < TABLE.x0 + BALL_R || x > TABLE.x1 - BALL_R ||
+          y < TABLE.y0 + BALL_R || y > TABLE.y1 - BALL_R) return { x: x, y: y, dist: d, kind: "rail" };
+      for (var i = 0; i < balls.length; i++) {
+        var dx = balls[i].x - x, dy = balls[i].y - y;
+        if (dx * dx + dy * dy < (2 * BALL_R) * (2 * BALL_R)) return { x: x, y: y, dist: d, kind: "ball" };
+      }
+    }
+    return { x: cue.x + dir.x * maxDist, y: cue.y + dir.y * maxDist, dist: maxDist, kind: "none" };
+  }
+  function shotGeom(cue, ball, pocket) {
+    // Signed geometry of a ghost-ball shot. comp = cos(angle between the
+    // cue's travel direction and the ball->pocket direction). comp > 0 means
+    // the cue is behind the ball relative to the pocket and the straight
+    // path to the ghost point is clear of the ball itself; comp <= 0 means
+    // the shot is physically impossible from this cue position — the cue
+    // would clip the ball's near side first and send it the wrong way.
+    var g = ghostAim(cue, ball, pocket);
+    var dx = g.x - cue.x, dy = g.y - cue.y;
+    var d = Math.sqrt(dx * dx + dy * dy) || 1;
+    var nx = (ball.x - g.x) / (2 * BALL_R), ny = (ball.y - g.y) / (2 * BALL_R);
+    var comp = (dx / d) * nx + (dy / d) * ny;
+    var ballDist = Math.hypot(pocket.x - ball.x, pocket.y - ball.y);
+    return { ghost: g, dx: dx, dy: dy, dist: d, comp: comp, ballDist: ballDist };
+  }
+  function shotSpeedFor(cueDist, ballDist, comp) {
+    // launch speed so the object ball still reaches its pocket after the
+    // cue loses speed over cueDist and the cut loses (1-comp) at impact
+    var needBall = Math.sqrt(2 * DECEL * ballDist) * 1.3;
+    if (comp < 0.25) comp = 0.25;
+    var needCueImpact = needBall / (comp * 0.98);
+    var needLaunch = Math.sqrt(needCueImpact * needCueImpact + 2 * DECEL * cueDist);
+    return Math.min(880, Math.max(260, needLaunch));
+  }
+  function freeSpot(balls, cue) {
+    var cands = [
+      { x: CUE_SPOT.x, y: CUE_SPOT.y },
+      { x: CUE_SPOT.x - 50, y: CUE_SPOT.y }, { x: CUE_SPOT.x + 50, y: CUE_SPOT.y },
+      { x: CUE_SPOT.x, y: CUE_SPOT.y - 50 }, { x: CUE_SPOT.x, y: CUE_SPOT.y + 50 },
+      { x: CUE_SPOT.x - 100, y: CUE_SPOT.y }, { x: CUE_SPOT.x + 100, y: CUE_SPOT.y }
+    ];
+    for (var i = 0; i < cands.length; i++) {
+      var ok = true;
+      for (var j = 0; j < balls.length; j++) {
+        var dx = balls[j].x - cands[i].x, dy = balls[j].y - cands[i].y;
+        if (dx * dx + dy * dy < (2 * BALL_R + 2) * (2 * BALL_R + 2)) { ok = false; break; }
+      }
+      if (ok) return cands[i];
+    }
+    return { x: CUE_SPOT.x, y: CUE_SPOT.y };
+  }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, timeLeft: 60,
+      streak: 0, shots: 0, pockets: 0, scratches: 0, hearts: 3,
+      cleared: 0, flawless: false };
+  }
+  return {
+    W: W, H: H, TABLE: TABLE, POCKETS: POCKETS, BALL_R: BALL_R, POCKET_R: POCKET_R,
+    CUE_SPOT: CUE_SPOT, RACK_APEX: RACK_APEX, MAX_SPEED: MAX_SPEED, MIN_DRAG: MIN_DRAG,
+    DRAG_SCALE: DRAG_SCALE, DECEL: DECEL, STOP_SPEED: STOP_SPEED,
+    CUSHION_E: CUSHION_E, BALL_E: BALL_E, BALL_COLORS: BALL_COLORS,
+    comboForStreak: comboForStreak, pocketPoints: pocketPoints,
+    nextShotGold: nextShotGold, rackBalls: rackBalls,
+    pocketIndexFor: pocketIndexFor, bounceCushion: bounceCushion,
+    stepBall: stepBall, collideBalls: collideBalls,
+    shotFromDrag: shotFromDrag, ghostAim: ghostAim,
+    nearestPocket: nearestPocket, firstHit: firstHit,
+    shotGeom: shotGeom, shotSpeedFor: shotSpeedFor,
+    freeSpot: freeSpot, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = PoolLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_pool_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_pool_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, shotSeq = 0, phase = "aim";
+  var cue = { x: L.CUE_SPOT.x, y: L.CUE_SPOT.y, vx: 0, vy: 0 };
+  var balls = L.rackBalls();
+  var shotGold = false, pocketsThisShot = 0, cuePocketed = false;
+  var dragging = false, dragStart = null, dragCur = null, dragShot = null;
+  var particles = [], floats = [];
+  var auto = (location.search.indexOf("auto=1") !== -1), autoT = 0;
+
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_pool_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; shotSeq = 0; phase = "aim";
+    cue = { x: L.CUE_SPOT.x, y: L.CUE_SPOT.y, vx: 0, vy: 0 };
+    balls = L.rackBalls();
+    shotGold = false; pocketsThisShot = 0; cuePocketed = false;
+    dragging = false; dragStart = null; dragCur = null; dragShot = null;
+    particles = []; floats = []; autoT = 0;
+    window.__poolState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame() {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.shots > 0 && S.scratches === 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_pool_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__poolState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function shootVel(vx, vy) {
+    if (S.screen !== "playing" || phase !== "aim") return 0;
+    shotGold = L.nextShotGold(shotSeq);
+    shotSeq++; S.shots++;
+    cue.vx = vx; cue.vy = vy;
+    phase = "rolling"; pocketsThisShot = 0; cuePocketed = false;
+    tone(180, 0.08, "square", 0.18, 90); buzz(15);
+    window.__poolState = S;
+    return 1;
+  }
+  function onPocket(b, isCue) {
+    if (isCue) { cuePocketed = true; return; }
+    var combo = L.comboForStreak(S.streak);
+    var pts = L.pocketPoints(combo, shotGold);
+    S.score += pts; S.pockets++; pocketsThisShot++;
+    addFloat(b.x, b.y - 24, "+" + pts + (shotGold ? " GOLD!" : ""), shotGold);
+    burst(b.x, b.y, shotGold ? "#ffd75e" : b.color, 14);
+    if (shotGold) { tone(1046, 0.1, "triangle", 0.2); tone(1318, 0.16, "triangle", 0.2); }
+    else { tone(523, 0.1, "triangle", 0.2); tone(784, 0.14, "triangle", 0.2); }
+    buzz(25);
+  }
+  function settleShot() {
+    if (pocketsThisShot > 0) S.streak++; else S.streak = 0;
+    pocketsThisShot = 0;
+    if (cuePocketed) {
+      S.scratches++; S.hearts--; S.streak = 0;
+      addFloat(240, 480, "SCRATCH!", false);
+      tone(140, 0.3, "sawtooth", 0.2, 70); buzz(80);
+      cuePocketed = false;
+      var spot = L.freeSpot(balls, cue);
+      cue.x = spot.x; cue.y = spot.y; cue.vx = 0; cue.vy = 0;
+      if (S.hearts <= 0) { S.hearts = 0; phase = "aim"; endGame(); return; }
+    }
+    if (balls.length === 0) {
+      S.score += 250; S.cleared++;
+      addFloat(240, 430, "TABLE CLEAR! +250", true);
+      tone(523, 0.1, "triangle", 0.2); tone(659, 0.1, "triangle", 0.2);
+      setTimeout(function () { tone(784, 0.18, "triangle", 0.2); }, 90);
+      balls = L.rackBalls();
+      var spot2 = L.freeSpot(balls, cue);
+      cue.x = spot2.x; cue.y = spot2.y; cue.vx = 0; cue.vy = 0;
+    }
+    phase = "aim";
+    window.__poolState = S;
+  }
+  function allStopped() {
+    if (Math.hypot(cue.vx, cue.vy) > 0) return false;
+    for (var i = 0; i < balls.length; i++) {
+      if (Math.hypot(balls[i].vx, balls[i].vy) > 0) return false;
+    }
+    return true;
+  }
+  function physics(dt) {
+    // 12 substeps: at 880 px/s a ball moves only ~1.2px per substep, so the
+    // contact normal at impact is within ~3 degrees of the true normal —
+    // without this, discrete collision fires up to a full substep late and
+    // the object ball leaves ~12 degrees off the ghost-ball aim line.
+    var sub = 12, h = dt / sub;
+    for (var s = 0; s < sub; s++) {
+      L.stepBall(cue, h);
+      for (var i = 0; i < balls.length; i++) L.stepBall(balls[i], h);
+      // cue vs balls
+      for (var j = 0; j < balls.length; j++) {
+        if (L.collideBalls(cue, balls[j])) tone(300 + Math.random() * 200, 0.05, "square", 0.08);
+      }
+      for (var a = 0; a < balls.length; a++) {
+        for (var b = 0; b < a; b++) {
+          if (L.collideBalls(balls[b], balls[a])) tone(300 + Math.random() * 200, 0.05, "square", 0.06);
+        }
+      }
+      L.bounceCushion(cue);
+      for (var k = 0; k < balls.length; k++) L.bounceCushion(balls[k]);
+      // pockets
+      if (L.pocketIndexFor(cue) >= 0 && !cuePocketed) {
+        cuePocketed = true;
+        cue.vx = 0; cue.vy = 0;
+        cue.x = -100; cue.y = -100;
+      }
+      for (var p = balls.length - 1; p >= 0; p--) {
+        if (L.pocketIndexFor(balls[p]) >= 0) {
+          onPocket(balls[p], false);
+          balls.splice(p, 1);
+        }
+      }
+    }
+  }
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  canvas.addEventListener("pointerdown", function (e) {
+    e.preventDefault();
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    if (phase !== "aim") return;
+    dragging = true;
+    dragStart = toWorld(e); dragCur = dragStart; dragShot = null;
+  });
+  canvas.addEventListener("pointermove", function (e) {
+    if (!dragging || S.screen !== "playing" || phase !== "aim") return;
+    dragCur = toWorld(e);
+    dragShot = L.shotFromDrag(dragStart.x, dragStart.y, dragCur.x, dragCur.y);
+  });
+  function endDrag() {
+    if (!dragging) return;
+    dragging = false;
+    if (S.screen === "playing" && phase === "aim" && dragShot) {
+      shootVel(dragShot.vx, dragShot.vy);
+    }
+    dragStart = null; dragCur = null; dragShot = null;
+  }
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", function () { dragging = false; dragStart = null; dragCur = null; dragShot = null; });
+  window.addEventListener("pointerup", function () { if (dragging) endDrag(); });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_pool_mute", muted ? "1" : "0"); } catch (err) {} }
+    if (S.screen === "title" || S.screen === "over") { if (e.key === " " || e.key === "Enter") { e.preventDefault(); start(); } return; }
+    if (phase !== "aim") return;
+    if (e.key === " ") { e.preventDefault(); autoShoot(); }
+  });
+  function autoShoot() {
+    if (balls.length === 0) return 0;
+    // sample balls and take the most full-on VALID shot (comp > 0.45):
+    // a shot with comp <= 0 is physically impossible from the cue's
+    // position — the cue would clip the ball's near side and send it
+    // the wrong way — so it must never be picked
+    var best = null, fallback = null;
+    for (var t = 0; t < 10; t++) {
+      var bi = Math.floor(Math.random() * balls.length);
+      var ball = balls[bi];
+      var pocket = L.nearestPocket(ball);
+      var sg = L.shotGeom(cue, ball, pocket);
+      if (!fallback || sg.comp > fallback.comp) fallback = { ball: ball, pocket: pocket, sg: sg };
+      if (sg.comp > 0.45 && (!best || sg.comp > best.sg.comp)) best = { ball: ball, pocket: pocket, sg: sg };
+    }
+    var pick = best || fallback;
+    var sp = L.shotSpeedFor(pick.sg.dist, pick.sg.ballDist, Math.max(0.25, pick.sg.comp));
+    return shootVel(pick.sg.dx / pick.sg.dist * sp, pick.sg.dy / pick.sg.dist * sp);
+  }
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (S.screen === "playing") {
+      elapsed += dt; S.timeLeft -= dt;
+      if (phase === "rolling") {
+        physics(dt);
+        if (allStopped()) settleShot();
+      }
+      if (auto && phase === "aim" && S.screen === "playing") {
+        autoT += dt;
+        if (autoT > 1.3) { autoT = 0; autoShoot(); }
+      }
+      if (S.timeLeft <= 0) { S.timeLeft = 0; endGame(); }
+    }
+    for (var pi = 0; pi < particles.length; pi++) {
+      particles[pi].t += dt;
+      particles[pi].x += particles[pi].vx * dt;
+      particles[pi].y += particles[pi].vy * dt;
+      particles[pi].vy += 400 * dt;
+    }
+    particles = particles.filter(function (p) { return p.t < 0.6; });
+    for (var f2 = 0; f2 < floats.length; f2++) { floats[f2].t += dt; floats[f2].y -= 30 * dt; }
+    floats = floats.filter(function (f) { return f.t < 1.2; });
+    draw(now);
+    requestAnimationFrame(frame);
+  }
+
+  function drawBall(x, y, r, color, gold) {
+    var g = ctx.createRadialGradient(x - r * 0.35, y - r * 0.4, r * 0.1, x, y, r);
+    if (gold) {
+      g.addColorStop(0, "#fffbe0"); g.addColorStop(0.4, "#ffe95e"); g.addColorStop(1, "#8a6d00");
+    } else if (color === "#ffffff" || !color) {
+      g.addColorStop(0, "#ffffff"); g.addColorStop(0.55, "#e8ecff"); g.addColorStop(1, "#8a93b8");
+    } else {
+      g.addColorStop(0, "#ffffff"); g.addColorStop(0.3, color); g.addColorStop(1, "#111122");
+    }
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = gold ? "#fff7cc" : "rgba(255,255,255,0.5)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(x, y, r - 0.5, 0, Math.PI * 2); ctx.stroke();
+  }
+  function draw(now) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#070512"; ctx.fillRect(0, 0, vw, vh);
+    ctx.save();
+    ctx.translate(ox, oy); ctx.scale(scale, scale);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, 480, 800); ctx.clip();
+    var bg = ctx.createLinearGradient(0, 0, 0, 800);
+    bg.addColorStop(0, "#0d1233"); bg.addColorStop(0.5, "#101a2e"); bg.addColorStop(1, "#0a1a2e");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, 480, 800);
+    // table felt — gradient created AFTER the transform, in world coords
+    var felt = ctx.createLinearGradient(40, 180, 40, 700);
+    felt.addColorStop(0, "#0f7a5c"); felt.addColorStop(0.5, "#0a5c44"); felt.addColorStop(1, "#084a38");
+    ctx.fillStyle = felt;
+    ctx.fillRect(L.TABLE.x0, L.TABLE.y0, L.TABLE.x1 - L.TABLE.x0, L.TABLE.y1 - L.TABLE.y0);
+    // felt shading stripes
+    ctx.fillStyle = "rgba(255,255,255,0.03)";
+    for (var st = 0; st < 5; st++) ctx.fillRect(L.TABLE.x0, L.TABLE.y0 + st * 104, L.TABLE.x1 - L.TABLE.x0, 52);
+    // rails
+    ctx.strokeStyle = "#1de9b6"; ctx.lineWidth = 4;
+    ctx.shadowColor = "#1de9b6"; ctx.shadowBlur = 14;
+    ctx.strokeRect(L.TABLE.x0, L.TABLE.y0, L.TABLE.x1 - L.TABLE.x0, L.TABLE.y1 - L.TABLE.y0);
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 1;
+    ctx.strokeRect(L.TABLE.x0 + 7, L.TABLE.y0 + 7, L.TABLE.x1 - L.TABLE.x0 - 14, L.TABLE.y1 - L.TABLE.y0 - 14);
+    // pockets
+    for (var pi = 0; pi < L.POCKETS.length; pi++) {
+      var pk = L.POCKETS[pi];
+      var pg = ctx.createRadialGradient(pk.x, pk.y, 2, pk.x, pk.y, L.POCKET_R + 6);
+      pg.addColorStop(0, "#000000"); pg.addColorStop(0.7, "#050510"); pg.addColorStop(1, "rgba(255,215,94,0.55)");
+      ctx.fillStyle = pg;
+      ctx.beginPath(); ctx.arc(pk.x, pk.y, L.POCKET_R + 6, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#000000";
+      ctx.beginPath(); ctx.arc(pk.x, pk.y, L.POCKET_R - 3, 0, Math.PI * 2); ctx.fill();
+    }
+    // HUD
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#6cf0ff";
+    ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("SCORE " + S.score, 14, 26);
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e5e" : "#ffffff";
+    ctx.font = "bold 28px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", 240, 26);
+    ctx.fillStyle = "#ff5e7a";
+    ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "right";
+    var hearts = "";
+    for (var hi = 0; hi < 3; hi++) hearts += (hi < S.hearts ? "♥" : "♡");
+    ctx.fillText(hearts, 466, 26);
+    ctx.fillStyle = "#9a8fd0";
+    ctx.font = "14px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("BEST " + S.best + "   COMBO x" + L.comboForStreak(S.streak) + "   BALLS " + S.pockets, 14, 52);
+    if (S.screen === "playing" && phase === "aim" && L.nextShotGold(shotSeq)) {
+      ctx.fillStyle = "#ffd75e";
+      ctx.font = "bold 16px 'Segoe UI',system-ui,sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("★ NEXT SHOT IS GOLDEN — 5x! ★", 240, 76);
+    }
+    // aim guide
+    if (S.screen === "playing" && phase === "aim" && dragging && dragShot) {
+      var dir = { x: dragShot.vx, y: dragShot.vy };
+      var dl = Math.hypot(dir.x, dir.y) || 1;
+      dir.x /= dl; dir.y /= dl;
+      var hit = L.firstHit(cue, dir, balls);
+      ctx.strokeStyle = shotGold ? "rgba(255,215,94,0.8)" : "rgba(108,240,255,0.8)";
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([8, 7]);
+      ctx.beginPath(); ctx.moveTo(cue.x, cue.y); ctx.lineTo(hit.x, hit.y); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = shotGold ? "#ffd75e" : "#6cf0ff";
+      ctx.beginPath(); ctx.arc(hit.x, hit.y, 5, 0, Math.PI * 2); ctx.fill();
+      // power meter
+      ctx.fillStyle = "rgba(255,255,255,0.15)";
+      ctx.fillRect(140, 736, 200, 14);
+      ctx.fillStyle = dragShot.power > 0.75 ? "#ff5e5e" : (dragShot.power > 0.45 ? "#ffd75e" : "#6cf0ff");
+      ctx.fillRect(140, 736, 200 * dragShot.power, 14);
+      ctx.strokeStyle = "rgba(255,255,255,0.4)"; ctx.lineWidth = 1;
+      ctx.strokeRect(140, 736, 200, 14);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "13px 'Segoe UI',system-ui,sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("POWER", 240, 764);
+    }
+    if (S.screen === "playing" && phase === "aim" && !dragging) {
+      ctx.fillStyle = "#9a8fd0";
+      ctx.font = "16px 'Segoe UI',system-ui,sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("DRAG BACK — RELEASE TO SHOOT", 240, 748);
+    }
+    // balls
+    for (var bi = 0; bi < balls.length; bi++) {
+      drawBall(balls[bi].x, balls[bi].y, L.BALL_R, balls[bi].color, false);
+    }
+    // cue ball (gold rim on a golden shot)
+    if (cue.x >= 0) {
+      drawBall(cue.x, cue.y, L.BALL_R, "#ffffff", shotGold && phase === "aim");
+      if (shotGold && phase === "aim") {
+        ctx.strokeStyle = "#ffd75e"; ctx.lineWidth = 2.5;
+        ctx.beginPath(); ctx.arc(cue.x, cue.y, L.BALL_R + 4, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+    // particles
+    for (var pj = 0; pj < particles.length; pj++) {
+      ctx.globalAlpha = 1 - particles[pj].t / 0.6;
+      ctx.fillStyle = particles[pj].color;
+      ctx.beginPath(); ctx.arc(particles[pj].x, particles[pj].y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // floats
+    ctx.textAlign = "center";
+    for (var fj = 0; fj < floats.length; fj++) {
+      ctx.globalAlpha = 1 - floats[fj].t / 1.2;
+      ctx.fillStyle = floats[fj].golden ? "#ffd75e" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(floats[fj].text, floats[fj].x, floats[fj].y);
+    }
+    ctx.globalAlpha = 1;
+    // title / game over overlays
+    if (S.screen === "title") {
+      ctx.fillStyle = "rgba(7,5,18,0.72)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#6cf0ff";
+      ctx.font = "bold 54px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("NEON", 240, 250);
+      ctx.fillStyle = "#ff4dd2";
+      ctx.fillText("POOL", 240, 310);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Drag back — release to shoot", 240, 380);
+      ctx.fillText("Pocket glowing balls to score", 240, 412);
+      ctx.fillStyle = "#ffd75e";
+      ctx.fillText("Golden shots pay 5x", 240, 444);
+      ctx.fillStyle = "#9a8fd0";
+      ctx.font = "17px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Chain pockets to raise your combo to x5", 240, 480);
+      ctx.fillText("Scratch the cue ball and lose a heart", 240, 506);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 24px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TAP TO START", 240, 580);
+      if (S.best > 0) {
+        ctx.fillStyle = "#ffd75e";
+        ctx.font = "18px 'Segoe UI',system-ui,sans-serif";
+        ctx.fillText("BEST " + S.best, 240, 620);
+      }
+    }
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(7,5,18,0.78)"; ctx.fillRect(0, 0, 480, 800);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#ff4dd2";
+      ctx.font = "bold 46px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TIME'S UP!", 240, 300);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 34px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("SCORE " + S.score, 240, 360);
+      ctx.fillStyle = "#ffd75e";
+      ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Balls pocketed " + S.pockets + "  ·  Tables cleared " + S.cleared, 240, 400);
+      if (S.flawless) ctx.fillText("FLAWLESS! +500 bonus", 240, 432);
+      ctx.fillStyle = "#9a8fd0";
+      ctx.fillText("BEST " + S.best, 240, 466);
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "bold 24px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TAP TO PLAY AGAIN", 240, 540);
+    }
+    ctx.restore();
+    ctx.restore();
+  }
+
+  window.__poolState = S;
+  window.__poolDebug = {
+    get phase() { return phase; },
+    get shots() { return S.shots; },
+    get pockets() { return S.pockets; },
+    get hearts() { return S.hearts; },
+    get cue() { return { x: cue.x, y: cue.y, vx: cue.vx, vy: cue.vy }; },
+    get ballCount() { return balls.length; },
+    get dragging() { return dragging; },
+    get shotGold() { return shotGold; }
+  };
+  reset();
+  if (auto) start();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
