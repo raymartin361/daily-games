@@ -1,0 +1,534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Archery — Day 49</title>
+<meta name="description" content="Neon Archery — 60 seconds of neon archery chaos. Drag back to draw the bow, release to loose the arrow — wind and gravity bend every shot. Bullseyes chain your combo to x5, golden arrows pay 5x. How steady is your aim?">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Archery — Day 49. A neon archery range: drag back anywhere and
+   release to loose an arrow at the drifting target. Gravity arcs the
+   arrow down and the wind pushes it sideways — the dotted preview shows
+   the true flight, so read the wind and pick your moment. Rings pay
+   100/50/30/20/10 x combo; combo climbs x1->x5 every 4 consecutive
+   scoring shots (a miss resets the streak). Every 6th arrow is GOLDEN
+   (5x). Flawless (no misses) pays +500. 60 seconds. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var ArcheryLogic = (function () {
+  var W = 480, H = 800;
+  var ARCHER = { x: 70, y: 640 };
+  var TARGET_X = 405;
+  var GRAV = 500, MAX_SPEED = 900, DRAG_SCALE = 4.5, MIN_DRAG = 12;
+  var WIND_MAX = 40;
+  var RINGS = [
+    { r: 14, pts: 100 },
+    { r: 26, pts: 50 },
+    { r: 38, pts: 30 },
+    { r: 50, pts: 20 },
+    { r: 62, pts: 10 }
+  ];
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function ringPoints(dist, combo, gold) {
+    for (var i = 0; i < RINGS.length; i++) {
+      if (dist <= RINGS[i].r) return RINGS[i].pts * combo * (gold ? 5 : 1);
+    }
+    return 0;
+  }
+  function ringIndex(dist) {
+    for (var i = 0; i < RINGS.length; i++) {
+      if (dist <= RINGS[i].r) return i;
+    }
+    return -1;
+  }
+  function nextArrowGold(shotSeq) { return shotSeq % 6 === 5; }
+  function newWind() { return (Math.random() * 2 - 1) * WIND_MAX; }
+  function newTargetBaseY() { return 240 + Math.random() * 320; }
+  function targetY(baseY, t) { return baseY + Math.sin(t * 0.9) * 40; }
+  function shotFromDrag(sx, sy, ex, ey) {
+    var dx = ex - sx, dy = ey - sy;
+    var len = Math.sqrt(dx * dx + dy * dy);
+    if (len < MIN_DRAG) return null;
+    var sp = Math.min(MAX_SPEED, len * DRAG_SCALE);
+    return { vx: -dx / len * sp, vy: -dy / len * sp, power: sp / MAX_SPEED };
+  }
+  // Pure flight simulation: returns the hit (ring index + point) or the miss.
+  function simulateFlight(x, y, vx, vy, wind, targetX, targetBaseY, t0) {
+    var dt = 1 / 120, t = t0;
+    for (var i = 0; i < 1200; i++) {
+      vx += wind * dt; vy += GRAV * dt;
+      x += vx * dt; y += vy * dt; t += dt;
+      var ty = targetY(targetBaseY, t);
+      // The target is a vertical face at x = targetX: the arrow scores
+      // where it crosses that plane (|dy| <= 62), not where it first
+      // clips the circle's edge on approach — otherwise a centre-aimed
+      // shot would always clip the outer ring and bullseyes would be
+      // impossible.
+      if (x >= targetX) {
+        var dy = y - ty;
+        if (Math.abs(dy) <= 62) {
+          return { hit: true, ring: ringIndex(Math.abs(dy)), x: x, y: y, t: t - t0 };
+        }
+        return { hit: false, ring: -1, x: x, y: y, t: t - t0 };
+      }
+      if (y >= 760 || x > 480 || x < 0 || y < 0) {
+        return { hit: false, ring: -1, x: x, y: y, t: t - t0 };
+      }
+    }
+    return { hit: false, ring: -1, x: x, y: y, t: t - t0 };
+  }
+  // Solve a launch velocity that lands on the target centre at time T,
+  // accounting for gravity and wind. Two passes refine the drifting target.
+  function solveShot(targetX, targetBaseY, t0, wind) {
+    var T = 0.85, ty = targetY(targetBaseY, t0 + T);
+    for (var pass = 0; pass < 2; pass++) {
+      var dx = targetX - ARCHER.x, dy = ty - ARCHER.y;
+      var vx = (dx - 0.5 * wind * T * T) / T;
+      var vy = (dy - 0.5 * GRAV * T * T) / T;
+      ty = targetY(targetBaseY, t0 + T);
+    }
+    var dx2 = targetX - ARCHER.x, dy2 = ty - ARCHER.y;
+    var vx2 = (dx2 - 0.5 * wind * T * T) / T;
+    var vy2 = (dy2 - 0.5 * GRAV * T * T) / T;
+    return { vx: vx2, vy: vy2, T: T };
+  }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, timeLeft: 60,
+      streak: 0, shots: 0, hits: 0, misses: 0, flawless: false };
+  }
+  return {
+    W: W, H: H, ARCHER: ARCHER, TARGET_X: TARGET_X, GRAV: GRAV,
+    MAX_SPEED: MAX_SPEED, DRAG_SCALE: DRAG_SCALE, MIN_DRAG: MIN_DRAG,
+    WIND_MAX: WIND_MAX, RINGS: RINGS,
+    comboForStreak: comboForStreak, ringPoints: ringPoints,
+    ringIndex: ringIndex, nextArrowGold: nextArrowGold,
+    newWind: newWind, newTargetBaseY: newTargetBaseY,
+    targetY: targetY, shotFromDrag: shotFromDrag,
+    simulateFlight: simulateFlight, solveShot: solveShot,
+    makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = ArcheryLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_archery_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_archery_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, shotSeq = 0, phase = "ready";
+  var wind = L.newWind(), targetBaseY = L.newTargetBaseY();
+  var arrow = null, shotGold = false, stuck = null;
+  var dragging = false, dragStart = null, dragCur = null, dragShot = null;
+  var particles = [], floats = [];
+  var auto = (location.search.indexOf("auto=1") !== -1), autoT = 0;
+
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_archery_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; shotSeq = 0; phase = "ready";
+    wind = L.newWind(); targetBaseY = L.newTargetBaseY();
+    arrow = null; shotGold = false; stuck = null;
+    dragging = false; dragStart = null; dragCur = null; dragShot = null;
+    particles = []; floats = []; autoT = 0;
+    window.__archeryState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame() {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.shots > 0 && S.misses === 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_archery_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__archeryState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function shootVel(vx, vy) {
+    if (S.screen !== "playing" || phase !== "ready") return 0;
+    shotGold = L.nextArrowGold(shotSeq);
+    shotSeq++; S.shots++;
+    arrow = { x: L.ARCHER.x, y: L.ARCHER.y, vx: vx, vy: vy };
+    phase = "flying"; stuck = null;
+    tone(180, 0.08, "square", 0.18, 90); buzz(15);
+    window.__archeryState = S;
+    return 1;
+  }
+  function resolveShot(hit) {
+    if (hit.hit) {
+      var combo = L.comboForStreak(S.streak);
+      var dist = Math.hypot(hit.x - L.TARGET_X, hit.y - L.targetY(targetBaseY, elapsed));
+      var pts = L.ringPoints(dist, combo, shotGold);
+      S.score += pts; S.hits++; S.streak++;
+      stuck = { x: hit.x, y: hit.y, angle: Math.atan2(arrow.vy, arrow.vx) };
+      addFloat(L.TARGET_X - 40, L.targetY(targetBaseY, elapsed) - 84,
+        "+" + pts + (hit.ring === 0 ? " BULLSEYE!" : "") + (shotGold ? " GOLD!" : ""), shotGold || hit.ring === 0);
+      burst(hit.x, hit.y, shotGold ? "#ffd75e" : "#6cf0ff", 14);
+      if (hit.ring === 0) { tone(1046, 0.1, "triangle", 0.2); tone(1568, 0.2, "triangle", 0.2); }
+      else if (shotGold) { tone(1046, 0.1, "triangle", 0.2); tone(1318, 0.16, "triangle", 0.2); }
+      else { tone(523, 0.1, "triangle", 0.2); tone(784, 0.14, "triangle", 0.2); }
+      buzz(25);
+    } else {
+      S.misses++; S.streak = 0;
+      addFloat(240, 430, hit.y >= 760 ? "INTO THE DIRT!" : "WIDE!", false);
+      tone(140, 0.3, "sawtooth", 0.2, 70); buzz(60);
+    }
+    arrow = null;
+    phase = "ready";
+    wind = L.newWind();
+    targetBaseY = L.newTargetBaseY();
+    window.__archeryState = S;
+  }
+  function physics(dt) {
+    if (phase !== "flying" || !arrow) return;
+    var sub = 8, h = dt / sub;
+    for (var s = 0; s < sub; s++) {
+      arrow.vx += wind * h; arrow.vy += L.GRAV * h;
+      arrow.x += arrow.vx * h; arrow.y += arrow.vy * h;
+      var ty = L.targetY(targetBaseY, elapsed);
+      // Score where the arrow crosses the target's vertical face plane.
+      if (arrow.x >= L.TARGET_X) {
+        var dy = arrow.y - ty;
+        if (Math.abs(dy) <= 62) {
+          resolveShot({ hit: true, ring: L.ringIndex(Math.abs(dy)), x: arrow.x, y: arrow.y });
+        } else {
+          resolveShot({ hit: false, ring: -1, x: arrow.x, y: arrow.y });
+        }
+        return;
+      }
+      if (arrow.y >= 760 || arrow.x > 480 || arrow.x < 0 || arrow.y < 0) {
+        resolveShot({ hit: false, ring: -1, x: arrow.x, y: arrow.y });
+        return;
+      }
+    }
+  }
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  function toCss(wx, wy) {
+    return { x: ox + wx * scale, y: oy + wy * scale };
+  }
+  canvas.addEventListener("pointerdown", function (e) {
+    e.preventDefault();
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    if (phase !== "ready") return;
+    dragging = true;
+    dragStart = toWorld(e); dragCur = dragStart; dragShot = null;
+  });
+  canvas.addEventListener("pointermove", function (e) {
+    if (!dragging || S.screen !== "playing" || phase !== "ready") return;
+    dragCur = toWorld(e);
+    dragShot = L.shotFromDrag(dragStart.x, dragStart.y, dragCur.x, dragCur.y);
+  });
+  function endDrag() {
+    if (!dragging) return;
+    dragging = false;
+    if (S.screen === "playing" && phase === "ready" && dragShot) {
+      shootVel(dragShot.vx, dragShot.vy);
+    }
+    dragStart = null; dragCur = null; dragShot = null;
+  }
+  canvas.addEventListener("pointerup", endDrag);
+  canvas.addEventListener("pointercancel", function () { dragging = false; dragStart = null; dragCur = null; dragShot = null; });
+  window.addEventListener("pointerup", function () { if (dragging) endDrag(); });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_archery_mute", muted ? "1" : "0"); } catch (err) {} }
+    if (S.screen === "title" || S.screen === "over") { if (e.key === " " || e.key === "Enter") { e.preventDefault(); start(); } return; }
+    if (phase !== "ready") return;
+    if (e.key === " ") { e.preventDefault(); autoShoot(); }
+  });
+  function autoShoot() {
+    var sol = L.solveShot(L.TARGET_X, targetBaseY, elapsed, wind);
+    return shootVel(sol.vx, sol.vy);
+  }
+  window.__archeryDebug = {
+    phase: function () { return phase; },
+    wind: function () { return wind; },
+    targetY: function () { return L.targetY(targetBaseY, elapsed); },
+    // A drag (in CSS px) that looses a centre-hit arrow from the current state.
+    aimDrag: function () {
+      var sol = L.solveShot(L.TARGET_X, targetBaseY, elapsed, wind);
+      var start = { x: 210, y: 520 };
+      var end = { x: start.x - sol.vx / L.DRAG_SCALE, y: start.y - sol.vy / L.DRAG_SCALE };
+      var cs = toCss(start.x, start.y), ce = toCss(end.x, end.y);
+      return { sx: cs.x, sy: cs.y, ex: ce.x, ey: ce.y, vx: sol.vx, vy: sol.vy };
+    },
+    arrow: function () { return arrow; }
+  };
+  window.__archeryState = S;
+
+  function drawTarget(ty) {
+    var cols = ["#ff5e5e", "#ffd75e", "#6cf0ff", "#7cfc66", "#ff4dd2"];
+    for (var i = L.RINGS.length - 1; i >= 0; i--) {
+      var g = ctx.createRadialGradient(L.TARGET_X, ty, 2, L.TARGET_X, ty, L.RINGS[i].r);
+      g.addColorStop(0, cols[i]); g.addColorStop(1, "#1a0f2e");
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.arc(L.TARGET_X, ty, L.RINGS[i].r, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "rgba(255,255,255,0.55)"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(L.TARGET_X, ty, L.RINGS[i].r, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(L.TARGET_X, ty, 3, 0, Math.PI * 2); ctx.fill();
+  }
+  function drawArcher() {
+    var ax = L.ARCHER.x, ay = L.ARCHER.y;
+    // archer figure
+    ctx.strokeStyle = "#6cf0ff"; ctx.lineWidth = 5; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.arc(ax, ay - 34, 9, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ax, ay - 25); ctx.lineTo(ax, ay + 6); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(ax, ay + 6); ctx.lineTo(ax - 12, ay + 30); ctx.moveTo(ax, ay + 6); ctx.lineTo(ax + 12, ay + 30); ctx.stroke();
+    // bow
+    var pull = dragging && dragShot ? dragShot.power : 0;
+    var bowX = ax + 22, bowY = ay - 14;
+    ctx.strokeStyle = shotGold ? "#ffd75e" : "#ff4dd2"; ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(bowX - 10, bowY, 26, -Math.PI / 2.4, Math.PI / 2.4); ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(bowX - 10 + Math.cos(-Math.PI / 2.4) * 26, bowY + Math.sin(-Math.PI / 2.4) * 26);
+    ctx.lineTo(bowX - 10 - pull * 26, bowY);
+    ctx.lineTo(bowX - 10 + Math.cos(Math.PI / 2.4) * 26, bowY + Math.sin(Math.PI / 2.4) * 26);
+    ctx.stroke();
+    if (phase === "ready") {
+      // nocked arrow
+      ctx.strokeStyle = shotGold ? "#ffd75e" : "#e8ecff"; ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(bowX - 10 - pull * 26, bowY);
+      ctx.lineTo(bowX + 34 - pull * 10, bowY);
+      ctx.stroke();
+    }
+  }
+  function drawArrow(x, y, angle, gold) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(angle);
+    var g = ctx.createLinearGradient(-26, 0, 10, 0);
+    g.addColorStop(0, gold ? "#ffd75e" : "#e8ecff"); g.addColorStop(1, gold ? "#fff3b0" : "#9aa4c8");
+    ctx.strokeStyle = g; ctx.lineWidth = 3; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(-26, 0); ctx.lineTo(8, 0); ctx.stroke();
+    ctx.fillStyle = gold ? "#ffd75e" : "#c8d0f0";
+    ctx.beginPath(); ctx.moveTo(8, 0); ctx.lineTo(0, -5); ctx.lineTo(0, 5); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = gold ? "#ffd75e" : "#ff4dd2"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-26, 0); ctx.lineTo(-32, -5); ctx.moveTo(-26, 0); ctx.lineTo(-32, 5); ctx.stroke();
+    ctx.restore();
+  }
+  function drawPreview() {
+    if (!dragging || !dragShot) return;
+    var x = L.ARCHER.x, y = L.ARCHER.y, vx = dragShot.vx, vy = dragShot.vy;
+    var dt = 1 / 30;
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    for (var i = 0; i < 26; i++) {
+      vx += wind * dt; vy += L.GRAV * dt;
+      x += vx * dt; y += vy * dt;
+      if (y >= 760 || x > 480 || x < 0 || y < 0) break;
+      ctx.beginPath(); ctx.arc(x, y, i % 3 === 0 ? 3.5 : 2, 0, Math.PI * 2); ctx.fill();
+      if (x >= L.TARGET_X) break;
+    }
+  }
+  function draw() {
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    // Clip all world drawing to the 480x800 rect so burst particles never
+    // streak across the desktop letterbox.
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    var bg = ctx.createLinearGradient(0, 0, 0, L.H);
+    bg.addColorStop(0, "#0b1026"); bg.addColorStop(0.6, "#131a3d"); bg.addColorStop(1, "#1d1445");
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, L.W, L.H);
+    // stars
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    for (var s = 0; s < 40; s++) {
+      var sx = (s * 137) % 480, sy = (s * 211) % 300;
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+    // ground
+    var gg = ctx.createLinearGradient(0, 700, 0, 800);
+    gg.addColorStop(0, "#12251a"); gg.addColorStop(1, "#0a1410");
+    ctx.fillStyle = gg; ctx.fillRect(0, 760, L.W, 40);
+    ctx.strokeStyle = "#2ee6a8"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(0, 760); ctx.lineTo(L.W, 760); ctx.stroke();
+    // range markers
+    ctx.strokeStyle = "rgba(108,240,255,0.25)"; ctx.lineWidth = 2;
+    for (var m = 100; m < 480; m += 100) {
+      ctx.beginPath(); ctx.moveTo(m, 760); ctx.lineTo(m, 748); ctx.stroke();
+    }
+    // wind flag
+    var wx = 30, wy = 120;
+    ctx.strokeStyle = "#e8ecff"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(wx, wy); ctx.lineTo(wx, wy + 70); ctx.stroke();
+    var dir = wind >= 0 ? 1 : -1;
+    var flagW = 14 + Math.min(34, Math.abs(wind));
+    var fg = ctx.createLinearGradient(wx, wy, wx + dir * flagW, wy);
+    fg.addColorStop(0, "#ffd75e"); fg.addColorStop(1, "#ff8c42");
+    ctx.fillStyle = fg;
+    ctx.beginPath();
+    ctx.moveTo(wx, wy);
+    ctx.lineTo(wx + dir * flagW, wy + 8);
+    ctx.lineTo(wx, wy + 16);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 16px 'Segoe UI',system-ui,sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("WIND " + (wind >= 0 ? ">" : "<") + " " + Math.abs(Math.round(wind)), wx + 4, wy + 92);
+    ctx.fillText(shotGold ? "GOLD ARROW x5!" : "ARROW " + (shotSeq + 1), wx + 4, wy + 114);
+
+    if (S.screen === "title") {
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 52px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("NEON", 240, 190);
+      ctx.fillStyle = "#ff4dd2";
+      ctx.fillText("ARCHERY", 240, 248);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Drag back to draw. Release to loose.", 240, 300);
+      ctx.fillText("Wind + gravity bend every arrow.", 240, 330);
+      ctx.fillText("Bullseye pays 100 x combo. Golden arrows pay 5x.", 240, 360);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 22px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TAP TO START", 240, 430);
+      ctx.fillStyle = "#9aa4c8"; ctx.font = "16px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("Best: " + S.best, 240, 470);
+      ctx.fillText("60 seconds  ·  M to mute", 240, 500);
+      // Title-screen target sits low (y=600) so it never overlaps the
+      // instruction lines above it.
+      drawTarget(600);
+      drawArcher();
+      ctx.restore();
+      return;
+    }
+
+    drawTarget(L.targetY(targetBaseY, elapsed));
+    drawArcher();
+    drawPreview();
+    if (arrow) drawArrow(arrow.x, arrow.y, Math.atan2(arrow.vy, arrow.vx), shotGold);
+    if (stuck) drawArrow(stuck.x, stuck.y, stuck.angle, shotGold);
+    // particles
+    for (var i = 0; i < particles.length; i++) {
+      var p = particles[i];
+      ctx.globalAlpha = Math.max(0, 1 - p.t / 0.7);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // floats
+    ctx.textAlign = "center";
+    for (var j = 0; j < floats.length; j++) {
+      var f = floats[j];
+      ctx.globalAlpha = Math.max(0, 1 - f.t / 1.1);
+      ctx.fillStyle = f.golden ? "#ffd75e" : "#e8ecff";
+      ctx.font = "bold 24px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(f.text, f.x, f.y - f.t * 40);
+    }
+    ctx.globalAlpha = 1;
+    // HUD
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 26px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("SCORE " + S.score, 16, 44);
+    ctx.font = "bold 18px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#ffd75e";
+    ctx.fillText("COMBO x" + L.comboForStreak(S.streak) + "  ·  STREAK " + S.streak, 16, 72);
+    ctx.fillStyle = "#e8ecff";
+    ctx.textAlign = "right";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", 464, 44);
+    ctx.font = "16px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#9aa4c8";
+    ctx.fillText("BEST " + S.best + "  ·  HITS " + S.hits, 464, 72);
+    ctx.fillText("ARROWS " + S.shots + "  ·  MISS " + S.misses, 464, 96);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "rgba(232,236,255,0.55)"; ctx.font = "15px 'Segoe UI',system-ui,sans-serif";
+    if (phase === "ready") ctx.fillText("Drag back anywhere — release to loose", 240, 736);
+
+    if (S.screen === "over") {
+      ctx.fillStyle = "rgba(7,5,18,0.82)"; ctx.fillRect(0, 0, L.W, L.H);
+      ctx.fillStyle = "#6cf0ff"; ctx.font = "bold 44px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TIME'S UP!", 240, 300);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "bold 30px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("SCORE " + S.score, 240, 360);
+      ctx.fillStyle = "#ffd75e"; ctx.font = "22px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(S.flawless ? "FLAWLESS! +500 BONUS" : "HITS " + S.hits + "  ·  BEST " + S.best, 240, 400);
+      ctx.fillStyle = "#e8ecff"; ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("TAP TO PLAY AGAIN", 240, 460);
+    }
+    ctx.restore();
+  }
+
+  var last = 0;
+  function frame(ts) {
+    var dt = Math.min(0.05, (ts - last) / 1000 || 0.016);
+    last = ts;
+    if (S.screen === "playing") {
+      elapsed += dt;
+      S.timeLeft = Math.max(0, 60 - elapsed);
+      physics(dt);
+      for (var i = particles.length - 1; i >= 0; i--) {
+        var p = particles[i]; p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt;
+        if (p.t > 0.7) particles.splice(i, 1);
+      }
+      for (var j = floats.length - 1; j >= 0; j--) {
+        floats[j].t += dt;
+        if (floats[j].t > 1.1) floats.splice(j, 1);
+      }
+      if (auto && phase === "ready") {
+        autoT += dt;
+        if (autoT > 0.9) { autoT = 0; autoShoot(); }
+      }
+      if (S.timeLeft <= 0) endGame();
+    }
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
