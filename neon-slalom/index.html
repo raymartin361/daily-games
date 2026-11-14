@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Slalom — Day 50</title>
+<meta name="description" content="Neon Slalom — 60 seconds of neon ski-slalom chaos. Drag to carve through the glowing gates, dodge the trees, grab stars — chain 4 gates to raise your combo to x5, golden gates pay 5x. How clean can you carve?">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Slalom — Day 50. A neon downhill ski slalom: drag (or arrow keys)
+   to carve left and right down the slope. Thread the glowing gates for
+   100 x combo; chain 4 consecutive gates to raise the combo x1->x5.
+   Every 8th gate is GOLDEN (5x). Stars pay 50 x combo. Trees and rocks
+   cost a heart (3 hearts). Flawless (no crashes) pays +500. 60 seconds. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var SlalomLogic = (function () {
+  var W = 480, H = 800;
+  var SKIER_Y = 620, SKIER_R = 16;
+  var GATE_HW = 55, GATE_SPACING = 265;
+  var MAX_HEARTS = 3, GAME_TIME = 60;
+  var BASE_SPEED = 250, SPEED_RAMP = 6.5, MAX_SPEED = 540;
+  var LATERAL_SPEED = 430;
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function gatePoints(combo, gold) { return 100 * combo * (gold ? 5 : 1); }
+  function starPoints(combo) { return 50 * combo; }
+  function nextGateGold(gateSeq) { return gateSeq % 8 === 7; }
+  function speedAt(t) {
+    var s = BASE_SPEED + SPEED_RAMP * t;
+    return s > MAX_SPEED ? MAX_SPEED : s;
+  }
+  function newGate(rng) {
+    var r = rng || Math.random;
+    return { cx: 80 + r() * 320, hw: GATE_HW, y: -50, gold: false, resolved: false };
+  }
+  function newTree(rng) {
+    var r = rng || Math.random;
+    return { x: 30 + r() * 420, y: -50, r: 15 + r() * 6, kind: r() < 0.7 ? "tree" : "rock" };
+  }
+  function newStar(rng) {
+    var r = rng || Math.random;
+    return { x: 40 + r() * 400, y: -50, r: 12 };
+  }
+  function gatePassed(skierX, gate) {
+    return Math.abs(skierX - gate.cx) <= gate.hw;
+  }
+  function treeHit(skierX, tree) {
+    return Math.abs(skierX - tree.x) < SKIER_R + tree.r - 4;
+  }
+  function starHit(skierX, skierY, star) {
+    var dx = skierX - star.x, dy = skierY - star.y;
+    return dx * dx + dy * dy < (SKIER_R + star.r + 4) * (SKIER_R + star.r + 4);
+  }
+  function steerToward(x, target, dt) {
+    var diff = target - x;
+    var maxStep = LATERAL_SPEED * dt;
+    if (Math.abs(diff) <= maxStep) return target;
+    return x + (diff > 0 ? maxStep : -maxStep);
+  }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, timeLeft: GAME_TIME,
+      streak: 0, gates: 0, misses: 0, crashes: 0, stars: 0,
+      hearts: MAX_HEARTS, flawless: false };
+  }
+  return { W: W, H: H, SKIER_Y: SKIER_Y, SKIER_R: SKIER_R,
+    GATE_HW: GATE_HW, GATE_SPACING: GATE_SPACING,
+    MAX_HEARTS: MAX_HEARTS, GAME_TIME: GAME_TIME,
+    BASE_SPEED: BASE_SPEED, SPEED_RAMP: SPEED_RAMP, MAX_SPEED: MAX_SPEED,
+    LATERAL_SPEED: LATERAL_SPEED,
+    comboForStreak: comboForStreak, gatePoints: gatePoints,
+    starPoints: starPoints, nextGateGold: nextGateGold,
+    speedAt: speedAt, newGate: newGate, newTree: newTree, newStar: newStar,
+    gatePassed: gatePassed, treeHit: treeHit, starHit: starHit,
+    steerToward: steerToward, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = SlalomLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_slalom_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_slalom_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, gateSeq = 0, phase = "title";
+  var skier = { x: 240, lean: 0 };
+  var targetX = 240, dragging = false;
+  var keys = { left: false, right: false };
+  var gates = [], trees = [], stars = [], flakes = [];
+  var particles = [], floats = [];
+  var distSinceGate = 0, distSinceTree = 0, distSinceStar = 0;
+  var invuln = 0, autoT = 0;
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  for (var i = 0; i < 70; i++) {
+    flakes.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 1 + Math.random() * 2.5, v: 20 + Math.random() * 40 });
+  }
+
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_slalom_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; gateSeq = 0; phase = "playing";
+    skier = { x: 240, lean: 0 }; targetX = 240; dragging = false;
+    keys = { left: false, right: false };
+    gates = []; trees = []; stars = [];
+    particles = []; floats = [];
+    distSinceGate = 0; distSinceTree = 0; distSinceStar = 0;
+    invuln = 0; autoT = 0;
+    spawnGate(true); spawnTree(true); spawnStar(true);
+    window.__slalomState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(wipedOut) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.crashes === 0 && S.gates > 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_slalom_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__slalomState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function spawnGate(first) {
+    var g = L.newGate();
+    g.gold = L.nextGateGold(gateSeq);
+    gateSeq++;
+    g.y = first ? -50 : -50;
+    gates.push(g);
+  }
+  function spawnTree(first) { trees.push(L.newTree()); }
+  function spawnStar(first) { stars.push(L.newStar()); }
+
+  function resolveGate(g) {
+    g.resolved = true;
+    if (L.gatePassed(skier.x, g)) {
+      var combo = L.comboForStreak(S.streak);
+      var pts = L.gatePoints(combo, g.gold);
+      S.score += pts; S.gates++; S.streak++;
+      addFloat(g.cx, L.SKIER_Y - 70, "+" + pts + (g.gold ? " GOLD!" : ""), g.gold);
+      burst(g.cx, L.SKIER_Y, g.gold ? "#ffd75e" : "#6cf0ff", 12);
+      tone(g.gold ? 1046 : 523, 0.1, "triangle", 0.2);
+      tone(g.gold ? 1568 : 784, 0.14, "triangle", 0.2);
+      buzz(20);
+    } else {
+      S.misses++; S.streak = 0;
+      addFloat(240, L.SKIER_Y - 90, "MISSED GATE!", false);
+      tone(140, 0.25, "sawtooth", 0.18, 70);
+    }
+    window.__slalomState = S;
+  }
+  function crash(t) {
+    S.hearts--; S.crashes++; S.streak = 0;
+    invuln = 1.2;
+    burst(skier.x, L.SKIER_Y, "#ff5e7a", 18);
+    addFloat(skier.x, L.SKIER_Y - 60, "CRASH!", false);
+    tone(120, 0.35, "sawtooth", 0.22, 60); buzz(90);
+    window.__slalomState = S;
+    if (S.hearts <= 0) endGame(true);
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    var cx = (e.clientX - r.left) / (r.width / vw);
+    var wx = (cx - ox) / scale;
+    return wx;
+  }
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    dragging = true;
+    targetX = Math.max(24, Math.min(L.W - 24, toWorld(e)));
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging || S.screen !== "playing") return;
+    targetX = Math.max(24, Math.min(L.W - 24, toWorld(e)));
+    e.preventDefault();
+  }
+  function onUp() { dragging = false; }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", onUp);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowLeft") keys.left = true;
+    if (e.key === "ArrowRight") keys.right = true;
+    if ((e.key === " " || e.key === "Enter") && (S.screen === "title" || S.screen === "over")) start();
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_slalom_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+  window.addEventListener("keyup", function (e) {
+    if (e.key === "ArrowLeft") keys.left = false;
+    if (e.key === "ArrowRight") keys.right = false;
+  });
+
+  function autoSteer() {
+    // Aim at the nearest unresolved gate, dodging trees near the line.
+    var g = null;
+    for (var i = 0; i < gates.length; i++) {
+      if (!gates[i].resolved && gates[i].y < L.SKIER_Y) { g = gates[i]; break; }
+    }
+    var t = g ? g.cx : 240;
+    for (var j = 0; j < trees.length; j++) {
+      var tr = trees[j];
+      if (tr.y > L.SKIER_Y - 300 && tr.y < L.SKIER_Y && Math.abs(tr.x - t) < 55) {
+        t = tr.x < t ? t + 85 : t - 85;
+      }
+    }
+    targetX = Math.max(24, Math.min(L.W - 24, t));
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    if (invuln > 0) invuln -= dt;
+    if (keys.left) targetX -= L.LATERAL_SPEED * dt;
+    if (keys.right) targetX += L.LATERAL_SPEED * dt;
+    targetX = Math.max(24, Math.min(L.W - 24, targetX));
+    if (auto) { autoT += dt; if (autoT > 0.12) { autoSteer(); autoT = 0; } }
+    var prevX = skier.x;
+    skier.x = L.steerToward(skier.x, targetX, dt);
+    skier.lean = (skier.x - prevX) / Math.max(dt, 0.001) / L.LATERAL_SPEED;
+
+    var speed = L.speedAt(elapsed);
+    var dy = speed * dt;
+    distSinceGate += dy; distSinceTree += dy; distSinceStar += dy;
+    if (distSinceGate >= L.GATE_SPACING) { spawnGate(false); distSinceGate = 0; }
+    if (distSinceTree >= 190) { if (Math.random() < 0.75) spawnTree(false); distSinceTree = 0; }
+    if (distSinceStar >= 320) { if (Math.random() < 0.8) spawnStar(false); distSinceStar = 0; }
+
+    var i, g, tr, st;
+    for (i = 0; i < gates.length; i++) {
+      g = gates[i]; g.y += dy;
+      if (!g.resolved && g.y >= L.SKIER_Y) resolveGate(g);
+    }
+    gates = gates.filter(function (gg) { return gg.y < L.H + 80; });
+    for (i = 0; i < trees.length; i++) {
+      tr = trees[i]; tr.y += dy;
+      if (invuln <= 0 && Math.abs(tr.y - L.SKIER_Y) < 30 && L.treeHit(skier.x, tr)) {
+        crash(tr); trees.splice(i, 1); i--;
+        if (S.screen !== "playing") return;
+      }
+    }
+    trees = trees.filter(function (tt) { return tt.y < L.H + 80; });
+    for (i = 0; i < stars.length; i++) {
+      st = stars[i]; st.y += dy;
+      if (L.starHit(skier.x, L.SKIER_Y, st)) {
+        var combo = L.comboForStreak(S.streak);
+        var pts = L.starPoints(combo);
+        S.score += pts; S.stars++;
+        addFloat(st.x, st.y - 20, "+" + pts, false);
+        burst(st.x, st.y, "#ffe066", 8);
+        tone(880, 0.08, "sine", 0.15, 1320);
+        stars.splice(i, 1); i--;
+        window.__slalomState = S;
+      }
+    }
+    stars = stars.filter(function (ss) { return ss.y < L.H + 80; });
+    for (i = 0; i < flakes.length; i++) {
+      flakes[i].y += (flakes[i].v + speed * 0.35) * dt;
+      if (flakes[i].y > L.H) { flakes[i].y = -4; flakes[i].x = Math.random() * L.W; }
+    }
+    for (i = particles.length - 1; i >= 0; i--) {
+      var p = particles[i];
+      p.x += p.vx * dt; p.y += p.vy * dt; p.t += dt;
+      if (p.t > 0.6) particles.splice(i, 1);
+    }
+    for (i = floats.length - 1; i >= 0; i--) {
+      floats[i].y -= 40 * dt; floats[i].t += dt;
+      if (floats[i].t > 0.9) floats.splice(i, 1);
+    }
+  }
+
+  function drawGate(g) {
+    var col = g.gold ? "#ffd75e" : "#6cf0ff";
+    ctx.strokeStyle = col; ctx.lineWidth = 3;
+    ctx.shadowColor = col; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.moveTo(g.cx - g.hw, g.y - 26); ctx.lineTo(g.cx - g.hw, g.y + 26);
+    ctx.moveTo(g.cx + g.hw, g.y - 26); ctx.lineTo(g.cx + g.hw, g.y + 26);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(g.cx - g.hw, g.y); ctx.lineTo(g.cx + g.hw, g.y);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(g.cx - g.hw, g.y - 26); ctx.lineTo(g.cx - g.hw + 16, g.y - 19); ctx.lineTo(g.cx - g.hw, g.y - 12); ctx.closePath();
+    ctx.moveTo(g.cx + g.hw, g.y - 26); ctx.lineTo(g.cx + g.hw - 16, g.y - 19); ctx.lineTo(g.cx + g.hw, g.y - 12); ctx.closePath();
+    ctx.fill();
+  }
+  function drawTree(tr) {
+    if (tr.kind === "rock") {
+      ctx.fillStyle = "#8a93b8"; ctx.strokeStyle = "#c7cdea"; ctx.lineWidth = 2;
+      ctx.shadowColor = "#8a93b8"; ctx.shadowBlur = 8;
+      ctx.beginPath();
+      ctx.moveTo(tr.x - tr.r, tr.y + tr.r * 0.7);
+      ctx.lineTo(tr.x - tr.r * 0.5, tr.y - tr.r);
+      ctx.lineTo(tr.x + tr.r * 0.6, tr.y - tr.r * 0.8);
+      ctx.lineTo(tr.x + tr.r, tr.y + tr.r * 0.7);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    } else {
+      ctx.fillStyle = "#2ee6a8"; ctx.strokeStyle = "#7dffd4"; ctx.lineWidth = 2;
+      ctx.shadowColor = "#2ee6a8"; ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.moveTo(tr.x, tr.y - tr.r - 10);
+      ctx.lineTo(tr.x - tr.r, tr.y + tr.r * 0.6);
+      ctx.lineTo(tr.x + tr.r, tr.y + tr.r * 0.6);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = "#5a3a1e";
+      ctx.fillRect(tr.x - 3, tr.y + tr.r * 0.6, 6, 10);
+    }
+    ctx.shadowBlur = 0;
+  }
+  function drawStar(st) {
+    ctx.fillStyle = "#ffe066"; ctx.strokeStyle = "#fff3b0"; ctx.lineWidth = 2;
+    ctx.shadowColor = "#ffe066"; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.moveTo(st.x, st.y - 14);
+    ctx.quadraticCurveTo(st.x, st.y, st.x + 14, st.y);
+    ctx.quadraticCurveTo(st.x, st.y, st.x, st.y + 14);
+    ctx.quadraticCurveTo(st.x, st.y, st.x - 14, st.y);
+    ctx.quadraticCurveTo(st.x, st.y, st.x, st.y - 14);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  function drawSkier() {
+    var x = skier.x, y = L.SKIER_Y;
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(skier.lean * 0.35);
+    if (invuln > 0 && Math.floor(elapsed * 12) % 2 === 0) ctx.globalAlpha = 0.35;
+    // skis
+    ctx.strokeStyle = "#ff8cd1"; ctx.lineWidth = 4; ctx.lineCap = "round";
+    ctx.shadowColor = "#ff8cd1"; ctx.shadowBlur = 8;
+    ctx.beginPath(); ctx.moveTo(-16, 14); ctx.lineTo(10, 18); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-8, 16); ctx.lineTo(16, 20); ctx.stroke();
+    // body
+    ctx.strokeStyle = "#6cf0ff"; ctx.lineWidth = 7;
+    ctx.beginPath(); ctx.moveTo(0, -6); ctx.lineTo(-2, 10); ctx.stroke();
+    // arms + poles
+    ctx.strokeStyle = "#b18cff"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(-14, 8); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, -2); ctx.lineTo(14, 8); ctx.stroke();
+    // head
+    ctx.fillStyle = "#ffe066";
+    ctx.beginPath(); ctx.arc(0, -16, 8, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  function drawHUD() {
+    ctx.fillStyle = "rgba(7,5,18,0.88)";
+    ctx.fillRect(0, 0, L.W, 54);
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText("SCORE " + S.score, 14, 18);
+    ctx.fillText("BEST " + S.best, 14, 42);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffd75e";
+    ctx.fillText("TIME " + Math.ceil(S.timeLeft) + "s", 240, 18);
+    var combo = L.comboForStreak(S.streak);
+    ctx.fillStyle = combo >= 3 ? "#ff8cd1" : "#aab4e8";
+    ctx.fillText("COMBO x" + combo + (S.streak > 0 ? " (" + S.streak + ")" : ""), 240, 42);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ff5e7a";
+    var hearts = "";
+    for (var i = 0; i < L.MAX_HEARTS; i++) hearts += i < S.hearts ? "♥" : "♡";
+    ctx.fillText(hearts, 466, 18);
+    ctx.fillStyle = "#aab4e8";
+    ctx.fillText("GATES " + S.gates, 466, 42);
+  }
+  function drawTitle() {
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 52px 'Segoe UI',system-ui,sans-serif";
+    ctx.shadowColor = "#6cf0ff"; ctx.shadowBlur = 18;
+    ctx.fillText("NEON", 240, 190);
+    ctx.fillText("SLALOM", 240, 248);
+    ctx.shadowBlur = 0;
+    ctx.font = "16px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#aab4e8";
+    ctx.fillText("60 seconds of downhill slalom chaos!", 240, 310);
+    ctx.fillText("Drag (or ← →) to carve through the gates.", 240, 338);
+    ctx.fillText("Gates pay 100 x combo — chain 4 to raise it to x5.", 240, 366);
+    ctx.fillText("Golden gates pay 5x. Stars pay 50 x combo.", 240, 394);
+    ctx.fillText("Trees and rocks cost a heart. You have 3.", 240, 422);
+    ctx.fillStyle = "#ffd75e"; ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(S.best > 0 ? "BEST " + S.best + " — TAP TO PLAY" : "TAP TO PLAY", 240, 480);
+    ctx.fillStyle = "#7780b8"; ctx.font = "14px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("M mute · Day 50", 240, 520);
+    // demo slope: a gate + skier at rest
+    drawGate({ cx: 240, hw: 55, y: 620, gold: false });
+    drawSkier();
+  }
+  function drawOver() {
+    ctx.fillStyle = "rgba(7,5,18,0.72)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 44px 'Segoe UI',system-ui,sans-serif";
+    ctx.shadowColor = "#ff8cd1"; ctx.shadowBlur = 16;
+    ctx.fillText(S.hearts <= 0 ? "WIPED OUT!" : "TIME'S UP!", 240, 260);
+    ctx.shadowBlur = 0;
+    ctx.font = "bold 30px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#ffd75e";
+    ctx.fillText("SCORE " + S.score, 240, 330);
+    ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#aab4e8";
+    ctx.fillText("Gates " + S.gates + " · Stars " + S.stars + " · Crashes " + S.crashes, 240, 372);
+    if (S.flawless) { ctx.fillStyle = "#2ee6a8"; ctx.fillText("FLAWLESS +500 — no crashes!", 240, 404); }
+    ctx.fillStyle = "#e8ecff";
+    ctx.fillText("BEST " + S.best, 240, 436);
+    ctx.fillStyle = "#ffd75e"; ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("TAP TO PLAY AGAIN", 240, 500);
+  }
+  function render() {
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    var bg = ctx.createLinearGradient(0, 0, 0, L.H);
+    bg.addColorStop(0, "#0b1030");
+    bg.addColorStop(0.6, "#131a4a");
+    bg.addColorStop(1, "#1c1440");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    // slope edge chevrons scrolling with speed
+    ctx.strokeStyle = "rgba(108,240,255,0.14)"; ctx.lineWidth = 3;
+    var off = (elapsed * L.speedAt(elapsed)) % 120;
+    for (var y = -120 + off; y < L.H + 120; y += 120) {
+      ctx.beginPath();
+      ctx.moveTo(28, y); ctx.lineTo(58, y + 34); ctx.lineTo(28, y + 68); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(452, y); ctx.lineTo(422, y + 34); ctx.lineTo(452, y + 68); ctx.stroke();
+    }
+    // snowflakes
+    ctx.fillStyle = "rgba(232,236,255,0.75)";
+    for (var i = 0; i < flakes.length; i++) {
+      ctx.beginPath(); ctx.arc(flakes[i].x, flakes[i].y, flakes[i].s, 0, Math.PI * 2); ctx.fill();
+    }
+    var j;
+    for (j = 0; j < stars.length; j++) drawStar(stars[j]);
+    for (j = 0; j < gates.length; j++) drawGate(gates[j]);
+    for (j = 0; j < trees.length; j++) drawTree(trees[j]);
+    if (S.screen === "playing" || S.screen === "over") drawSkier();
+    // particles
+    for (j = 0; j < particles.length; j++) {
+      var p = particles[j];
+      ctx.globalAlpha = Math.max(0, 1 - p.t / 0.6);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // floats
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (j = 0; j < floats.length; j++) {
+      var f = floats[j];
+      ctx.globalAlpha = Math.max(0, 1 - f.t / 0.9);
+      ctx.fillStyle = f.golden ? "#ffd75e" : "#e8ecff";
+      ctx.font = "bold 22px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(f.text, f.x, f.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    if (S.screen === "playing" || S.screen === "over") drawHUD();
+  }
+
+  window.__slalomState = S;
+  window.__slalomDebug = {
+    phase: function () { return phase; },
+    skierX: function () { return skier.x; },
+    targetX: function () { return targetX; },
+    nextGate: function () {
+      for (var i = 0; i < gates.length; i++) if (!gates[i].resolved) return gates[i];
+      return null;
+    },
+    aimAtGate: function () {
+      var g = null;
+      for (var i = 0; i < gates.length; i++) if (!gates[i].resolved) { g = gates[i]; break; }
+      if (g) { targetX = g.cx; return { cx: g.cx, y: g.y }; }
+      return null;
+    },
+    start: function () { start(); }
+  };
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
