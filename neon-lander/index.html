@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Lander — Day 51</title>
+<meta name="description" content="Neon Lander — 60 seconds of neon lunar-lander chaos. Hold to fire the thruster, drag to tilt — land gently on the glowing pads. Soft landings pay 100 x combo, chain 4 to raise it to x5, golden pads pay 5x. How smooth can you touch down?">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Lander — Day 51. A neon lunar lander: gravity pulls you down,
+   hold to fire the main thruster, drag (or arrow keys) to tilt and steer.
+   Land gently on a glowing pad: vertical speed <= 60, relative horizontal
+   speed <= 40, tilt <= 0.22 rad. Soft landings pay 100 x combo; chain 4
+   consecutive soft landings to raise the combo x1->x5. Every 6th pad is
+   GOLDEN (5x). Stars pay 50 x combo. Crashes cost a heart (3 hearts).
+   Fuel drains while thrusting and refills on landing. Flawless +500. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var LanderLogic = (function () {
+  var W = 480, H = 800;
+  var GROUND_Y = 740, LANDER_R = 14;
+  var MAX_HEARTS = 3, GAME_TIME = 60;
+  var BASE_GRAVITY = 80, GRAVITY_RAMP = 0.5, MAX_GRAVITY = 110;
+  var THRUST = 150, TILT_MAX = 0.45, TILT_RATE = 3.0;
+  var MAX_VY = 260, FUEL_MAX = 120, FUEL_DRAIN = 18;
+  var SAFE_VY = 60, SAFE_VX = 40, SAFE_TILT = 0.22;
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function padPoints(combo, gold) { return 100 * combo * (gold ? 5 : 1); }
+  function starPoints(combo) { return 50 * combo; }
+  function nextPadGold(padSeq) { return padSeq % 6 === 5; }
+  function gravityAt(t) {
+    var g = BASE_GRAVITY + GRAVITY_RAMP * t;
+    return g > MAX_GRAVITY ? MAX_GRAVITY : g;
+  }
+  function padWidthAt(t) {
+    var hw = 46 - Math.min(16, t * 0.25);
+    return hw;
+  }
+  function padSpeedAt(t) {
+    var s = Math.min(40, t * 0.7);
+    return s;
+  }
+  function newPad(rng, t) {
+    var r = rng || Math.random;
+    var hw = padWidthAt(t || 0);
+    var sp = padSpeedAt(t || 0);
+    return { cx: 90 + r() * 300, hw: hw, y: GROUND_Y,
+      vx: (r() < 0.5 ? -1 : 1) * (sp * (0.5 + r() * 0.5)), gold: false };
+  }
+  function newStar(rng) {
+    var r = rng || Math.random;
+    return { x: 40 + r() * 400, y: 220 + r() * 380, r: 12, taken: false };
+  }
+  // Landing verdict: vy (down positive), vx relative to pad motion, tilt.
+  function landVerdict(vy, vxRel, tilt) {
+    if (vy > SAFE_VY) return "hard";
+    if (Math.abs(vxRel) > SAFE_VX) return "slide";
+    if (Math.abs(tilt) > SAFE_TILT) return "tilt";
+    return "ok";
+  }
+  function starHit(lx, ly, star) {
+    var dx = lx - star.x, dy = ly - star.y;
+    var rr = LANDER_R + star.r + 4;
+    return dx * dx + dy * dy < rr * rr;
+  }
+  function clampTilt(tilt, target, dt) {
+    var diff = target - tilt;
+    var step = TILT_RATE * dt;
+    if (Math.abs(diff) <= step) return target;
+    return tilt + (diff > 0 ? step : -step);
+  }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, timeLeft: GAME_TIME,
+      streak: 0, landings: 0, crashes: 0, stars: 0,
+      hearts: MAX_HEARTS, flawless: false, fuel: FUEL_MAX };
+  }
+  return { W: W, H: H, GROUND_Y: GROUND_Y, LANDER_R: LANDER_R,
+    MAX_HEARTS: MAX_HEARTS, GAME_TIME: GAME_TIME,
+    BASE_GRAVITY: BASE_GRAVITY, GRAVITY_RAMP: GRAVITY_RAMP, MAX_GRAVITY: MAX_GRAVITY,
+    THRUST: THRUST, TILT_MAX: TILT_MAX, TILT_RATE: TILT_RATE,
+    MAX_VY: MAX_VY, FUEL_MAX: FUEL_MAX, FUEL_DRAIN: FUEL_DRAIN,
+    SAFE_VY: SAFE_VY, SAFE_VX: SAFE_VX, SAFE_TILT: SAFE_TILT,
+    comboForStreak: comboForStreak, padPoints: padPoints,
+    starPoints: starPoints, nextPadGold: nextPadGold,
+    gravityAt: gravityAt, padWidthAt: padWidthAt, padSpeedAt: padSpeedAt,
+    newPad: newPad, newStar: newStar, landVerdict: landVerdict,
+    starHit: starHit, clampTilt: clampTilt, makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = LanderLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_lander_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_lander_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, padSeq = 0, phase = "title";
+  var ship = { x: 240, y: 120, vx: 0, vy: 0, tilt: 0 };
+  var thrusting = false, tiltTarget = 0;
+  var keys = { left: false, right: false, up: false };
+  var pad = null, stars = [], particles = [], floats = [], bgStars = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  var autoT = 0, thrustNoise = 0;
+  for (var i = 0; i < 90; i++) {
+    bgStars.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 0.6 + Math.random() * 1.8, tw: Math.random() * Math.PI * 2 });
+  }
+  // Demo pad for the title screen (replaced by spawnDescent on start).
+  pad = L.newPad(null, 0);
+  pad.cx = 240; pad.vx = 0; pad.gold = false;
+
+  function spawnDescent() {
+    pad = L.newPad(null, elapsed);
+    pad.gold = L.nextPadGold(padSeq);
+    padSeq++;
+    ship = { x: 60 + Math.random() * 360, y: 110, vx: 0, vy: 0, tilt: 0 };
+    S.fuel = L.FUEL_MAX;
+    stars = [];
+    var n = 1 + (Math.random() < 0.5 ? 1 : 0);
+    for (var i = 0; i < n; i++) stars.push(L.newStar());
+    thrusting = false; tiltTarget = 0;
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_lander_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; padSeq = 0; phase = "playing";
+    particles = []; floats = [];
+    autoT = 0;
+    spawnDescent();
+    window.__landerState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(crashedOut) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.crashes === 0 && S.landings > 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_lander_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__landerState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function land() {
+    var verdict = L.landVerdict(ship.vy, ship.vx - pad.vx, ship.tilt);
+    window.__landerLastEvent = { type: "land-attempt", verdict: verdict,
+      vy: Math.round(ship.vy), vxRel: Math.round(ship.vx - pad.vx),
+      tilt: +ship.tilt.toFixed(2), padVx: Math.round(pad.vx) };
+    if (verdict === "ok") {
+      var combo = L.comboForStreak(S.streak);
+      var pts = L.padPoints(combo, pad.gold);
+      S.score += pts; S.landings++; S.streak++;
+      addFloat(pad.cx, L.GROUND_Y - 60, "+" + pts + (pad.gold ? " GOLD!" : ""), pad.gold);
+      burst(ship.x, L.GROUND_Y, pad.gold ? "#ffd75e" : "#2ee6a8", 14);
+      tone(pad.gold ? 1046 : 523, 0.1, "triangle", 0.2);
+      tone(pad.gold ? 1568 : 784, 0.14, "triangle", 0.2);
+      buzz(20);
+      window.__landerState = S;
+      spawnDescent();
+    } else {
+      crash(verdict);
+    }
+  }
+  function crash(reason) {
+    S.hearts--; S.crashes++; S.streak = 0;
+    window.__landerLastEvent = { type: "crash", reason: reason,
+      vy: Math.round(ship.vy), vxRel: pad ? Math.round(ship.vx - pad.vx) : null,
+      tilt: +ship.tilt.toFixed(2), x: Math.round(ship.x),
+      padCx: pad ? Math.round(pad.cx) : null };
+    burst(ship.x, ship.y, "#ff5e7a", 22);
+    var msg = reason === "hard" ? "TOO FAST!" : reason === "slide" ? "TOO MUCH DRIFT!" : reason === "tilt" ? "TOO TILTED!" : "ROUGH TERRAIN!";
+    addFloat(ship.x, ship.y - 50, msg + " CRASH!", false);
+    tone(120, 0.35, "sawtooth", 0.22, 60); buzz(90);
+    window.__landerState = S;
+    if (S.hearts <= 0) { endGame(true); return; }
+    spawnDescent();
+  }
+
+  function toWorldX(clientX) {
+    var r = canvas.getBoundingClientRect();
+    var cx = (clientX - r.left) / (r.width / vw);
+    return (cx - ox) / scale;
+  }
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    thrusting = true;
+    tiltTarget = Math.max(-L.TILT_MAX, Math.min(L.TILT_MAX, (toWorldX(e.clientX) - ship.x) / 150 * L.TILT_MAX));
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!thrusting || S.screen !== "playing") return;
+    tiltTarget = Math.max(-L.TILT_MAX, Math.min(L.TILT_MAX, (toWorldX(e.clientX) - ship.x) / 150 * L.TILT_MAX));
+    e.preventDefault();
+  }
+  function onUp() { thrusting = false; }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", onUp);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowLeft") keys.left = true;
+    if (e.key === "ArrowRight") keys.right = true;
+    if (e.key === "ArrowUp" || e.key === " ") { keys.up = true; e.preventDefault(); }
+    if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_lander_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+  window.addEventListener("keyup", function (e) {
+    if (e.key === "ArrowLeft") keys.left = false;
+    if (e.key === "ArrowRight") keys.right = false;
+    if (e.key === "ArrowUp" || e.key === " ") keys.up = false;
+  });
+
+  function autoPilot(dt) {
+    // PD controller: desired horizontal speed chases the pad (plus its own
+    // drift), tilt chases the velocity error. Damped at every altitude so
+    // the ship never builds the runaway lateral speed a pure P tilt gives.
+    if (!pad) return;
+    var dx = pad.cx - ship.x;
+    var vxDes = Math.max(-90, Math.min(90, dx * 0.6 + pad.vx));
+    tiltTarget = Math.max(-L.TILT_MAX, Math.min(L.TILT_MAX, (vxDes - ship.vx) * 0.008));
+    var targetVy = ship.y > L.GROUND_Y - 120 ? 45 : 70;
+    thrusting = ship.vy > targetVy && S.fuel > 5;
+    // If nearly out of fuel and still high, save the last drops for the flare.
+    if (S.fuel <= 5 && ship.y < L.GROUND_Y - 200) thrusting = false;
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    if (auto) { autoT += dt; if (autoT > 0.08) { autoPilot(dt); autoT = 0; } }
+    if (keys.left) tiltTarget = -L.TILT_MAX;
+    if (keys.right) tiltTarget = L.TILT_MAX;
+    if (keys.up) thrusting = true;
+    else if (!keys.left && !keys.right && !auto) { /* pointer controls thrusting */ }
+    if (keys.up === false && !auto && !dragPointerDown) thrusting = false;
+
+    ship.tilt = L.clampTilt(ship.tilt, tiltTarget, dt);
+    var g = L.gravityAt(elapsed);
+    ship.vy += g * dt;
+    if (thrusting && S.fuel > 0) {
+      var ax = Math.sin(ship.tilt) * L.THRUST;
+      var ay = -Math.cos(ship.tilt) * L.THRUST;
+      ship.vx += ax * dt;
+      ship.vy += ay * dt;
+      S.fuel = Math.max(0, S.fuel - L.FUEL_DRAIN * dt);
+      thrustNoise += dt;
+      if (Math.random() < 0.6) {
+        particles.push({ x: ship.x - Math.sin(ship.tilt) * 16, y: ship.y + Math.cos(ship.tilt) * 16,
+          vx: -Math.sin(ship.tilt) * 40 + (Math.random() - 0.5) * 30,
+          vy: Math.cos(ship.tilt) * 120 + Math.random() * 40, t: 0, color: "#ffb347" });
+      }
+    }
+    if (ship.vy > L.MAX_VY) ship.vy = L.MAX_VY;
+    ship.x += ship.vx * dt;
+    ship.y += ship.vy * dt;
+    if (ship.x < 20) { ship.x = 20; ship.vx = Math.abs(ship.vx) * 0.3; }
+    if (ship.x > L.W - 20) { ship.x = L.W - 20; ship.vx = -Math.abs(ship.vx) * 0.3; }
+    if (ship.y < 60) { ship.y = 60; if (ship.vy < 0) ship.vy = 0; }
+
+    // Pad drift
+    if (pad) {
+      pad.cx += pad.vx * dt;
+      if (pad.cx - pad.hw < 10) { pad.cx = 10 + pad.hw; pad.vx = Math.abs(pad.vx); }
+      if (pad.cx + pad.hw > L.W - 10) { pad.cx = L.W - 10 - pad.hw; pad.vx = -Math.abs(pad.vx); }
+    }
+    // Stars
+    for (var i = 0; i < stars.length; i++) {
+      var st = stars[i];
+      if (!st.taken && L.starHit(ship.x, ship.y, st)) {
+        st.taken = true;
+        var combo = L.comboForStreak(S.streak);
+        var pts = L.starPoints(combo);
+        S.score += pts; S.stars++;
+        addFloat(st.x, st.y - 20, "+" + pts, false);
+        burst(st.x, st.y, "#ffe066", 8);
+        tone(880, 0.08, "sine", 0.15, 1320);
+        window.__landerState = S;
+      }
+    }
+    stars = stars.filter(function (ss) { return !ss.taken; });
+
+    // Ground contact
+    if (ship.y + L.LANDER_R >= L.GROUND_Y) {
+      ship.y = L.GROUND_Y - L.LANDER_R;
+      if (pad && Math.abs(ship.x - pad.cx) <= pad.hw) land();
+      else crash("terrain");
+      if (S.screen !== "playing") return;
+    }
+    for (var j = particles.length - 1; j >= 0; j--) {
+      var p = particles[j];
+      p.x += p.vx * dt; p.y += p.vy * dt; p.t += dt;
+      if (p.t > 0.6) particles.splice(j, 1);
+    }
+    for (var k = floats.length - 1; k >= 0; k--) {
+      floats[k].y -= 40 * dt; floats[k].t += dt;
+      if (floats[k].t > 0.9) floats.splice(k, 1);
+    }
+    for (var b = 0; b < bgStars.length; b++) bgStars[b].tw += dt * 2;
+  }
+  var dragPointerDown = false;
+  canvas.addEventListener("pointerdown", function () { dragPointerDown = true; });
+  canvas.addEventListener("pointerup", function () { dragPointerDown = false; });
+  canvas.addEventListener("pointercancel", function () { dragPointerDown = false; });
+
+  function drawShip() {
+    ctx.save();
+    ctx.translate(ship.x, ship.y);
+    ctx.rotate(ship.tilt);
+    if (thrusting && S.fuel > 0) {
+      var fl = 14 + Math.random() * 12;
+      var fg = ctx.createLinearGradient(0, 12, 0, 12 + fl);
+      fg.addColorStop(0, "#ffe066");
+      fg.addColorStop(0.5, "#ffb347");
+      fg.addColorStop(1, "rgba(255,94,122,0)");
+      ctx.fillStyle = fg;
+      ctx.beginPath();
+      ctx.moveTo(-7, 12); ctx.lineTo(0, 12 + fl); ctx.lineTo(7, 12); ctx.closePath(); ctx.fill();
+    }
+    // body
+    ctx.fillStyle = "#1c1440"; ctx.strokeStyle = "#6cf0ff"; ctx.lineWidth = 2.5;
+    ctx.shadowColor = "#6cf0ff"; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.moveTo(0, -16); ctx.lineTo(11, 8); ctx.lineTo(6, 14); ctx.lineTo(-6, 14); ctx.lineTo(-11, 8);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // cockpit
+    ctx.fillStyle = "#ffe066";
+    ctx.beginPath(); ctx.arc(0, -4, 5, 0, Math.PI * 2); ctx.fill();
+    // legs
+    ctx.strokeStyle = "#b18cff"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(-9, 10); ctx.lineTo(-15, 18); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(9, 10); ctx.lineTo(15, 18); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.restore();
+  }
+  function drawPad() {
+    if (!pad) return;
+    var col = pad.gold ? "#ffd75e" : "#2ee6a8";
+    ctx.fillStyle = col; ctx.strokeStyle = "#e8ecff"; ctx.lineWidth = 2;
+    ctx.shadowColor = col; ctx.shadowBlur = 14;
+    ctx.beginPath();
+    ctx.roundRect(pad.cx - pad.hw, pad.y - 6, pad.hw * 2, 10, 4);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 13px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(pad.gold ? "★ GOLD ★" : "LAND HERE", pad.cx, pad.y - 22);
+  }
+  function drawStar(st) {
+    ctx.fillStyle = "#ffe066"; ctx.strokeStyle = "#fff3b0"; ctx.lineWidth = 2;
+    ctx.shadowColor = "#ffe066"; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.moveTo(st.x, st.y - 14);
+    ctx.quadraticCurveTo(st.x, st.y, st.x + 14, st.y);
+    ctx.quadraticCurveTo(st.x, st.y, st.x, st.y + 14);
+    ctx.quadraticCurveTo(st.x, st.y, st.x - 14, st.y);
+    ctx.quadraticCurveTo(st.x, st.y, st.x, st.y - 14);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  function drawHUD() {
+    ctx.fillStyle = "rgba(7,5,18,0.88)";
+    ctx.fillRect(0, 0, L.W, 54);
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText("SCORE " + S.score, 14, 18);
+    ctx.fillText("BEST " + S.best, 14, 42);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffd75e";
+    ctx.fillText("TIME " + Math.ceil(S.timeLeft) + "s", 240, 18);
+    var combo = L.comboForStreak(S.streak);
+    ctx.fillStyle = combo >= 3 ? "#ff8cd1" : "#aab4e8";
+    ctx.fillText("COMBO x" + combo + (S.streak > 0 ? " (" + S.streak + ")" : ""), 240, 42);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ff5e7a";
+    var hearts = "";
+    for (var i = 0; i < L.MAX_HEARTS; i++) hearts += i < S.hearts ? "♥" : "♡";
+    ctx.fillText(hearts, 466, 18);
+    ctx.fillStyle = "#aab4e8";
+    ctx.fillText("LANDINGS " + S.landings, 466, 42);
+    // fuel bar
+    ctx.fillStyle = "rgba(255,255,255,0.15)";
+    ctx.fillRect(14, 58, 120, 8);
+    ctx.fillStyle = S.fuel > 30 ? "#2ee6a8" : "#ff5e7a";
+    ctx.fillRect(14, 58, 120 * (S.fuel / L.FUEL_MAX), 8);
+    ctx.fillStyle = "#aab4e8"; ctx.font = "12px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("FUEL", 138, 62);
+  }
+  function drawTitle() {
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 52px 'Segoe UI',system-ui,sans-serif";
+    ctx.shadowColor = "#6cf0ff"; ctx.shadowBlur = 18;
+    ctx.fillText("NEON", 240, 190);
+    ctx.fillText("LANDER", 240, 248);
+    ctx.shadowBlur = 0;
+    ctx.font = "16px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#aab4e8";
+    ctx.fillText("60 seconds of lunar-lander chaos!", 240, 310);
+    ctx.fillText("HOLD to fire the thruster — drag to tilt and steer.", 240, 338);
+    ctx.fillText("Land GENTLY on the glowing pad: slow, level, no drift.", 240, 366);
+    ctx.fillText("Soft landings pay 100 x combo — chain 4 to raise it to x5.", 240, 394);
+    ctx.fillText("Golden pads pay 5x. Stars pay 50 x combo. 3 hearts.", 240, 422);
+    ctx.fillStyle = "#ffd75e"; ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(S.best > 0 ? "BEST " + S.best + " — TAP TO PLAY" : "TAP TO PLAY", 240, 480);
+    ctx.fillStyle = "#7780b8"; ctx.font = "14px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("↑ thrust · ← → tilt · M mute · Day 51", 240, 520);
+    // demo: pad + ship hovering
+    drawPad();
+    var saveY = ship.y, saveVy = ship.vy;
+    ship.y = 600; drawShip(); ship.y = saveY; ship.vy = saveVy;
+  }
+  function drawOver() {
+    ctx.fillStyle = "rgba(7,5,18,0.72)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 44px 'Segoe UI',system-ui,sans-serif";
+    ctx.shadowColor = "#ff8cd1"; ctx.shadowBlur = 16;
+    ctx.fillText(S.hearts <= 0 ? "SHIP LOST!" : "TIME'S UP!", 240, 260);
+    ctx.shadowBlur = 0;
+    ctx.font = "bold 30px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#ffd75e";
+    ctx.fillText("SCORE " + S.score, 240, 330);
+    ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#aab4e8";
+    ctx.fillText("Landings " + S.landings + " · Stars " + S.stars + " · Crashes " + S.crashes, 240, 372);
+    if (S.flawless) { ctx.fillStyle = "#2ee6a8"; ctx.fillText("FLAWLESS +500 — no crashes!", 240, 404); }
+    ctx.fillStyle = "#e8ecff";
+    ctx.fillText("BEST " + S.best, 240, 436);
+    ctx.fillStyle = "#ffd75e"; ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("TAP TO PLAY AGAIN", 240, 500);
+  }
+  function render() {
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    var bg = ctx.createLinearGradient(0, 0, 0, L.H);
+    bg.addColorStop(0, "#050214");
+    bg.addColorStop(0.55, "#0b1030");
+    bg.addColorStop(1, "#1c1440");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    // twinkling background stars
+    for (var i = 0; i < bgStars.length; i++) {
+      var bs = bgStars[i];
+      ctx.globalAlpha = 0.35 + 0.45 * Math.abs(Math.sin(bs.tw));
+      ctx.fillStyle = "#cdd6ff";
+      ctx.beginPath(); ctx.arc(bs.x, bs.y, bs.s, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // distant planet
+    var pg = ctx.createRadialGradient(400, 130, 6, 400, 130, 46);
+    pg.addColorStop(0, "#3a2a6e");
+    pg.addColorStop(0.7, "#241a4a");
+    pg.addColorStop(1, "rgba(36,26,74,0)");
+    ctx.fillStyle = pg;
+    ctx.beginPath(); ctx.arc(400, 130, 46, 0, Math.PI * 2); ctx.fill();
+    // terrain
+    ctx.fillStyle = "#14102e";
+    ctx.beginPath();
+    ctx.moveTo(0, L.GROUND_Y + 10);
+    ctx.lineTo(0, L.H); ctx.lineTo(L.W, L.H); ctx.lineTo(L.W, L.GROUND_Y + 10);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "rgba(108,240,255,0.35)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, L.GROUND_Y + 10); ctx.lineTo(L.W, L.GROUND_Y + 10); ctx.stroke();
+    var j;
+    for (j = 0; j < stars.length; j++) drawStar(stars[j]);
+    drawPad();
+    if (S.screen === "playing" || S.screen === "over") drawShip();
+    for (j = 0; j < particles.length; j++) {
+      var p = particles[j];
+      ctx.globalAlpha = Math.max(0, 1 - p.t / 0.6);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (j = 0; j < floats.length; j++) {
+      var f = floats[j];
+      ctx.globalAlpha = Math.max(0, 1 - f.t / 0.9);
+      ctx.fillStyle = f.golden ? "#ffd75e" : "#e8ecff";
+      ctx.font = "bold 22px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(f.text, f.x, f.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    if (S.screen === "playing" || S.screen === "over") drawHUD();
+  }
+
+  window.__landerState = S;
+  window.__landerDebug = {
+    phase: function () { return phase; },
+    ship: function () { return { x: ship.x, y: ship.y, vx: ship.vx, vy: ship.vy, tilt: ship.tilt }; },
+    pad: function () { return pad ? { cx: pad.cx, hw: pad.hw, vx: pad.vx, gold: pad.gold } : null; },
+    thrusting: function () { return thrusting; },
+    fuel: function () { return S.fuel; },
+    setAuto: function (v) { auto = v; },
+    start: function () { start(); },
+    // Teleport the ship just above the pad, gentle and level: the next
+    // physics step must resolve it as a soft landing.
+    debugLand: function () {
+      if (!pad) return null;
+      ship.x = pad.cx; ship.y = L.GROUND_Y - L.LANDER_R - 2;
+      ship.vx = pad.vx; ship.vy = 20; ship.tilt = 0;
+      tiltTarget = 0; thrusting = false; // neutralize stale pointer tilt/thrust
+      return { x: ship.x, y: ship.y };
+    }
+  };
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
