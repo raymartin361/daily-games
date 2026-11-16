@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Pong — Day 52</title>
+<meta name="description" content="Neon Pong — 60 seconds of neon pong chaos. Slide your paddle, keep the rally alive — returns pay 100 x combo, goals past the AI pay 250 x combo, chain 4 to raise it to x5, golden balls pay 5x. How long can you rally?">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Pong — Day 52. A neon vertical pong rally: you slide the bottom
+   paddle (drag or arrow keys), the AI works the top paddle. Every return
+   off your paddle pays 100 x combo; beating the AI paddle pays 250 x
+   combo (a GOAL). Chain 4 consecutive scoring hits to raise the combo
+   x1->x5. Every 6th ball is GOLDEN (5x). Letting a ball past you costs
+   a heart (3 hearts). Ball speed ramps with the rally and with time.
+   Flawless (no concedes) +500. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var PongLogic = (function () {
+  var W = 480, H = 800;
+  var PADDLE_W = 110, PADDLE_H = 14, BALL_R = 9;
+  var PLAYER_Y = 740, AI_Y = 92;
+  var MAX_HEARTS = 3, GAME_TIME = 60;
+  var BASE_SPEED = 260, SPEED_RAMP = 3, MAX_SPEED = 620, RALLY_BOOST = 8;
+  var PLAYER_SPEED = 520;
+  var AI_BASE = 300, AI_RAMP = 4, AI_MAX = 520;
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function returnPoints(combo, gold) { return 100 * combo * (gold ? 5 : 1); }
+  function goalPoints(combo, gold) { return 250 * combo * (gold ? 5 : 1); }
+  function nextBallGold(serveSeq) { return serveSeq % 6 === 5; }
+  function ballSpeedAt(elapsed, rally) {
+    var s = BASE_SPEED + SPEED_RAMP * elapsed + RALLY_BOOST * rally;
+    return s > MAX_SPEED ? MAX_SPEED : s;
+  }
+  function aiSpeedAt(elapsed) {
+    var s = AI_BASE + AI_RAMP * elapsed;
+    return s > AI_MAX ? AI_MAX : s;
+  }
+  function clampPaddleX(x) {
+    var min = PADDLE_W / 2 + 8, max = W - PADDLE_W / 2 - 8;
+    if (x < min) return min;
+    if (x > max) return max;
+    return x;
+  }
+  // Bounce off the player paddle: offset in [-1,1] across the paddle face
+  // steers the ball; speed is preserved, vertical component flips up.
+  function playerReturn(ball, paddleX, speed) {
+    var offset = (ball.x - paddleX) / (PADDLE_W / 2);
+    if (offset > 1) offset = 1;
+    if (offset < -1) offset = -1;
+    var vx = offset * speed * 0.75;
+    var vy = -Math.sqrt(Math.max(1, speed * speed - vx * vx));
+    return { vx: vx, vy: vy, offset: offset };
+  }
+  // Bounce off the AI paddle: same shape, vertical component flips down.
+  function aiReturn(ball, aiX, speed) {
+    var offset = (ball.x - aiX) / (PADDLE_W / 2);
+    if (offset > 1) offset = 1;
+    if (offset < -1) offset = -1;
+    var vx = offset * speed * 0.75;
+    var vy = Math.sqrt(Math.max(1, speed * speed - vx * vx));
+    return { vx: vx, vy: vy, offset: offset };
+  }
+  // Does the ball clear the paddle (miss) at the paddle's line?
+  function clearsPaddle(ballX, paddleX) {
+    return Math.abs(ballX - paddleX) > PADDLE_W / 2 + BALL_R;
+  }
+  function aiTarget(ballX, err) { return ballX + err; }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, timeLeft: GAME_TIME,
+      streak: 0, returns: 0, goals: 0, concedes: 0,
+      hearts: MAX_HEARTS, flawless: false, rally: 0 };
+  }
+  return { W: W, H: H, PADDLE_W: PADDLE_W, PADDLE_H: PADDLE_H, BALL_R: BALL_R,
+    PLAYER_Y: PLAYER_Y, AI_Y: AI_Y, MAX_HEARTS: MAX_HEARTS, GAME_TIME: GAME_TIME,
+    BASE_SPEED: BASE_SPEED, SPEED_RAMP: SPEED_RAMP, MAX_SPEED: MAX_SPEED,
+    RALLY_BOOST: RALLY_BOOST, PLAYER_SPEED: PLAYER_SPEED,
+    AI_BASE: AI_BASE, AI_RAMP: AI_RAMP, AI_MAX: AI_MAX,
+    comboForStreak: comboForStreak, returnPoints: returnPoints,
+    goalPoints: goalPoints, nextBallGold: nextBallGold,
+    ballSpeedAt: ballSpeedAt, aiSpeedAt: aiSpeedAt,
+    clampPaddleX: clampPaddleX, playerReturn: playerReturn,
+    aiReturn: aiReturn, clearsPaddle: clearsPaddle, aiTarget: aiTarget,
+    makeState: makeState };
+})();
+//LOGIC-END
+
+(function () {
+  var L = PongLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_pong_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_pong_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, serveSeq = 0, phase = "title";
+  var playerX = 240, aiX = 240, aiErr = 0;
+  var ball = { x: 240, y: 400, vx: 0, vy: 0 };
+  var ballGold = false, trail = [];
+  var keys = { left: false, right: false };
+  var dragging = false;
+  var particles = [], floats = [], bgDots = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  for (var i = 0; i < 70; i++) {
+    bgDots.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 0.6 + Math.random() * 1.6, tw: Math.random() * Math.PI * 2 });
+  }
+
+  function serve() {
+    serveSeq++;
+    ballGold = L.nextBallGold(serveSeq);
+    var speed = L.ballSpeedAt(elapsed, S.rally);
+    var ang = (Math.random() - 0.5) * 0.9;
+    ball = { x: 240, y: 400, vx: Math.sin(ang) * speed, vy: speed * 0.9 };
+    // AI aim error grows with ball speed: fast balls beat the AI more often.
+    aiErr = (Math.random() - 0.5) * 2 * (40 + speed * 0.11);
+    trail = [];
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_pong_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; serveSeq = 0; phase = "playing";
+    playerX = 240; aiX = 240; aiErr = 0;
+    particles = []; floats = []; trail = [];
+    serve();
+    window.__pongState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(concededOut) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.concedes === 0 && (S.returns > 0 || S.goals > 0)) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_pong_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__pongState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function onReturn() {
+    var speed = L.ballSpeedAt(elapsed, S.rally);
+    var r = L.playerReturn(ball, playerX, speed);
+    ball.vx = r.vx; ball.vy = r.vy;
+    ball.y = L.PLAYER_Y - L.PADDLE_H / 2 - L.BALL_R - 1;
+    S.rally++;
+    // Redraw the AI's aim error on every return: each trip up the court
+    // is an independent chance for the AI to be beaten. (Drawing it once
+    // per serve made a whole rally all-or-nothing.)
+    aiErr = (Math.random() - 0.5) * 2 * (40 + L.ballSpeedAt(elapsed, S.rally) * 0.11);
+    var combo = L.comboForStreak(S.streak);
+    var pts = L.returnPoints(combo, ballGold);
+    S.score += pts; S.returns++; S.streak++;
+    addFloat(ball.x, L.PLAYER_Y - 50, "+" + pts, ballGold);
+    burst(ball.x, L.PLAYER_Y - 10, ballGold ? "#ffd75e" : "#2ee6a8", 10);
+    tone(ballGold ? 1046 : 523, 0.08, "triangle", 0.18);
+    buzz(15);
+    window.__pongLastEvent = { type: "return", pts: pts, rally: S.rally, streak: S.streak, gold: ballGold };
+    window.__pongState = S;
+  }
+  function onGoal() {
+    var combo = L.comboForStreak(S.streak);
+    var pts = L.goalPoints(combo, ballGold);
+    S.score += pts; S.goals++; S.streak++; S.rally = 0;
+    addFloat(240, 300, "GOAL! +" + pts, ballGold);
+    burst(ball.x, 60, ballGold ? "#ffd75e" : "#ff8cd1", 18);
+    tone(784, 0.1, "triangle", 0.2);
+    tone(1175, 0.16, "triangle", 0.2);
+    buzz(30);
+    window.__pongLastEvent = { type: "goal", pts: pts, goals: S.goals, streak: S.streak, gold: ballGold };
+    window.__pongState = S;
+    serve();
+  }
+  function onConcede() {
+    S.hearts--; S.concedes++; S.streak = 0; S.rally = 0;
+    addFloat(240, 500, "MISSED!", false);
+    burst(ball.x, L.H - 30, "#ff5e7a", 20);
+    tone(140, 0.3, "sawtooth", 0.2, 70);
+    buzz(90);
+    window.__pongLastEvent = { type: "concede", hearts: S.hearts, concedes: S.concedes };
+    window.__pongState = S;
+    if (S.hearts <= 0) { endGame(true); return; }
+    serve();
+  }
+  function onAiReturn() {
+    var speed = L.ballSpeedAt(elapsed, S.rally);
+    var r = L.aiReturn(ball, aiX, speed);
+    ball.vx = r.vx; ball.vy = r.vy;
+    ball.y = L.AI_Y + L.PADDLE_H / 2 + L.BALL_R + 1;
+    tone(392, 0.05, "square", 0.08);
+    window.__pongLastEvent = { type: "ai-return", aiX: Math.round(aiX) };
+  }
+
+  function toWorldX(clientX) {
+    var r = canvas.getBoundingClientRect();
+    var cx = (clientX - r.left) / (r.width / vw);
+    return (cx - ox) / scale;
+  }
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    dragging = true;
+    playerX = L.clampPaddleX(toWorldX(e.clientX));
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging || S.screen !== "playing") return;
+    playerX = L.clampPaddleX(toWorldX(e.clientX));
+    e.preventDefault();
+  }
+  function onUp() { dragging = false; }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", onUp);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowLeft") keys.left = true;
+    if (e.key === "ArrowRight") keys.right = true;
+    if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_pong_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+  window.addEventListener("keyup", function (e) {
+    if (e.key === "ArrowLeft") keys.left = false;
+    if (e.key === "ArrowRight") keys.right = false;
+  });
+
+  function autoPilot(dt) {
+    // Track the ball's x with a lag so the rally survives but isn't perfect.
+    if (ball.vy > 0) {
+      var target = L.clampPaddleX(ball.x + ball.vx * 0.12);
+      var diff = target - playerX;
+      var step = L.PLAYER_SPEED * 0.85 * dt;
+      playerX += Math.abs(diff) <= step ? diff : (diff > 0 ? step : -step);
+    } else {
+      var c = 240 - playerX;
+      var s2 = L.PLAYER_SPEED * 0.4 * dt;
+      playerX += Math.abs(c) <= s2 ? c : (c > 0 ? s2 : -s2);
+    }
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    if (auto) autoPilot(dt);
+    if (keys.left) playerX = L.clampPaddleX(playerX - L.PLAYER_SPEED * dt);
+    if (keys.right) playerX = L.clampPaddleX(playerX + L.PLAYER_SPEED * dt);
+
+    // AI paddle: chase the ball (with its serve error) while the ball heads
+    // up; drift back to centre while it heads down.
+    var aiSpeed = L.aiSpeedAt(elapsed);
+    var aiDest = ball.vy < 0 ? L.aiTarget(ball.x, aiErr) : 240;
+    var ad = aiDest - aiX;
+    var aStep = aiSpeed * dt;
+    aiX += Math.abs(ad) <= aStep ? ad : (ad > 0 ? aStep : -aStep);
+    aiX = L.clampPaddleX(aiX);
+
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+    trail.push({ x: ball.x, y: ball.y, t: 0 });
+    if (trail.length > 14) trail.shift();
+    for (var ti = 0; ti < trail.length; ti++) trail[ti].t += dt;
+    // Walls
+    if (ball.x - L.BALL_R < 8) { ball.x = 8 + L.BALL_R; ball.vx = Math.abs(ball.vx); }
+    if (ball.x + L.BALL_R > L.W - 8) { ball.x = L.W - 8 - L.BALL_R; ball.vx = -Math.abs(ball.vx); }
+    // Player paddle line (ball moving down)
+    if (ball.vy > 0 && ball.y + L.BALL_R >= L.PLAYER_Y - L.PADDLE_H / 2 &&
+        ball.y - L.BALL_R <= L.PLAYER_Y + L.PADDLE_H / 2) {
+      if (!L.clearsPaddle(ball.x, playerX)) onReturn();
+    }
+    if (S.screen !== "playing") return;
+    // AI paddle line (ball moving up)
+    if (ball.vy < 0 && ball.y - L.BALL_R <= L.AI_Y + L.PADDLE_H / 2 &&
+        ball.y + L.BALL_R >= L.AI_Y - L.PADDLE_H / 2) {
+      if (!L.clearsPaddle(ball.x, aiX)) onAiReturn();
+      else onGoal();
+    }
+    if (S.screen !== "playing") return;
+    // Concede: ball fully past the player line.
+    if (ball.y - L.BALL_R > L.H) onConcede();
+    if (S.screen !== "playing") return;
+    // Safety: ball above the top edge without scoring (shouldn't happen).
+    if (ball.y + L.BALL_R < 0) { ball.y = L.BALL_R; ball.vy = Math.abs(ball.vy); }
+
+    for (var j = particles.length - 1; j >= 0; j--) {
+      var p = particles[j];
+      p.x += p.vx * dt; p.y += p.vy * dt; p.t += dt;
+      if (p.t > 0.6) particles.splice(j, 1);
+    }
+    for (var k = floats.length - 1; k >= 0; k--) {
+      floats[k].y -= 40 * dt; floats[k].t += dt;
+      if (floats[k].t > 0.9) floats.splice(k, 1);
+    }
+    for (var b = 0; b < bgDots.length; b++) bgDots[b].tw += dt * 2;
+  }
+
+  function drawPaddle(x, y, color) {
+    ctx.fillStyle = "#151c3f";
+    ctx.strokeStyle = color; ctx.lineWidth = 2.5;
+    ctx.shadowColor = color; ctx.shadowBlur = 14;
+    ctx.beginPath();
+    ctx.roundRect(x - L.PADDLE_W / 2, y - L.PADDLE_H / 2, L.PADDLE_W, L.PADDLE_H, 7);
+    ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = color;
+    ctx.fillRect(x - L.PADDLE_W / 2 + 10, y - 2, L.PADDLE_W - 20, 4);
+  }
+  function drawBall() {
+    // Trail (one continuous path would smear; draw fading circles instead).
+    for (var i = 0; i < trail.length; i++) {
+      var tp = trail[i];
+      ctx.globalAlpha = Math.max(0, 0.25 * (1 - tp.t / 0.25));
+      ctx.fillStyle = ballGold ? "#ffd75e" : "#6cf0ff";
+      ctx.beginPath(); ctx.arc(tp.x, tp.y, L.BALL_R * 0.7, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    var col = ballGold ? "#ffd75e" : "#e8ecff";
+    ctx.fillStyle = col;
+    ctx.strokeStyle = ballGold ? "#ffb347" : "#6cf0ff"; ctx.lineWidth = 2.5;
+    ctx.shadowColor = ballGold ? "#ffd75e" : "#6cf0ff"; ctx.shadowBlur = 16;
+    ctx.beginPath(); ctx.arc(ball.x, ball.y, L.BALL_R, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+  function drawHUD() {
+    ctx.fillStyle = "rgba(7,5,18,0.88)";
+    ctx.fillRect(0, 0, L.W, 54);
+    ctx.fillStyle = "#e8ecff"; ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "left"; ctx.textBaseline = "middle";
+    ctx.fillText("SCORE " + S.score, 14, 18);
+    ctx.fillText("BEST " + S.best, 14, 42);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ffd75e";
+    ctx.fillText("TIME " + Math.ceil(S.timeLeft) + "s", 240, 18);
+    var combo = L.comboForStreak(S.streak);
+    ctx.fillStyle = combo >= 3 ? "#ff8cd1" : "#aab4e8";
+    ctx.fillText("COMBO x" + combo + (S.streak > 0 ? " (" + S.streak + ")" : ""), 240, 42);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ff5e7a";
+    var hearts = "";
+    for (var i = 0; i < L.MAX_HEARTS; i++) hearts += i < S.hearts ? "♥" : "♡";
+    ctx.fillText(hearts, 466, 18);
+    ctx.fillStyle = "#aab4e8";
+    ctx.fillText("RET " + S.returns + " · GOALS " + S.goals, 466, 42);
+  }
+  function drawTitle() {
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 56px 'Segoe UI',system-ui,sans-serif";
+    ctx.shadowColor = "#6cf0ff"; ctx.shadowBlur = 18;
+    ctx.fillText("NEON", 240, 180);
+    ctx.fillText("PONG", 240, 242);
+    ctx.shadowBlur = 0;
+    ctx.font = "16px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#aab4e8";
+    ctx.fillText("60 seconds of neon pong chaos!", 240, 300);
+    ctx.fillText("DRAG to slide your paddle — keep the rally alive.", 240, 328);
+    ctx.fillText("Returns pay 100 x combo — beat the AI paddle for", 240, 356);
+    ctx.fillText("a GOAL worth 250 x combo. Chain 4 to raise it to x5.", 240, 384);
+    ctx.fillText("Golden balls pay 5x. Let one past you, lose a heart.", 240, 412);
+    ctx.fillStyle = "#ffd75e"; ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText(S.best > 0 ? "BEST " + S.best + " — TAP TO PLAY" : "TAP TO PLAY", 240, 470);
+    ctx.fillStyle = "#7780b8"; ctx.font = "14px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("← → slide · M mute · Day 52", 240, 510);
+    // Demo paddles + ball on the title screen.
+    drawPaddle(240, L.AI_Y, "#ff8cd1");
+    drawPaddle(240, L.PLAYER_Y, "#2ee6a8");
+    var saveX = ball.x, saveY = ball.y;
+    ball.x = 240; ball.y = 620; drawBall(); ball.x = saveX; ball.y = saveY;
+  }
+  function drawOver() {
+    ctx.fillStyle = "rgba(7,5,18,0.72)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.fillStyle = "#e8ecff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.font = "bold 44px 'Segoe UI',system-ui,sans-serif";
+    ctx.shadowColor = "#ff8cd1"; ctx.shadowBlur = 16;
+    ctx.fillText(S.hearts <= 0 ? "RALLY OVER!" : "TIME'S UP!", 240, 260);
+    ctx.shadowBlur = 0;
+    ctx.font = "bold 30px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#ffd75e";
+    ctx.fillText("SCORE " + S.score, 240, 330);
+    ctx.font = "20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillStyle = "#aab4e8";
+    ctx.fillText("Returns " + S.returns + " · Goals " + S.goals + " · Missed " + S.concedes, 240, 372);
+    if (S.flawless) { ctx.fillStyle = "#2ee6a8"; ctx.fillText("FLAWLESS +500 — nothing got past you!", 240, 404); }
+    ctx.fillStyle = "#e8ecff";
+    ctx.fillText("BEST " + S.best, 240, 436);
+    ctx.fillStyle = "#ffd75e"; ctx.font = "bold 20px 'Segoe UI',system-ui,sans-serif";
+    ctx.fillText("TAP TO PLAY AGAIN", 240, 500);
+  }
+  function render() {
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    var bg = ctx.createLinearGradient(0, 0, 0, L.H);
+    bg.addColorStop(0, "#050214");
+    bg.addColorStop(0.5, "#0b1030");
+    bg.addColorStop(1, "#1c1440");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    // twinkling background dots
+    for (var i = 0; i < bgDots.length; i++) {
+      var bd = bgDots[i];
+      ctx.globalAlpha = 0.3 + 0.4 * Math.abs(Math.sin(bd.tw));
+      ctx.fillStyle = "#cdd6ff";
+      ctx.beginPath(); ctx.arc(bd.x, bd.y, bd.s, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Centre line + court frame
+    ctx.strokeStyle = "rgba(108,240,255,0.35)"; ctx.lineWidth = 2;
+    ctx.setLineDash([14, 12]);
+    ctx.beginPath(); ctx.moveTo(20, 400); ctx.lineTo(460, 400); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.strokeStyle = "rgba(108,240,255,0.18)";
+    ctx.beginPath(); ctx.arc(240, 400, 70, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = "rgba(232,236,255,0.25)";
+    ctx.strokeRect(8, 60, L.W - 16, L.H - 68);
+    // AI label + player label
+    ctx.fillStyle = "#7780b8"; ctx.font = "12px 'Segoe UI',system-ui,sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("AI", 240, L.AI_Y - 26);
+    ctx.fillText("YOU", 240, L.PLAYER_Y + 26);
+    // Golden ball banner
+    if (ballGold && S.screen === "playing") {
+      ctx.fillStyle = "#ffd75e"; ctx.font = "bold 16px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText("★ GOLDEN BALL ★", 240, 400);
+    }
+    drawPaddle(aiX, L.AI_Y, "#ff8cd1");
+    drawPaddle(playerX, L.PLAYER_Y, "#2ee6a8");
+    if (S.screen === "playing" || S.screen === "over") drawBall();
+    for (var j = 0; j < particles.length; j++) {
+      var p = particles[j];
+      ctx.globalAlpha = Math.max(0, 1 - p.t / 0.6);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    for (var k = 0; k < floats.length; k++) {
+      var f = floats[k];
+      ctx.globalAlpha = Math.max(0, 1 - f.t / 0.9);
+      ctx.fillStyle = f.golden ? "#ffd75e" : "#e8ecff";
+      ctx.font = "bold 22px 'Segoe UI',system-ui,sans-serif";
+      ctx.fillText(f.text, f.x, f.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    if (S.screen === "playing" || S.screen === "over") drawHUD();
+  }
+
+  window.__pongState = S;
+  window.__pongDebug = {
+    ball: function () { return { x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy, gold: ballGold }; },
+    paddles: function () { return { playerX: playerX, aiX: aiX, aiErr: aiErr }; },
+    setAuto: function (v) { auto = v; },
+    start: function () { start(); },
+    setPlayerX: function (x) { playerX = L.clampPaddleX(x); },
+    // Teleport the ball just above the player paddle, heading down:
+    // the next physics step must resolve it as a return.
+    debugReturn: function () {
+      if (S.screen !== "playing") return null;
+      ball.x = playerX; ball.y = L.PLAYER_Y - L.PADDLE_H / 2 - L.BALL_R - 1;
+      ball.vx = 0; ball.vy = 200;
+      return { x: ball.x, y: ball.y };
+    },
+    // Teleport the ball at the AI line, far from the AI paddle:
+    // the next physics step must resolve it as a goal.
+    debugGoal: function () {
+      if (S.screen !== "playing") return null;
+      aiX = 60;
+      ball.x = 400; ball.y = L.AI_Y - L.BALL_R - 1;
+      ball.vx = 0; ball.vy = -200;
+      return { x: ball.x, y: ball.y };
+    }
+  };
+
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
