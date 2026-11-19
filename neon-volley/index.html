@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Volley — Day 55</title>
+<meta name="description" content="Neon Volley — 60 seconds of neon volleyball chaos. Drag to move, tap to jump and spike — bump the ball over the net, don't let it land on your side. Points pay 100 x combo, golden rallies pay 5x.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Volley — Day 55. A neon volleyball duel: you (left, cyan) vs an AI
+   rival (right, magenta) across a glowing net. Drag to move, tap to jump —
+   jump into the ball to SPIKE it down, stay grounded to bump it over.
+   Ball landing on the rival floor scores 100 x combo; chain 4 points to
+   raise the combo x1->x5. Every 6th rally is GOLDEN (5x). Stars floating
+   over the court pay 50 x combo when the ball touches them. Letting the
+   ball land on YOUR floor costs a heart (3 hearts). Flawless (no concedes)
+   +500. 60 seconds, best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var VolleyLogic = (function () {
+  var W = 480, H = 800;
+  var FLOOR_Y = 720, NET_X = 240, NET_TOP = 430, NET_HALF = 4;
+  var BALL_R = 12, PLAYER_R = 22;
+  var GRAV = 1000, PLAYER_GRAV = 1700, JUMP_V = -580, MOVE_SPEED = 430;
+  var GAME_TIME = 60, MAX_HEARTS = 3;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, combo: 1, streak: 0,
+      points: 0, concedes: 0, deaths: 0, hearts: MAX_HEARTS, timeLeft: GAME_TIME,
+      flawless: false, touches: 0, stars: 0 };
+  }
+  // combo: +1 every 4 consecutive points, capped at x5.
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function pointPoints(combo, golden) { return 100 * combo * (golden ? 5 : 1); }
+  function starPoints(combo) { return 50 * combo; }
+  // 1-based: the 6th, 12th, 18th... point is GOLDEN.
+  function isGolden(pointNumber) { return pointNumber % 6 === 0; }
+
+  function makeBall(x, y, vx, vy, golden) {
+    return { x: x, y: y, vx: vx, vy: vy, r: BALL_R, golden: !!golden,
+      trail: [], px: x, py: y };
+  }
+  // Serve from the winner's half: tossed up, drifting toward the opponent.
+  // nextPointNumber is 1-based, so the ball is golden on the 6th rally.
+  function serveBall(side, nextPointNumber) {
+    var sx = side === "left" ? 120 : 360;
+    return makeBall(sx, 300, side === "left" ? 150 : -150, -280,
+      isGolden(nextPointNumber));
+  }
+  // Gravity + integrate. Trail is a flat [x,y,x,y,...] list: trim WHOLE
+  // PAIRS from the front (trimming single values misaligns the pairs and
+  // the renderer draws an axis-swapped ghost line, and push(2)/shift(1)
+  // grows forever).
+  function stepBall(ball, dt) {
+    ball.px = ball.x; ball.py = ball.y;
+    ball.vy += GRAV * dt;
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+    ball.trail.push(ball.x, ball.y);
+    while (ball.trail.length > 14) ball.trail.splice(0, 2);
+    if (ball.x < ball.r + 4) { ball.x = ball.r + 4; ball.vx = Math.abs(ball.vx) * 0.5; }
+    if (ball.x > W - ball.r - 4) { ball.x = W - ball.r - 4; ball.vx = -Math.abs(ball.vx) * 0.5; }
+  }
+  // Net: vertical slab x=NET_X, y NET_TOP..FLOOR_Y. Returns "net",
+  // "net-top", or null. Uses the previous position so a fast ball cannot
+  // tunnel through the slab or the top cap in one step.
+  function resolveNet(ball) {
+    var R = ball.r, slab = R + NET_HALF;
+    if (ball.y + R > NET_TOP && ball.y - R < FLOOR_Y) {
+      if (ball.px < NET_X - slab && ball.x >= NET_X - slab && ball.x < NET_X + slab) {
+        ball.x = NET_X - slab;
+        if (ball.vx > 0) ball.vx = -ball.vx * 0.55;
+        return "net";
+      }
+      if (ball.px > NET_X + slab && ball.x <= NET_X + slab && ball.x > NET_X - slab) {
+        ball.x = NET_X + slab;
+        if (ball.vx < 0) ball.vx = -ball.vx * 0.55;
+        return "net";
+      }
+    }
+    if (ball.vy > 0 && ball.py + R <= NET_TOP && ball.y + R >= NET_TOP &&
+        Math.abs(ball.x - NET_X) < R + NET_HALF + 2) {
+      ball.y = NET_TOP - R;
+      ball.vy = -Math.abs(ball.vy) * 0.55;
+      return "net-top";
+    }
+    return null;
+  }
+  // Which floor the ball just touched: "left" (your side), "right" (AI
+  // side), or null while still in the air.
+  function floorSide(ball) {
+    if (ball.y + ball.r >= FLOOR_Y) return ball.x < NET_X ? "left" : "right";
+    return null;
+  }
+  // Player contact. Rising into the ball spikes it down hard toward the
+  // opponent's far corner; a grounded bump always clears the net — vy is
+  // sized from the net-crossing time, and a bump from right at the net
+  // lofts almost straight up instead of dying into the mesh.
+  function hitBall(ball, p, side) {
+    var dir = side === "left" ? 1 : -1;
+    var aim = clamp((ball.x - p.x) / PLAYER_R, -1, 1);
+    if (p.vy < -50) {
+      var disc = 420 * 420 - 2000 * (ball.y - (FLOOR_Y - BALL_R));
+      var tf = disc > 0 ? (-420 + Math.sqrt(disc)) / 1000 : 0.3;
+      if (tf < 0.05) tf = 0.05;
+      var targetX = side === "left" ? W - 50 : 50;
+      var needVx = (targetX - ball.x) / tf;
+      var svx = dir * 360 + aim * 60 + (p.vx || 0) * 0.3;
+      if (dir > 0) svx = Math.max(svx, needVx);
+      else svx = Math.min(svx, needVx);
+      if (svx > 900) svx = 900;
+      if (svx < -900) svx = -900;
+      return { vx: svx, vy: 420, spiked: true };
+    }
+    var bvx = dir * 200 + aim * 140 + (p.vx || 0) * 0.3;
+    var distNet = Math.abs(NET_X - ball.x);
+    var tNet = distNet / Math.max(40, Math.abs(bvx));
+    // vy that puts the ball at net-top height when it crosses the net.
+    var vyClear = (ball.y - (NET_TOP - BALL_R) + 500 * tNet * tNet) / tNet + 30;
+    var need = Math.sqrt(2 * GRAV * Math.max(60, ball.y - 400)) + 40;
+    var vy = Math.max(need, vyClear);
+    if (vy > 950) {
+      // Too close to the net for a normal bump: loft it high so it
+      // clears the mesh on a steep arc instead of dying into it.
+      bvx = dir * 60 + aim * 40;
+      vy = 1000;
+    }
+    return { vx: bvx, vy: -vy, spiked: false };
+  }
+  // Ballistic x where the ball will be at targetY (falling branch), or
+  // null if it never gets there.
+  function predictX(ball, targetY) {
+    var dy = targetY - ball.y;
+    var disc = ball.vy * ball.vy + 2 * GRAV * dy;
+    if (disc < 0) return null;
+    var t = (-ball.vy + Math.sqrt(disc)) / GRAV;
+    if (t < 0) return null;
+    return ball.x + ball.vx * t;
+  }
+  // Seconds until the ball reaches the floor (falling branch).
+  function timeToFloor(ball) {
+    var disc = ball.vy * ball.vy - 2 * GRAV * (ball.y - FLOOR_Y);
+    if (disc < 0) return Infinity;
+    var t = (-ball.vy + Math.sqrt(disc)) / GRAV;
+    return t < 0 ? 0 : t;
+  }
+  // AI brain: where to stand and whether to jump. rng() in [0,1); the aim
+  // error shrinks as the rally clock (elapsed) grows.
+  function aiDecision(ball, selfX, selfY, side, elapsed, rng) {
+    var home = side === "left" ? 120 : 360;
+    var lo = side === "left" ? 30 : 270, hi = side === "left" ? 210 : 450;
+    var mySide = side === "left" ? ball.x < NET_X : ball.x > NET_X;
+    var coming = side === "left" ? ball.vx < 0 : ball.vx > 0;
+    var jump = false, tx = home;
+    if ((mySide || coming) && ball.y > 200) {
+      var px = predictX(ball, FLOOR_Y);
+      if (px === null) px = ball.x;
+      var err = Math.max(10, 50 - elapsed * 0.5);
+      tx = clamp(px + (rng() - 0.5) * err, lo, hi);
+      // Jump only for a HIGH ball with time to meet it in the air. A ball
+      // about to land at your feet (timeToFloor < 0.35s) must be met on
+      // the floor with a grounded bump — jumping lifts you over it and it
+      // sails underneath into a concede.
+      jump = ball.vy > 0 && ball.y < 560 && timeToFloor(ball) > 0.35 &&
+        Math.abs(ball.x - selfX) < 70 && ball.y > NET_TOP - 80;
+    }
+    return { tx: tx, jump: jump };
+  }
+
+  return { W: W, H: H, FLOOR_Y: FLOOR_Y, NET_X: NET_X, NET_TOP: NET_TOP,
+    NET_HALF: NET_HALF, BALL_R: BALL_R, PLAYER_R: PLAYER_R, GRAV: GRAV,
+    PLAYER_GRAV: PLAYER_GRAV, JUMP_V: JUMP_V, MOVE_SPEED: MOVE_SPEED,
+    GAME_TIME: GAME_TIME, MAX_HEARTS: MAX_HEARTS,
+    clamp: clamp, makeState: makeState, comboForStreak: comboForStreak,
+    pointPoints: pointPoints, starPoints: starPoints, isGolden: isGolden,
+    makeBall: makeBall, serveBall: serveBall, stepBall: stepBall,
+    resolveNet: resolveNet, floorSide: floorSide, hitBall: hitBall,
+    predictX: predictX, timeToFloor: timeToFloor, aiDecision: aiDecision };
+})();
+//LOGIC-END
+
+(function () {
+  var L = VolleyLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_volley_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_volley_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, serveT = 0, serveSide = "left", servePending = false;
+  var ball = L.serveBall("left", 1);
+  var player = { x: 120, y: L.FLOOR_Y - L.PLAYER_R, vx: 0, vy: 0, side: "left",
+    jumping: false, hitCd: 0, jumpCd: 0, targetX: null, keyDir: 0 };
+  var ai = { x: 360, y: L.FLOOR_Y - L.PLAYER_R, vx: 0, vy: 0, side: "right",
+    jumping: false, hitCd: 0, jumpCd: 0 };
+  var stars = [];
+  var particles = [], floats = [], bgDots = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  for (var i = 0; i < 70; i++) {
+    bgDots.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 0.6 + Math.random() * 1.6, tw: Math.random() * Math.PI * 2 });
+  }
+  function spawnStar() {
+    return { x: 70 + Math.random() * 340, y: 170 + Math.random() * 290,
+      r: 14, active: true, respawnT: 0, spin: Math.random() * Math.PI * 2 };
+  }
+  stars = [spawnStar(), spawnStar()];
+
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_volley_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; serveT = 0; serveSide = "left"; servePending = false;
+    ball = L.serveBall("left", 1);
+    player.x = 120; player.y = L.FLOOR_Y - L.PLAYER_R; player.vx = 0; player.vy = 0;
+    player.jumping = false; player.hitCd = 0; player.jumpCd = 0; player.targetX = null; player.keyDir = 0;
+    ai.x = 360; ai.y = L.FLOOR_Y - L.PLAYER_R; ai.vx = 0; ai.vy = 0;
+    ai.jumping = false; ai.hitCd = 0; ai.jumpCd = 0;
+    stars = [spawnStar(), spawnStar()];
+    particles = []; floats = [];
+    window.__volleyState = S;
+  }
+  function start() { reset(); S.screen = "playing"; serveT = 0.9; servePending = true; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(outOfHearts) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.deaths === 0 && S.points > 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_volley_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__volleyState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function serve(side) {
+    serveSide = side;
+    ball = L.serveBall(side, S.points + 1);
+    serveT = 0.9; servePending = true;
+  }
+  function awardPoint() {
+    S.points++;
+    var golden = ball.golden;
+    var pts = L.pointPoints(S.combo, golden);
+    S.score += pts;
+    S.streak++;
+    S.combo = L.comboForStreak(S.streak);
+    addFloat(ball.x, L.FLOOR_Y - 60, "+" + pts, golden);
+    burst(ball.x, L.FLOOR_Y - 20, golden ? "#ffd94a" : "#35f0ff", golden ? 22 : 12);
+    tone(golden ? 1320 : 880, 0.15, "sine", 0.2, golden ? 1760 : 1170);
+    buzz(30);
+    serve("left");
+    window.__volleyState = S;
+  }
+  function awardConcede() {
+    S.concedes++;
+    S.deaths++;
+    S.hearts--;
+    S.streak = 0; S.combo = 1;
+    addFloat(ball.x, L.FLOOR_Y - 60, "CONCEDED", false);
+    burst(ball.x, L.FLOOR_Y - 20, "#ff5e7a", 14);
+    tone(180, 0.3, "sawtooth", 0.18, 90);
+    buzz([40, 40, 40]);
+    if (S.hearts <= 0) { endGame(true); return; }
+    serve("right");
+    window.__volleyState = S;
+  }
+  function collectStar(st) {
+    var pts = L.starPoints(S.combo);
+    S.score += pts; S.stars++;
+    addFloat(st.x, st.y - 20, "+" + pts, false);
+    burst(st.x, st.y, "#ffd94a", 10);
+    tone(1170, 0.12, "sine", 0.16, 1560);
+    st.active = false; st.respawnT = 2.5;
+    window.__volleyState = S;
+  }
+
+  function stepPlayer(p, dt, moveInput) {
+    // moveInput: {tx} target x, or {dir} -1/0/1. maxSpeed caps the
+    // proportional controller (the AI ramps its speed with elapsed time).
+    var wantVx = 0;
+    var maxSp = moveInput.maxSpeed || L.MOVE_SPEED;
+    if (moveInput.tx !== null && moveInput.tx !== undefined) {
+      var dx = moveInput.tx - p.x;
+      if (Math.abs(dx) > 4) wantVx = L.clamp(dx * 8, -maxSp, maxSp);
+    } else if (moveInput.dir) {
+      wantVx = moveInput.dir * maxSp;
+    }
+    p.vx = wantVx;
+    p.x += p.vx * dt;
+    var lo = p.side === "left" ? 30 : L.NET_X + 32, hi = p.side === "left" ? L.NET_X - 32 : 450;
+    if (p.x < lo) p.x = lo;
+    if (p.x > hi) p.x = hi;
+    if (p.jumpQueued && !p.jumping) {
+      p.vy = L.JUMP_V; p.jumping = true; p.jumpQueued = false;
+      tone(440, 0.08, "sine", 0.1, 660);
+    }
+    if (p.jumping) {
+      p.vy += L.PLAYER_GRAV * dt;
+      p.y += p.vy * dt;
+      if (p.y >= L.FLOOR_Y - L.PLAYER_R) {
+        p.y = L.FLOOR_Y - L.PLAYER_R; p.vy = 0; p.jumping = false;
+      }
+    }
+    if (p.hitCd > 0) p.hitCd -= dt;
+    if (p.jumpCd > 0) p.jumpCd -= dt;
+  }
+  function tryHit(p) {
+    if (p.hitCd > 0) return;
+    var dx = ball.x - p.x, dy = ball.y - p.y;
+    var minD = ball.r + L.PLAYER_R + 2;
+    if (dx * dx + dy * dy < minD * minD) {
+      var res = L.hitBall(ball, p, p.side);
+      ball.vx = res.vx; ball.vy = res.vy;
+      p.hitCd = 0.18;
+      if (p.side === "left") S.touches++;
+      burst(ball.x, ball.y, res.spiked ? "#ff9d5c" : "#35f0ff", res.spiked ? 14 : 8);
+      tone(res.spiked ? 300 : 520, 0.1, res.spiked ? "square" : "sine", 0.16, res.spiked ? 120 : 780);
+      if (res.spiked) { addFloat(ball.x, ball.y - 24, "SPIKE!", false); buzz(25); }
+    }
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    if (serveT > 0) { serveT -= dt; }
+    else {
+      L.stepBall(ball, dt);
+      L.resolveNet(ball);
+      var side = L.floorSide(ball);
+      if (side === "right") { awardPoint(); if (S.screen !== "playing") return; }
+      else if (side === "left") { awardConcede(); if (S.screen !== "playing") return; }
+    }
+    // Player control: autopilot, drag target, or keys.
+    if (auto) {
+      var dec = L.aiDecision(ball, player.x, player.y, "left", elapsed, Math.random);
+      player.targetX = dec.tx;
+      if (dec.jump && player.jumpCd <= 0 && !player.jumping) { player.jumpQueued = true; player.jumpCd = 0.7; }
+      stepPlayer(player, dt, { tx: player.targetX });
+    } else if (player.targetX !== null) {
+      stepPlayer(player, dt, { tx: player.targetX });
+    } else {
+      stepPlayer(player, dt, { dir: player.keyDir });
+    }
+    // AI opponent.
+    var adec = L.aiDecision(ball, ai.x, ai.y, "right", elapsed, Math.random);
+    if (adec.jump && ai.jumpCd <= 0 && !ai.jumping) { ai.jumpQueued = true; ai.jumpCd = 0.7; }
+    var aiSpeed = 230 + Math.min(100, elapsed * 1.5);
+    stepPlayer(ai, dt, { tx: adec.tx, maxSpeed: aiSpeed });
+    if (serveT <= 0) { tryHit(player); tryHit(ai); }
+    // Stars.
+    for (var i = 0; i < stars.length; i++) {
+      var st = stars[i];
+      if (!st.active) {
+        st.respawnT -= dt;
+        if (st.respawnT <= 0) { stars[i] = spawnStar(); }
+        continue;
+      }
+      st.spin += dt * 2;
+      var sdx = ball.x - st.x, sdy = ball.y - st.y;
+      if (serveT <= 0 && sdx * sdx + sdy * sdy < (ball.r + st.r + 4) * (ball.r + st.r + 4)) collectStar(st);
+    }
+    for (var j = particles.length - 1; j >= 0; j--) {
+      var pt = particles[j];
+      pt.t += dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vy += 300 * dt;
+      if (pt.t > 0.6) particles.splice(j, 1);
+    }
+    for (var k = floats.length - 1; k >= 0; k--) {
+      floats[k].t += dt; floats[k].y -= 40 * dt;
+      if (floats[k].t > 1.1) floats.splice(k, 1);
+    }
+  }
+
+  function drawPlayer(p, color, label) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    var g = ctx.createRadialGradient(-6, -8, 2, 0, 0, L.PLAYER_R + 8);
+    g.addColorStop(0, "#ffffff");
+    g.addColorStop(0.35, color);
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, L.PLAYER_R + 8, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = color;
+    ctx.shadowColor = color; ctx.shadowBlur = 14;
+    ctx.beginPath(); ctx.arc(0, 0, L.PLAYER_R, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#070512";
+    var look = p.side === "left" ? 4 : -4;
+    ctx.beginPath(); ctx.arc(-7 + look, -4, 3.4, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(7 + look, -4, 3.4, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "#070512"; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(look, 6, 8, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.font = "bold 10px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(label, 0, -L.PLAYER_R - 12);
+    ctx.restore();
+  }
+  function drawStarShape(x, y, r, rot) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.fillStyle = "#ffd94a"; ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    for (var i = 0; i < 8; i++) {
+      var a = i * Math.PI / 4, rr = (i % 2 === 0) ? r : r * 0.45;
+      var px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  function render() {
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    var bg = ctx.createLinearGradient(0, 0, 0, L.H);
+    bg.addColorStop(0, "#04122b");
+    bg.addColorStop(0.5, "#0b1030");
+    bg.addColorStop(1, "#120a2e");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    for (var i = 0; i < bgDots.length; i++) {
+      var bd = bgDots[i];
+      ctx.globalAlpha = 0.3 + 0.4 * Math.abs(Math.sin(bd.tw + performance.now() / 900));
+      ctx.fillStyle = "#3a6bff";
+      ctx.beginPath(); ctx.arc(bd.x, bd.y, bd.s, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Court: floor, side walls, center line, net.
+    ctx.strokeStyle = "rgba(53,240,255,0.55)"; ctx.lineWidth = 3;
+    ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 8;
+    ctx.beginPath(); ctx.moveTo(8, L.FLOOR_Y); ctx.lineTo(L.W - 8, L.FLOOR_Y); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(255,255,255,0.14)"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(8, 140); ctx.lineTo(8, L.FLOOR_Y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(L.W - 8, 140); ctx.lineTo(L.W - 8, L.FLOOR_Y); ctx.stroke();
+    // Net: glowing mesh from NET_TOP to floor.
+    ctx.strokeStyle = "#35f0ff"; ctx.lineWidth = 3;
+    ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.moveTo(L.NET_X, L.NET_TOP); ctx.lineTo(L.NET_X, L.FLOOR_Y); ctx.stroke();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(53,240,255,0.35)"; ctx.lineWidth = 1;
+    for (var ny = L.NET_TOP + 18; ny < L.FLOOR_Y; ny += 18) {
+      ctx.beginPath(); ctx.moveTo(L.NET_X - 14, ny); ctx.lineTo(L.NET_X + 14, ny); ctx.stroke();
+    }
+    ctx.fillStyle = "#35f0ff";
+    ctx.beginPath(); ctx.arc(L.NET_X, L.NET_TOP, 5, 0, Math.PI * 2); ctx.fill();
+    // Stars.
+    for (var s = 0; s < stars.length; s++) {
+      if (stars[s].active) drawStarShape(stars[s].x, stars[s].y, stars[s].r, stars[s].spin);
+    }
+    // Ball trail (flat pairs — drawn as one continuous path).
+    if (ball.trail.length >= 4) {
+      ctx.strokeStyle = ball.golden ? "rgba(255,217,74,0.7)" : "rgba(53,240,255,0.7)";
+      ctx.lineWidth = 3; ctx.lineCap = "round"; ctx.lineJoin = "round";
+      ctx.beginPath();
+      ctx.moveTo(ball.trail[0], ball.trail[1]);
+      for (var t = 2; t < ball.trail.length; t += 2) ctx.lineTo(ball.trail[t], ball.trail[t + 1]);
+      ctx.stroke();
+    }
+    // Ball.
+    ctx.save();
+    ctx.translate(ball.x, ball.y);
+    var bg2 = ctx.createRadialGradient(-4, -4, 1, 0, 0, ball.r + 7);
+    bg2.addColorStop(0, "#ffffff");
+    bg2.addColorStop(0.4, ball.golden ? "#ffd94a" : "#9ff3ff");
+    bg2.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = bg2;
+    ctx.beginPath(); ctx.arc(0, 0, ball.r + 7, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = ball.golden ? "#ffd94a" : "#ffffff";
+    ctx.shadowColor = ball.golden ? "#ffd94a" : "#35f0ff"; ctx.shadowBlur = 16;
+    ctx.beginPath(); ctx.arc(0, 0, ball.r, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = ball.golden ? "#8a6d00" : "#1899ad"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(0, 0, ball.r - 3, 0.4, 2.4); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, ball.r - 3, 3.6, 5.4); ctx.stroke();
+    ctx.restore();
+    // Players.
+    drawPlayer(player, "#35f0ff", "YOU");
+    drawPlayer(ai, "#ff5e9c", "RIVAL");
+    // Particles.
+    for (var p = 0; p < particles.length; p++) {
+      var pt = particles[p];
+      ctx.globalAlpha = Math.max(0, 1 - pt.t / 0.6);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Floating score text.
+    ctx.textAlign = "center";
+    for (var f = 0; f < floats.length; f++) {
+      var fl = floats[f];
+      ctx.globalAlpha = Math.max(0, 1 - fl.t / 1.1);
+      ctx.fillStyle = fl.golden ? "#ffd94a" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',sans-serif";
+      ctx.fillText(fl.text, fl.x, fl.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    if (S.screen === "playing" || S.screen === "over") drawHUD();
+  }
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.88)";
+    ctx.fillRect(0, 0, L.W, 76);
+    ctx.strokeStyle = "rgba(53,240,255,0.4)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, 76); ctx.lineTo(L.W, 76); ctx.stroke();
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 26px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, 14, 34);
+    ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = S.combo > 1 ? "#ffd94a" : "#9ff3ff";
+    ctx.fillText("COMBO x" + S.combo + "  ·  PTS " + S.points, 14, 60);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e7a" : "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 36);
+    ctx.font = "bold 13px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 60);
+    ctx.textAlign = "right";
+    ctx.font = "bold 22px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#ff5e7a";
+    var hearts = "";
+    for (var h = 0; h < L.MAX_HEARTS; h++) hearts += h < S.hearts ? "♥" : "♡";
+    ctx.fillText(hearts, L.W - 14, 34);
+    ctx.font = "bold 13px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText(ball.golden ? "★ GOLDEN RALLY ★" : "STARS " + S.stars, L.W - 14, 60);
+    ctx.restore();
+  }
+  function drawTitle() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.78)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#35f0ff";
+    ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 52px 'Segoe UI',sans-serif";
+    ctx.fillText("NEON", L.W / 2, 210);
+    ctx.fillStyle = "#ff5e9c";
+    ctx.shadowColor = "#ff5e9c";
+    ctx.fillText("VOLLEY", L.W / 2, 268);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("60 seconds of neon volleyball chaos!", L.W / 2, 312);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "17px 'Segoe UI',sans-serif";
+    ctx.fillText("Drag to move · Tap to JUMP", L.W / 2, 360);
+    ctx.fillText("Jump INTO the ball to SPIKE it down", L.W / 2, 388);
+    ctx.fillText("Bump it over the net — never let it", L.W / 2, 416);
+    ctx.fillText("land on YOUR side of the court", L.W / 2, 444);
+    ctx.fillStyle = "#ffd94a";
+    ctx.fillText("Points pay 100 x combo · Golden rallies 5x", L.W / 2, 486);
+    ctx.fillText("Stars pay 50 x combo · 3 hearts", L.W / 2, 514);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 21px 'Segoe UI',sans-serif";
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO START", L.W / 2, 590);
+    ctx.globalAlpha = 1;
+    ctx.font = "15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 628);
+    ctx.restore();
+  }
+  function drawOver() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.82)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff";
+    ctx.shadowColor = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 44px 'Segoe UI',sans-serif";
+    ctx.fillText(S.hearts <= 0 ? "OUT OF HEARTS!" : "TIME'S UP!", L.W / 2, 250);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, L.W / 2, 320);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "19px 'Segoe UI',sans-serif";
+    ctx.fillText("Points " + S.points + "  ·  Stars " + S.stars + "  ·  Touches " + S.touches, L.W / 2, 360);
+    if (S.flawless) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 20px 'Segoe UI',sans-serif";
+      ctx.fillText("FLAWLESS +500 — no concedes!", L.W / 2, 396);
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("BEST " + S.best, L.W / 2, 440);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 520);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  var downPos = null, downTime = 0;
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    var w = toWorld(e);
+    downPos = w; downTime = performance.now();
+    player.targetX = w.x;
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!downPos) return;
+    var w = toWorld(e);
+    player.targetX = w.x;
+    e.preventDefault();
+  }
+  function onUp(e) {
+    if (!downPos) return;
+    var w = toWorld(e);
+    var moved = Math.hypot(w.x - downPos.x, w.y - downPos.y);
+    if (performance.now() - downTime < 250 && moved < 14) {
+      // Quick tap: jump.
+      if (S.screen === "playing" && !player.jumping) { player.jumpQueued = true; player.jumpCd = 0; }
+    }
+    downPos = null;
+    e.preventDefault();
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", function () { downPos = null; });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") player.keyDir = -1;
+    else if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") player.keyDir = 1;
+    else if ((e.key === "ArrowUp" || e.key === " " || e.key === "w" || e.key === "W") && S.screen === "playing" && !player.jumping) player.jumpQueued = true;
+    else if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    else if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_volley_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+  window.addEventListener("keyup", function (e) {
+    if ((e.key === "ArrowLeft" || e.key === "a" || e.key === "A") && player.keyDir === -1) player.keyDir = 0;
+    if ((e.key === "ArrowRight" || e.key === "d" || e.key === "D") && player.keyDir === 1) player.keyDir = 0;
+  });
+
+  window.__volleyState = S;
+  window.__volleyDebug = {
+    player: function () { return { x: Math.round(player.x), y: Math.round(player.y), vx: Math.round(player.vx), vy: Math.round(player.vy), jumping: player.jumping }; },
+    ai: function () { return { x: Math.round(ai.x), y: Math.round(ai.y), jumping: ai.jumping }; },
+    ball: function () { return { x: Math.round(ball.x), y: Math.round(ball.y), vx: Math.round(ball.vx), vy: Math.round(ball.vy), golden: ball.golden }; },
+    setAuto: function (v) { auto = v; },
+    start: function () { start(); },
+    jump: function () { if (S.screen === "playing" && !player.jumping) player.jumpQueued = true; },
+    // Drop the ball onto the rival floor, AI parked far away: the next
+    // step must score exactly one point for the player.
+    debugPoint: function () {
+      if (S.screen !== "playing") return null;
+      ai.x = 450; ai.y = L.FLOOR_Y - L.PLAYER_R;
+      serveT = 0;
+      ball.x = 320; ball.y = L.FLOOR_Y - L.BALL_R - 2; ball.vx = 0; ball.vy = 80;
+      return { x: ball.x, y: ball.y };
+    },
+    // Drop the ball onto your floor, player parked far away: the next step
+    // must cost exactly one heart.
+    debugConcede: function () {
+      if (S.screen !== "playing") return null;
+      player.x = 60; player.y = L.FLOOR_Y - L.PLAYER_R; player.targetX = 60;
+      serveT = 0;
+      ball.x = 160; ball.y = L.FLOOR_Y - L.BALL_R - 2; ball.vx = 0; ball.vy = 80;
+      return { x: ball.x, y: ball.y };
+    },
+    // Put the ball on a live star: the next step must collect it.
+    debugStar: function () {
+      if (S.screen !== "playing") return null;
+      for (var i = 0; i < stars.length; i++) {
+        if (stars[i].active) {
+          serveT = 0;
+          ball.x = stars[i].x; ball.y = stars[i].y; ball.vx = 0; ball.vy = 0;
+          return { x: stars[i].x, y: stars[i].y };
+        }
+      }
+      return null;
+    }
+  };
+
+  reset();
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
