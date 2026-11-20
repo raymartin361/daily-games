@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Tanks — Day 56</title>
+<meta name="description" content="Neon Tanks — 60 seconds of neon tank battle chaos. Drag to drive, tap to FIRE — your shells bounce off the walls once, so bank shots around the blocks. Kills pay 100 x combo, golden tanks pay 5x.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Tanks — Day 56. A neon tank-battle arena: you (cyan) vs waves of
+   enemy tanks (magenta, orange, red). Drag to drive, tap to FIRE a shell
+   toward the tap — your shells bounce off the arena walls once, so bank
+   shots around the blocks. Enemy tanks roam, take aim (barrel glows) and
+   fire back. Kills pay 100 x combo; chain 4 kills to raise the combo
+   x1->x5. Every 6th enemy spawned is GOLDEN (5x). Stars on the field pay
+   50 x combo when you drive over them. A hit costs a heart (3 hearts).
+   Flawless (no hits) +500. 60 seconds, best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var TanksLogic = (function () {
+  var W = 480, H = 800;
+  var ARENA = { x: 16, y: 92, w: 448, h: 684 }; // x 16..464, y 92..776
+  var BLOCKS = [
+    { x: 120, y: 300, w: 56, h: 110 },
+    { x: 304, y: 300, w: 56, h: 110 },
+    { x: 200, y: 520, w: 80, h: 44 },
+    { x: 200, y: 180, w: 80, h: 44 }
+  ];
+  var SPAWNS = [
+    { x: 70, y: 130 }, { x: 240, y: 120 }, { x: 410, y: 130 },
+    { x: 70, y: 430 }, { x: 410, y: 430 }
+  ];
+  var PLAYER_R = 20, ENEMY_R = 18, SHELL_R = 5;
+  var PLAYER_SPEED = 300, SHELL_SPEED = 540, ENEMY_SHELL_SPEED = 380;
+  var FIRE_CD = 0.35, AIM_TIME = 0.45, INVULN_TIME = 1.5;
+  var GAME_TIME = 60, MAX_HEARTS = 3;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function dist(ax, ay, bx, by) { var dx = bx - ax, dy = by - ay; return Math.sqrt(dx * dx + dy * dy); }
+
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, combo: 1, streak: 0,
+      kills: 0, hits: 0, hearts: MAX_HEARTS, timeLeft: GAME_TIME,
+      flawless: false, stars: 0, shots: 0 };
+  }
+  // combo: +1 every 4 consecutive kills, capped at x5.
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function killPoints(combo, golden) { return 100 * combo * (golden ? 5 : 1); }
+  function starPoints(combo) { return 50 * combo; }
+  // 1-based: the 6th, 12th, 18th... enemy spawned is GOLDEN.
+  function isGoldenSpawn(n) { return n % 6 === 0; }
+  function maxEnemies(elapsed) {
+    var m = 2 + Math.floor(elapsed / 15);
+    return m > 5 ? 5 : m;
+  }
+  function spawnInterval(elapsed) {
+    var iv = 2.2 - elapsed * 0.02;
+    return iv < 1.1 ? 1.1 : iv;
+  }
+  function enemySpeed(elapsed) {
+    var s = 120 + elapsed * 1.2;
+    return s > 190 ? 190 : s;
+  }
+
+  // Reflect a velocity off an arena wall. wall is "left" | "right" |
+  // "top" | "bottom".
+  function reflect(vx, vy, wall) {
+    if (wall === "left" || wall === "right") return { vx: -vx, vy: vy };
+    return { vx: vx, vy: -vy };
+  }
+  // Which arena wall (if any) a point of radius r has crossed.
+  function wallHit(x, y, r) {
+    if (x - r < ARENA.x) return "left";
+    if (x + r > ARENA.x + ARENA.w) return "right";
+    if (y - r < ARENA.y) return "top";
+    if (y + r > ARENA.y + ARENA.h) return "bottom";
+    return null;
+  }
+  // Circle vs rect test (tank vs block, shell vs block).
+  function circleHitsRect(cx, cy, r, rect) {
+    var nx = clamp(cx, rect.x, rect.x + rect.w);
+    var ny = clamp(cy, rect.y, rect.y + rect.h);
+    var dx = cx - nx, dy = cy - ny;
+    return dx * dx + dy * dy < r * r;
+  }
+  // Push a circle out of a rect it overlaps; returns true on collision.
+  // Mutates p ({x,y}).
+  function resolveCircleRect(p, r, rect) {
+    var nx = clamp(p.x, rect.x, rect.x + rect.w);
+    var ny = clamp(p.y, rect.y, rect.y + rect.h);
+    var dx = p.x - nx, dy = p.y - ny;
+    var d2 = dx * dx + dy * dy;
+    if (d2 >= r * r) return false;
+    if (d2 > 0.0001) {
+      var d = Math.sqrt(d2);
+      p.x = nx + dx / d * r;
+      p.y = ny + dy / d * r;
+    } else {
+      // Center inside the rect: push out along the smallest penetration.
+      var left = p.x - rect.x, right = rect.x + rect.w - p.x;
+      var top = p.y - rect.y, bottom = rect.y + rect.h - p.y;
+      var m = Math.min(left, right, top, bottom);
+      if (m === left) p.x = rect.x - r;
+      else if (m === right) p.x = rect.x + rect.w + r;
+      else if (m === top) p.y = rect.y - r;
+      else p.y = rect.y + rect.h + r;
+    }
+    return true;
+  }
+  // Keep a circle inside the arena; returns the wall hit (or null).
+  function clampToArena(p, r) {
+    var wall = null;
+    if (p.x - r < ARENA.x) { p.x = ARENA.x + r; wall = "left"; }
+    if (p.x + r > ARENA.x + ARENA.w) { p.x = ARENA.x + ARENA.w - r; wall = "right"; }
+    if (p.y - r < ARENA.y) { p.y = ARENA.y + r; wall = "top"; }
+    if (p.y + r > ARENA.y + ARENA.h) { p.y = ARENA.y + ARENA.h - r; wall = "bottom"; }
+    return wall;
+  }
+  // Segment vs rect: true if the segment touches or crosses the rect.
+  // Used for line-of-sight (enemy can only shoot what it can see).
+  function segHitsRect(x1, y1, x2, y2, rect) {
+    if (x1 >= rect.x && x1 <= rect.x + rect.w && y1 >= rect.y && y1 <= rect.y + rect.h) return true;
+    if (x2 >= rect.x && x2 <= rect.x + rect.w && y2 >= rect.y && y2 <= rect.y + rect.h) return true;
+    function segSeg(ax, ay, bx, by, cx, cy, dx, dy) {
+      var d = (bx - ax) * (dy - cy) - (by - ay) * (dx - cx);
+      if (d === 0) return false;
+      var t = ((cx - ax) * (dy - cy) - (cy - ay) * (dx - cx)) / d;
+      var u = ((cx - ax) * (by - ay) - (cy - ay) * (bx - ax)) / d;
+      return t >= 0 && t <= 1 && u >= 0 && u <= 1;
+    }
+    var rx = rect.x, ry = rect.y, rw = rect.x + rect.w, rh = rect.y + rect.h;
+    return segSeg(x1, y1, x2, y2, rx, ry, rw, ry) ||
+      segSeg(x1, y1, x2, y2, rw, ry, rw, rh) ||
+      segSeg(x1, y1, x2, y2, rw, rh, rx, rh) ||
+      segSeg(x1, y1, x2, y2, rx, rh, rx, ry);
+  }
+  function hasLOS(ax, ay, bx, by, blocks) {
+    for (var i = 0; i < blocks.length; i++) {
+      if (segHitsRect(ax, ay, bx, by, blocks[i])) return false;
+    }
+    return true;
+  }
+  // Random waypoint inside the arena, clear of blocks (margin = tank r).
+  function pickWaypoint(rng) {
+    for (var tries = 0; tries < 20; tries++) {
+      var x = ARENA.x + 30 + rng() * (ARENA.w - 60);
+      var y = ARENA.y + 30 + rng() * (ARENA.h - 60);
+      var clear = true;
+      for (var i = 0; i < BLOCKS.length; i++) {
+        if (circleHitsRect(x, y, ENEMY_R + 6, BLOCKS[i])) { clear = false; break; }
+      }
+      if (clear) return { x: x, y: y };
+    }
+    return { x: ARENA.x + ARENA.w / 2, y: ARENA.y + 60 };
+  }
+  // Shell step: integrate, return "wall" | "block" | null. The caller
+  // handles the bounce (player shells bounce once, enemy shells die).
+  function stepShell(s, dt, blocks) {
+    s.px = s.x; s.py = s.y;
+    s.x += s.vx * dt;
+    s.y += s.vy * dt;
+    var w = wallHit(s.x, s.y, s.r);
+    if (w) return { hit: "wall", wall: w };
+    for (var i = 0; i < blocks.length; i++) {
+      if (circleHitsRect(s.x, s.y, s.r, blocks[i])) return { hit: "block" };
+    }
+    return { hit: null };
+  }
+
+  return { W: W, H: H, ARENA: ARENA, BLOCKS: BLOCKS, SPAWNS: SPAWNS,
+    PLAYER_R: PLAYER_R, ENEMY_R: ENEMY_R, SHELL_R: SHELL_R,
+    PLAYER_SPEED: PLAYER_SPEED, SHELL_SPEED: SHELL_SPEED,
+    ENEMY_SHELL_SPEED: ENEMY_SHELL_SPEED, FIRE_CD: FIRE_CD,
+    AIM_TIME: AIM_TIME, INVULN_TIME: INVULN_TIME,
+    GAME_TIME: GAME_TIME, MAX_HEARTS: MAX_HEARTS,
+    clamp: clamp, dist: dist, makeState: makeState,
+    comboForStreak: comboForStreak, killPoints: killPoints,
+    starPoints: starPoints, isGoldenSpawn: isGoldenSpawn,
+    maxEnemies: maxEnemies, spawnInterval: spawnInterval,
+    enemySpeed: enemySpeed, reflect: reflect, wallHit: wallHit,
+    circleHitsRect: circleHitsRect, resolveCircleRect: resolveCircleRect,
+    clampToArena: clampToArena, segHitsRect: segHitsRect, hasLOS: hasLOS,
+    pickWaypoint: pickWaypoint, stepShell: stepShell };
+})();
+//LOGIC-END
+
+(function () {
+  var L = TanksLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_tanks_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_tanks_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, spawnT = 1.2, spawnCount = 0;
+  var player = { x: 240, y: 700, angle: -Math.PI / 2, turret: -Math.PI / 2,
+    targetX: null, targetY: null, keyDirX: 0, keyDirY: 0, fireCd: 0,
+    invuln: 0, moving: false };
+  var enemies = [], pShells = [], eShells = [];
+  var stars = [];
+  var particles = [], floats = [], bgDots = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  for (var i = 0; i < 70; i++) {
+    bgDots.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 0.6 + Math.random() * 1.6, tw: Math.random() * Math.PI * 2 });
+  }
+  function spawnStar() {
+    for (var tries = 0; tries < 20; tries++) {
+      var x = L.ARENA.x + 30 + Math.random() * (L.ARENA.w - 60);
+      var y = L.ARENA.y + 30 + Math.random() * (L.ARENA.h - 60);
+      var clear = true;
+      for (var i = 0; i < L.BLOCKS.length; i++) {
+        if (L.circleHitsRect(x, y, 20, L.BLOCKS[i])) { clear = false; break; }
+      }
+      if (clear) return { x: x, y: y, r: 13, active: true, respawnT: 0, spin: Math.random() * Math.PI * 2 };
+    }
+    return { x: 240, y: 420, r: 13, active: true, respawnT: 0, spin: 0 };
+  }
+  stars = [spawnStar(), spawnStar()];
+
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_tanks_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; spawnT = 1.2; spawnCount = 0;
+    player.x = 240; player.y = 700; player.angle = -Math.PI / 2; player.turret = -Math.PI / 2;
+    player.targetX = null; player.targetY = null; player.keyDirX = 0; player.keyDirY = 0;
+    player.fireCd = 0; player.invuln = 0; player.moving = false;
+    enemies = []; pShells = []; eShells = [];
+    stars = [spawnStar(), spawnStar()];
+    particles = []; floats = [];
+    window.__tanksState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(outOfHearts) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.hits === 0 && S.kills > 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_tanks_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__tanksState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function spawnEnemy() {
+    spawnCount++;
+    var sp = L.SPAWNS[(spawnCount - 1) % L.SPAWNS.length];
+    var golden = L.isGoldenSpawn(spawnCount);
+    var wp = L.pickWaypoint(Math.random);
+    enemies.push({ x: sp.x, y: sp.y, angle: Math.PI / 2, turret: Math.PI / 2,
+      wp: wp, wpT: 2 + Math.random() * 2, fireCd: 1.2 + Math.random() * 1.2,
+      aiming: false, aimT: 0, golden: golden, flash: 0 });
+    burst(sp.x, sp.y, golden ? "#ffd94a" : "#ff5e9c", 10);
+  }
+  function firePlayer(tx, ty) {
+    if (player.fireCd > 0 || S.screen !== "playing") return false;
+    var a = Math.atan2(ty - player.y, tx - player.x);
+    player.turret = a;
+    var bx = player.x + Math.cos(a) * (L.PLAYER_R + 8);
+    var by = player.y + Math.sin(a) * (L.PLAYER_R + 8);
+    pShells.push({ x: bx, y: by, vx: Math.cos(a) * L.SHELL_SPEED,
+      vy: Math.sin(a) * L.SHELL_SPEED, r: L.SHELL_R, bounced: false, px: bx, py: by });
+    player.fireCd = L.FIRE_CD;
+    S.shots++;
+    tone(520, 0.08, "square", 0.12, 180);
+    buzz(12);
+    return true;
+  }
+  function fireEnemy(e) {
+    var a = Math.atan2(player.y - e.y, player.x - e.x);
+    e.turret = a;
+    var bx = e.x + Math.cos(a) * (L.ENEMY_R + 8);
+    var by = e.y + Math.sin(a) * (L.ENEMY_R + 8);
+    eShells.push({ x: bx, y: by, vx: Math.cos(a) * L.ENEMY_SHELL_SPEED,
+      vy: Math.sin(a) * L.ENEMY_SHELL_SPEED, r: L.SHELL_R, px: bx, py: by });
+    tone(300, 0.1, "square", 0.1, 140);
+  }
+  function awardKill(e) {
+    S.kills++;
+    var pts = L.killPoints(S.combo, e.golden);
+    S.score += pts;
+    S.streak++;
+    S.combo = L.comboForStreak(S.streak);
+    addFloat(e.x, e.y - 24, "+" + pts, e.golden);
+    burst(e.x, e.y, e.golden ? "#ffd94a" : "#ff5e9c", e.golden ? 24 : 14);
+    tone(e.golden ? 1320 : 880, 0.15, "sine", 0.2, e.golden ? 1760 : 1170);
+    buzz(30);
+    window.__tanksState = S;
+  }
+  function damagePlayer() {
+    if (player.invuln > 0) return;
+    S.hits++;
+    S.hearts--;
+    S.streak = 0; S.combo = 1;
+    player.invuln = L.INVULN_TIME;
+    burst(player.x, player.y, "#ff5e7a", 16);
+    tone(180, 0.3, "sawtooth", 0.18, 90);
+    buzz([40, 40, 40]);
+    if (S.hearts <= 0) { endGame(true); return; }
+    window.__tanksState = S;
+  }
+  function collectStar(st) {
+    var pts = L.starPoints(S.combo);
+    S.score += pts; S.stars++;
+    addFloat(st.x, st.y - 20, "+" + pts, false);
+    burst(st.x, st.y, "#ffd94a", 10);
+    tone(1170, 0.12, "sine", 0.16, 1560);
+    st.active = false; st.respawnT = 2.5;
+    window.__tanksState = S;
+  }
+  function nearestEnemy() {
+    var bestE = null, bestD = Infinity;
+    for (var i = 0; i < enemies.length; i++) {
+      var d = L.dist(player.x, player.y, enemies[i].x, enemies[i].y);
+      if (d < bestD) { bestD = d; bestE = enemies[i]; }
+    }
+    return bestE ? { e: bestE, d: bestD } : null;
+  }
+
+  function stepPlayer(dt) {
+    var mx = 0, my = 0;
+    if (player.targetX !== null && player.targetY !== null) {
+      var dx = player.targetX - player.x, dy = player.targetY - player.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d > 8) { mx = dx / d; my = dy / d; }
+      else { player.targetX = null; player.targetY = null; }
+    } else if (player.keyDirX !== 0 || player.keyDirY !== 0) {
+      mx = player.keyDirX; my = player.keyDirY;
+      var kd = Math.sqrt(mx * mx + my * my);
+      mx /= kd; my /= kd;
+    }
+    player.moving = (mx !== 0 || my !== 0);
+    if (player.moving) {
+      player.x += mx * L.PLAYER_SPEED * dt;
+      player.y += my * L.PLAYER_SPEED * dt;
+      player.angle = Math.atan2(my, mx);
+    }
+    L.clampToArena(player, L.PLAYER_R);
+    for (var i = 0; i < L.BLOCKS.length; i++) L.resolveCircleRect(player, L.PLAYER_R, L.BLOCKS[i]);
+    if (player.fireCd > 0) player.fireCd -= dt;
+    if (player.invuln > 0) player.invuln -= dt;
+  }
+  function stepEnemy(e, dt) {
+    var speed = L.enemySpeed(elapsed);
+    var dPlayer = L.dist(e.x, e.y, player.x, player.y);
+    var los = dPlayer < 400 && L.hasLOS(e.x, e.y, player.x, player.y, L.BLOCKS);
+    if (e.fireCd > 0) e.fireCd -= dt;
+    if (e.flash > 0) e.flash -= dt;
+    if (los && e.fireCd <= 0) {
+      // Aim: barrel tracks the player for AIM_TIME, then fire.
+      e.aiming = true;
+      e.aimT += dt;
+      e.turret = Math.atan2(player.y - e.y, player.x - e.x);
+      if (e.aimT >= L.AIM_TIME) {
+        fireEnemy(e);
+        e.aiming = false; e.aimT = 0;
+        e.fireCd = 1.6 + Math.random() * 1.0;
+      }
+      return; // hold position while aiming
+    }
+    e.aiming = false; e.aimT = 0;
+    e.wpT -= dt;
+    var wdx = e.wp.x - e.x, wdy = e.wp.y - e.y;
+    var wd = Math.sqrt(wdx * wdx + wdy * wdy);
+    if (wd < 12 || e.wpT <= 0) {
+      e.wp = L.pickWaypoint(Math.random);
+      e.wpT = 2 + Math.random() * 2;
+      return;
+    }
+    e.x += wdx / wd * speed * dt;
+    e.y += wdy / wd * speed * dt;
+    e.angle = Math.atan2(wdy, wdx);
+    L.clampToArena(e, L.ENEMY_R);
+    for (var i = 0; i < L.BLOCKS.length; i++) L.resolveCircleRect(e, L.ENEMY_R, L.BLOCKS[i]);
+  }
+  function separateEnemies() {
+    for (var i = 0; i < enemies.length; i++) {
+      for (var j = i + 1; j < enemies.length; j++) {
+        var a = enemies[i], b = enemies[j];
+        var dx = b.x - a.x, dy = b.y - a.y;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        var min = L.ENEMY_R * 2 + 2;
+        if (d > 0.001 && d < min) {
+          var push = (min - d) / 2, nx = dx / d, ny = dy / d;
+          a.x -= nx * push; a.y -= ny * push;
+          b.x += nx * push; b.y += ny * push;
+        }
+      }
+      // Enemy never overlaps the player: shove it out (no damage).
+      var pdx = enemies[i].x - player.x, pdy = enemies[i].y - player.y;
+      var pd = Math.sqrt(pdx * pdx + pdy * pdy);
+      var pmin = L.ENEMY_R + L.PLAYER_R + 2;
+      if (pd > 0.001 && pd < pmin) {
+        enemies[i].x = player.x + pdx / pd * pmin;
+        enemies[i].y = player.y + pdy / pd * pmin;
+      }
+    }
+  }
+  function stepShells(dt) {
+    // Player shells: bounce once off walls, die on blocks, kill enemies,
+    // cancel enemy shells.
+    for (var i = pShells.length - 1; i >= 0; i--) {
+      var s = pShells[i];
+      var res = L.stepShell(s, dt, L.BLOCKS);
+      var dead = false;
+      if (res.hit === "wall") {
+        if (!s.bounced) {
+          var r = L.reflect(s.vx, s.vy, res.wall);
+          s.vx = r.vx; s.vy = r.vy; s.bounced = true;
+          L.clampToArena(s, s.r);
+          tone(700, 0.05, "sine", 0.08, 900);
+        } else dead = true;
+      } else if (res.hit === "block") dead = true;
+      if (!dead) {
+        for (var k = enemies.length - 1; k >= 0; k--) {
+          var e = enemies[k];
+          if (L.dist(s.x, s.y, e.x, e.y) < s.r + L.ENEMY_R) {
+            awardKill(e);
+            enemies.splice(k, 1);
+            dead = true;
+            break;
+          }
+        }
+      }
+      if (!dead) {
+        for (var m = eShells.length - 1; m >= 0; m--) {
+          var es = eShells[m];
+          if (L.dist(s.x, s.y, es.x, es.y) < s.r + es.r + 4) {
+            burst(s.x, s.y, "#ffffff", 6);
+            eShells.splice(m, 1);
+            dead = true;
+            break;
+          }
+        }
+      }
+      if (dead) pShells.splice(i, 1);
+    }
+    // Enemy shells: die on walls/blocks, hurt the player on contact.
+    for (var j = eShells.length - 1; j >= 0; j--) {
+      var es2 = eShells[j];
+      var res2 = L.stepShell(es2, dt, L.BLOCKS);
+      var dead2 = res2.hit !== null;
+      if (!dead2 && player.invuln <= 0 &&
+          L.dist(es2.x, es2.y, player.x, player.y) < es2.r + L.PLAYER_R) {
+        damagePlayer();
+        dead2 = true;
+      }
+      if (dead2) eShells.splice(j, 1);
+    }
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    // Spawning.
+    if (spawnT > 0) spawnT -= dt;
+    else if (enemies.length < L.maxEnemies(elapsed)) {
+      spawnEnemy();
+      spawnT = L.spawnInterval(elapsed);
+    }
+    // Autopilot: chase the nearest enemy, keep ~200px, fire when aimed.
+    if (auto) {
+      var near = nearestEnemy();
+      if (near) {
+        var e = near.e;
+        var ang = Math.atan2(e.y - player.y, e.x - player.x);
+        var wantD = 200;
+        var tx = e.x - Math.cos(ang) * wantD, ty = e.y - Math.sin(ang) * wantD;
+        player.targetX = L.clamp(tx, L.ARENA.x + 30, L.ARENA.x + L.ARENA.w - 30);
+        player.targetY = L.clamp(ty, L.ARENA.y + 30, L.ARENA.y + L.ARENA.h - 30);
+        var aimErr = Math.abs(((Math.atan2(e.y - player.y, e.x - player.x) - player.turret + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+        if (aimErr < 0.3 && player.fireCd <= 0) firePlayer(e.x, e.y);
+        else if (player.fireCd <= 0) player.turret = Math.atan2(e.y - player.y, e.x - player.x);
+      } else {
+        player.targetX = 240; player.targetY = 420;
+      }
+    }
+    stepPlayer(dt);
+    for (var i = 0; i < enemies.length; i++) stepEnemy(enemies[i], dt);
+    separateEnemies();
+    stepShells(dt);
+    if (S.screen !== "playing") return;
+    // Stars: drive over one to collect.
+    for (var s = 0; s < stars.length; s++) {
+      var st = stars[s];
+      if (!st.active) {
+        st.respawnT -= dt;
+        if (st.respawnT <= 0) { stars[s] = spawnStar(); }
+        continue;
+      }
+      st.spin += dt * 2;
+      if (L.dist(player.x, player.y, st.x, st.y) < L.PLAYER_R + st.r) collectStar(st);
+    }
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.t += dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vy += 300 * dt;
+      if (pt.t > 0.6) particles.splice(p, 1);
+    }
+    for (var f = floats.length - 1; f >= 0; f--) {
+      floats[f].t += dt; floats[f].y -= 40 * dt;
+      if (floats[f].t > 1.1) floats.splice(f, 1);
+    }
+  }
+
+  function drawTank(x, y, bodyAngle, turretAngle, color, r, golden, aiming, invuln) {
+    ctx.save();
+    ctx.translate(x, y);
+    if (invuln > 0 && Math.floor(performance.now() / 120) % 2 === 0) ctx.globalAlpha = 0.35;
+    // Glow halo (gradient created AFTER the translate, in local coords).
+    var g = ctx.createRadialGradient(0, 0, 2, 0, 0, r + 10);
+    g.addColorStop(0, "#ffffff");
+    g.addColorStop(0.35, color);
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, r + 10, 0, Math.PI * 2); ctx.fill();
+    // Tracks.
+    ctx.save();
+    ctx.rotate(bodyAngle);
+    ctx.fillStyle = "#0a0f28";
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.roundRect(-r - 2, -r - 4, r * 2 + 4, 10, 4); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.roundRect(-r - 2, r - 6, r * 2 + 4, 10, 4); ctx.fill(); ctx.stroke();
+    ctx.restore();
+    // Body.
+    ctx.fillStyle = color;
+    ctx.shadowColor = color; ctx.shadowBlur = aiming ? 22 : 14;
+    ctx.beginPath(); ctx.arc(0, 0, r - 3, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(255,255,255,0.65)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, r - 6, 0, Math.PI * 2); ctx.stroke();
+    // Barrel + turret.
+    ctx.save();
+    ctx.rotate(turretAngle);
+    ctx.fillStyle = "#0a0f28";
+    ctx.fillRect(r - 8, -4, 16, 8);
+    ctx.fillStyle = golden ? "#ffd94a" : color;
+    ctx.beginPath(); ctx.arc(0, 0, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#070512";
+    ctx.beginPath(); ctx.arc(0, 0, 3.5, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    if (golden) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 11px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("★ GOLD ★", 0, -r - 14);
+    }
+    ctx.restore();
+  }
+  function drawStarShape(x, y, r, rot) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.fillStyle = "#ffd94a"; ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    for (var i = 0; i < 8; i++) {
+      var a = i * Math.PI / 4, rr = (i % 2 === 0) ? r : r * 0.45;
+      var px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  function render() {
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    var bg = ctx.createLinearGradient(0, 0, 0, L.H);
+    bg.addColorStop(0, "#04122b");
+    bg.addColorStop(0.5, "#0b1030");
+    bg.addColorStop(1, "#120a2e");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    for (var i = 0; i < bgDots.length; i++) {
+      var bd = bgDots[i];
+      ctx.globalAlpha = 0.3 + 0.4 * Math.abs(Math.sin(bd.tw + performance.now() / 900));
+      ctx.fillStyle = "#3a6bff";
+      ctx.beginPath(); ctx.arc(bd.x, bd.y, bd.s, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Arena walls.
+    ctx.strokeStyle = "rgba(53,240,255,0.6)"; ctx.lineWidth = 3;
+    ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 10;
+    ctx.strokeRect(L.ARENA.x, L.ARENA.y, L.ARENA.w, L.ARENA.h);
+    ctx.shadowBlur = 0;
+    // Blocks.
+    for (var b = 0; b < L.BLOCKS.length; b++) {
+      var bl = L.BLOCKS[b];
+      ctx.fillStyle = "#141b3d";
+      ctx.strokeStyle = "#ff9d5c"; ctx.lineWidth = 2;
+      ctx.shadowColor = "#ff9d5c"; ctx.shadowBlur = 8;
+      ctx.beginPath(); ctx.roundRect(bl.x, bl.y, bl.w, bl.h, 8); ctx.fill(); ctx.stroke();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "rgba(255,157,92,0.4)"; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(bl.x + 8, bl.y + bl.h / 2); ctx.lineTo(bl.x + bl.w - 8, bl.y + bl.h / 2);
+      ctx.stroke();
+    }
+    // Stars.
+    for (var s = 0; s < stars.length; s++) {
+      if (stars[s].active) drawStarShape(stars[s].x, stars[s].y, stars[s].r, stars[s].spin);
+    }
+    // Enemy aim telegraphs.
+    for (var e = 0; e < enemies.length; e++) {
+      var en = enemies[e];
+      if (en.aiming) {
+        ctx.strokeStyle = "rgba(255,94,122,0.75)"; ctx.lineWidth = 1.5;
+        ctx.setLineDash([6, 6]);
+        ctx.beginPath(); ctx.moveTo(en.x, en.y); ctx.lineTo(player.x, player.y); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+    // Shells: short motion streak + glowing core.
+    function drawShell(sh, color) {
+      ctx.strokeStyle = color; ctx.lineWidth = 3; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(sh.px, sh.py); ctx.lineTo(sh.x, sh.y); ctx.stroke();
+      ctx.fillStyle = "#ffffff";
+      ctx.shadowColor = color; ctx.shadowBlur = 10;
+      ctx.beginPath(); ctx.arc(sh.x, sh.y, sh.r, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+    for (var ps = 0; ps < pShells.length; ps++) drawShell(pShells[ps], pShells[ps].bounced ? "#ffd94a" : "#35f0ff");
+    for (var es = 0; es < eShells.length; es++) drawShell(eShells[es], "#ff5e7a");
+    // Enemies.
+    for (var ei = 0; ei < enemies.length; ei++) {
+      var en2 = enemies[ei];
+      var col = en2.golden ? "#ffd94a" : (en2.flash > 0 ? "#ffffff" : "#ff5e9c");
+      drawTank(en2.x, en2.y, en2.angle, en2.turret, col, L.ENEMY_R, en2.golden, en2.aiming, 0);
+    }
+    // Player.
+    drawTank(player.x, player.y, player.angle, player.turret, "#35f0ff", L.PLAYER_R, false, false, player.invuln);
+    // Particles.
+    for (var p = 0; p < particles.length; p++) {
+      var pt = particles[p];
+      ctx.globalAlpha = Math.max(0, 1 - pt.t / 0.6);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Floating score text.
+    ctx.textAlign = "center";
+    for (var f = 0; f < floats.length; f++) {
+      var fl = floats[f];
+      ctx.globalAlpha = Math.max(0, 1 - fl.t / 1.1);
+      ctx.fillStyle = fl.golden ? "#ffd94a" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',sans-serif";
+      ctx.fillText(fl.text, fl.x, fl.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    if (S.screen === "playing" || S.screen === "over") drawHUD();
+  }
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.88)";
+    ctx.fillRect(0, 0, L.W, 76);
+    ctx.strokeStyle = "rgba(53,240,255,0.4)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, 76); ctx.lineTo(L.W, 76); ctx.stroke();
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 26px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, 14, 34);
+    ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = S.combo > 1 ? "#ffd94a" : "#9ff3ff";
+    ctx.fillText("COMBO x" + S.combo + "  ·  KILLS " + S.kills, 14, 60);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e7a" : "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 36);
+    ctx.font = "bold 13px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 60);
+    ctx.textAlign = "right";
+    ctx.font = "bold 22px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#ff5e7a";
+    var hearts = "";
+    for (var h = 0; h < L.MAX_HEARTS; h++) hearts += h < S.hearts ? "♥" : "♡";
+    ctx.fillText(hearts, L.W - 14, 34);
+    ctx.font = "bold 13px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("STARS " + S.stars + "  ·  SHOTS " + S.shots, L.W - 14, 60);
+    ctx.restore();
+  }
+  function drawTitle() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.78)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#35f0ff";
+    ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 52px 'Segoe UI',sans-serif";
+    ctx.fillText("NEON", L.W / 2, 210);
+    ctx.fillStyle = "#ff5e9c";
+    ctx.shadowColor = "#ff5e9c";
+    ctx.fillText("TANKS", L.W / 2, 268);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("60 seconds of neon tank battle!", L.W / 2, 312);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "17px 'Segoe UI',sans-serif";
+    ctx.fillText("Drag to drive · Tap to FIRE", L.W / 2, 360);
+    ctx.fillText("Your shells bounce off the walls once —", L.W / 2, 388);
+    ctx.fillText("bank shots around the blocks!", L.W / 2, 416);
+    ctx.fillText("Enemy tanks take aim before they fire —", L.W / 2, 444);
+    ctx.fillText("dodge the red dashed line", L.W / 2, 472);
+    ctx.fillStyle = "#ffd94a";
+    ctx.fillText("Kills pay 100 x combo · Golden tanks 5x", L.W / 2, 514);
+    ctx.fillText("Stars pay 50 x combo · 3 hearts", L.W / 2, 542);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 21px 'Segoe UI',sans-serif";
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO START", L.W / 2, 606);
+    ctx.globalAlpha = 1;
+    ctx.font = "15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 644);
+    ctx.restore();
+  }
+  function drawOver() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.82)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff";
+    ctx.shadowColor = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 44px 'Segoe UI',sans-serif";
+    ctx.fillText(S.hearts <= 0 ? "OUT OF TANKS!" : "TIME'S UP!", L.W / 2, 250);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, L.W / 2, 320);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "19px 'Segoe UI',sans-serif";
+    ctx.fillText("Kills " + S.kills + "  ·  Stars " + S.stars + "  ·  Shots " + S.shots, L.W / 2, 360);
+    if (S.flawless) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 20px 'Segoe UI',sans-serif";
+      ctx.fillText("FLAWLESS +500 — no hits taken!", L.W / 2, 396);
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("BEST " + S.best, L.W / 2, 440);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 520);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  var downPos = null, downTime = 0, dragged = false;
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    var w = toWorld(e);
+    downPos = w; downTime = performance.now(); dragged = false;
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!downPos) return;
+    var w = toWorld(e);
+    if (Math.hypot(w.x - downPos.x, w.y - downPos.y) > 14) dragged = true;
+    if (dragged) { player.targetX = w.x; player.targetY = w.y; }
+    e.preventDefault();
+  }
+  function onUp(e) {
+    if (!downPos) return;
+    var w = toWorld(e);
+    var moved = Math.hypot(w.x - downPos.x, w.y - downPos.y);
+    if (performance.now() - downTime < 250 && moved < 14) {
+      // Quick tap: fire a shell toward the tap point (no driving).
+      if (S.screen === "playing") firePlayer(w.x, w.y);
+    }
+    // A drag leaves the drive target set, so the tank keeps rolling to
+    // where the finger pointed; a tap never sets a drive target.
+    downPos = null;
+    e.preventDefault();
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", function () { downPos = null; });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") player.keyDirX = -1;
+    else if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") player.keyDirX = 1;
+    else if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") player.keyDirY = -1;
+    else if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") player.keyDirY = 1;
+    else if (e.key === " " && S.screen === "playing") {
+      var near = nearestEnemy();
+      if (near) firePlayer(near.e.x, near.e.y);
+      else firePlayer(player.x + Math.cos(player.turret) * 100, player.y + Math.sin(player.turret) * 100);
+      e.preventDefault();
+    }
+    else if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    else if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_tanks_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+  window.addEventListener("keyup", function (e) {
+    if ((e.key === "ArrowLeft" || e.key === "a" || e.key === "A") && player.keyDirX === -1) player.keyDirX = 0;
+    if ((e.key === "ArrowRight" || e.key === "d" || e.key === "D") && player.keyDirX === 1) player.keyDirX = 0;
+    if ((e.key === "ArrowUp" || e.key === "w" || e.key === "W") && player.keyDirY === -1) player.keyDirY = 0;
+    if ((e.key === "ArrowDown" || e.key === "s" || e.key === "S") && player.keyDirY === 1) player.keyDirY = 0;
+  });
+
+  window.__tanksState = S;
+  window.__tanksDebug = {
+    player: function () { return { x: Math.round(player.x), y: Math.round(player.y), fireCd: Math.round(player.fireCd * 100) / 100, invuln: Math.round(player.invuln * 100) / 100 }; },
+    enemies: function () { return enemies.map(function (e) { return { x: Math.round(e.x), y: Math.round(e.y), golden: e.golden, aiming: e.aiming }; }); },
+    shells: function () { return { p: pShells.length, e: eShells.length }; },
+    setAuto: function (v) { auto = v; },
+    start: function () { start(); },
+    fire: function (tx, ty) { return firePlayer(tx, ty); },
+    // Spawn an enemy right in front of the player and fire at it: the
+    // shell must kill it for exactly 100 x combo.
+    debugKill: function () {
+      if (S.screen !== "playing") return null;
+      spawnCount++;
+      var golden = L.isGoldenSpawn(spawnCount);
+      var ex = player.x + 120, ey = player.y;
+      enemies.push({ x: ex, y: ey, angle: 0, turret: 0, wp: { x: ex, y: ey },
+        wpT: 3, fireCd: 99, aiming: false, aimT: 0, golden: golden, flash: 0 });
+      player.fireCd = 0;
+      firePlayer(ex, ey);
+      return { x: ex, y: ey, golden: golden };
+    },
+    // Drop an enemy shell onto the player: the next step must cost
+    // exactly one heart.
+    debugHit: function () {
+      if (S.screen !== "playing") return null;
+      player.invuln = 0;
+      eShells.push({ x: player.x, y: player.y - 30, vx: 0, vy: 200, r: L.SHELL_R, px: player.x, py: player.y - 30 });
+      return { x: player.x, y: player.y };
+    },
+    // Teleport the player onto a live star: the next step must collect it.
+    debugStar: function () {
+      if (S.screen !== "playing") return null;
+      for (var i = 0; i < stars.length; i++) {
+        if (stars[i].active) {
+          player.x = stars[i].x; player.y = stars[i].y;
+          player.targetX = null; player.targetY = null;
+          return { x: stars[i].x, y: stars[i].y };
+        }
+      }
+      return null;
+    }
+  };
+
+  reset();
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
