@@ -1,0 +1,741 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Traffic — Day 57</title>
+<meta name="description" content="Neon Traffic — 60 seconds of neon traffic-control chaos. Tap a car to STOP it, tap again to GO — don't let two cars meet in the junction. Safe exits pay 100 x combo, golden cars pay 5x.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Traffic — Day 57. You are the traffic controller of one very busy
+   neon junction. Cars stream in from all four edges; tap a car to STOP it,
+   tap again to let it GO. A car that exits the far side safely pays
+   100 x combo; chain 4 safe exits to raise the combo x1->x5. Every 6th
+   car is GOLDEN (5x). Two cars meeting inside the junction CRASH — a
+   heart lost, combo reset. Stopped cars get impatient: after 5s they
+   honk, after 7s they go anyway, so you can't just stop everything.
+   Stars on the road pay 50 x combo when a car drives over them.
+   Flawless (no crashes) +500. 60 seconds, best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var TrafficLogic = (function () {
+  var W = 480, H = 800;
+  // Roads: vertical x 185..295, horizontal y 330..470.
+  var VROAD = { x: 185, w: 110 };
+  var HROAD = { y: 330, h: 140 };
+  var JUNCTION = { x: 180, y: 325, w: 120, h: 150 };
+  // Lanes: 0 southbound (down, x=212), 1 northbound (up, x=268),
+  // 2 eastbound (right, y=357), 3 westbound (left, y=412).
+  // start/end are the spawn point and the far-edge exit coordinate
+  // along the travel axis. The vertical road starts below the HUD
+  // (y=76), so lane 0 spawns at y=76 and lane 1 exits at y=76 — cars
+  // never drive behind the HUD bar.
+  var LANES = [
+    { id: 0, vertical: true, fixed: 212, vx: 0, vy: 1, start: 76, end: 830, axis: "y", sign: 1 },
+    { id: 1, vertical: true, fixed: 268, vx: 0, vy: -1, start: 830, end: 76, axis: "y", sign: -1 },
+    { id: 2, vertical: false, fixed: 357, vx: 1, vy: 0, start: -30, end: 830, axis: "x", sign: 1 },
+    { id: 3, vertical: false, fixed: 412, vx: -1, vy: 0, start: 830, end: -30, axis: "x", sign: -1 }
+  ];
+  var CAR_LEN = 34, CAR_WID = 20, CAR_R = 15;
+  var GAME_TIME = 60, MAX_HEARTS = 3;
+  var HONK_AT = 5, IMPATIENT_AT = 7;
+  var JUNCTION_CENTER = { x: 240, y: 400 };
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function dist(ax, ay, bx, by) { var dx = bx - ax, dy = by - ay; return Math.sqrt(dx * dx + dy * dy); }
+
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, combo: 1, streak: 0,
+      passes: 0, crashes: 0, hearts: MAX_HEARTS, timeLeft: GAME_TIME,
+      flawless: false, stars: 0, spawned: 0 };
+  }
+  // combo: +1 every 4 consecutive safe exits, capped at x5.
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function passPoints(combo, golden) { return 100 * combo * (golden ? 5 : 1); }
+  function starPoints(combo) { return 50 * combo; }
+  // 1-based: the 6th, 12th, 18th... car spawned is GOLDEN.
+  function isGoldenSpawn(n) { return n % 6 === 0; }
+  function maxCars(elapsed) {
+    var m = 3 + Math.floor(elapsed / 12);
+    return m > 7 ? 7 : m;
+  }
+  function spawnInterval(elapsed) {
+    var iv = 2.2 - elapsed * 0.018;
+    return iv < 1.1 ? 1.1 : iv;
+  }
+  function carSpeed(elapsed) {
+    var s = 120 + elapsed * 1.1;
+    return s > 185 ? 185 : s;
+  }
+  function pointInJunction(x, y) {
+    return x >= JUNCTION.x && x <= JUNCTION.x + JUNCTION.w &&
+      y >= JUNCTION.y && y <= JUNCTION.y + JUNCTION.h;
+  }
+  function laneOf(car) { return LANES[car.lane]; }
+  // Along-track coordinate: increases in the car's direction of travel.
+  function trackPos(car) {
+    var lane = LANES[car.lane];
+    return lane.axis === "y" ? car.y * lane.sign : car.x * lane.sign;
+  }
+  function spawnPos(laneId) {
+    var lane = LANES[laneId];
+    if (lane.vertical) return { x: lane.fixed, y: lane.start };
+    return { x: lane.start, y: lane.fixed };
+  }
+  // Has the car fully left the far edge? (+10 past the end coordinate
+  // in the travel direction; lane 1's end is the HUD line at y=76.)
+  function hasExited(car) {
+    var lane = LANES[car.lane];
+    if (lane.axis === "y") return lane.sign === 1 ? car.y > lane.end + 10 : car.y < lane.end;
+    return lane.sign === 1 ? car.x > lane.end + 10 : car.x < lane.end;
+  }
+  // Distance along the track from the car to the junction centre.
+  function distToJunction(car) {
+    var lane = LANES[car.lane];
+    if (lane.vertical) return Math.abs(JUNCTION_CENTER.y - car.y);
+    return Math.abs(JUNCTION_CENTER.x - car.x);
+  }
+  // Is the car still approaching the junction (not yet inside it)?
+  function approaching(car) {
+    return !pointInJunction(car.x, car.y) && distToJunction(car) < 260;
+  }
+  // Two cars crash when they overlap inside the junction and at least
+  // one of them is moving. (A stopped car sitting in the junction is a
+  // hazard too — don't stop cars mid-junction.)
+  function carsCollide(a, b) {
+    if (!a.moving && !b.moving) return false;
+    if (!pointInJunction(a.x, a.y) && !pointInJunction(b.x, b.y)) return false;
+    return dist(a.x, a.y, b.x, b.y) < CAR_R * 2;
+  }
+  // Car-following: the speed this car may use given the car ahead in its
+  // own lane. Returns 0 when it must wait behind a stopped car.
+  function followSpeed(car, others) {
+    var myS = trackPos(car);
+    var best = null, bestDelta = Infinity;
+    for (var i = 0; i < others.length; i++) {
+      var o = others[i];
+      if (o === car || o.lane !== car.lane) continue;
+      var d = trackPos(o) - myS;
+      if (d > 0 && d < bestDelta) { bestDelta = d; best = o; }
+    }
+    if (!best) return car.speed;
+    if (bestDelta < 38) return best.moving ? Math.min(car.speed, best.speed) : 0;
+    if (bestDelta < 64) return Math.min(car.speed, best.moving ? best.speed : car.speed * 0.4);
+    return car.speed;
+  }
+  // ETA (seconds) for a moving car to reach the junction centre.
+  function etaToJunction(car) {
+    if (!car.moving || car.speed <= 0) return Infinity;
+    return distToJunction(car) / car.speed;
+  }
+  // Do two moving cars from crossing lanes arrive at the junction at
+  // overlapping times? (Same-axis lanes can never cross.)
+  function wouldCollide(a, b) {
+    if (!a.moving || !b.moving) return false;
+    var la = LANES[a.lane], lb = LANES[b.lane];
+    if (la.vertical === lb.vertical) return false;
+    if (!approaching(a) && !pointInJunction(a.x, a.y)) return false;
+    if (!approaching(b) && !pointInJunction(b.x, b.y)) return false;
+    var ta = etaToJunction(a), tb = etaToJunction(b);
+    if (ta === Infinity || tb === Infinity) return false;
+    return Math.abs(ta - tb) < 1.4;
+  }
+
+  return { W: W, H: H, VROAD: VROAD, HROAD: HROAD, JUNCTION: JUNCTION,
+    LANES: LANES, CAR_LEN: CAR_LEN, CAR_WID: CAR_WID, CAR_R: CAR_R,
+    GAME_TIME: GAME_TIME, MAX_HEARTS: MAX_HEARTS,
+    HONK_AT: HONK_AT, IMPATIENT_AT: IMPATIENT_AT,
+    JUNCTION_CENTER: JUNCTION_CENTER,
+    clamp: clamp, dist: dist, makeState: makeState,
+    comboForStreak: comboForStreak, passPoints: passPoints,
+    starPoints: starPoints, isGoldenSpawn: isGoldenSpawn,
+    maxCars: maxCars, spawnInterval: spawnInterval,
+    carSpeed: carSpeed, pointInJunction: pointInJunction,
+    laneOf: laneOf, trackPos: trackPos, spawnPos: spawnPos,
+    hasExited: hasExited, distToJunction: distToJunction,
+    approaching: approaching, carsCollide: carsCollide,
+    followSpeed: followSpeed, etaToJunction: etaToJunction,
+    wouldCollide: wouldCollide };
+})();
+//LOGIC-END
+
+(function () {
+  var L = TrafficLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_traffic_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var CAR_COLORS = ["#35f0ff", "#ff5e9c", "#7dff5e", "#b98cff", "#ff9d5c", "#5e8cff"];
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_traffic_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, spawnT = 0.8;
+  var cars = [], stars = [];
+  var particles = [], floats = [], bgDots = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  for (var i = 0; i < 60; i++) {
+    bgDots.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 0.6 + Math.random() * 1.4, tw: Math.random() * Math.PI * 2 });
+  }
+
+  function spawnStar() {
+    var lane = L.LANES[Math.floor(Math.random() * 4)];
+    var along = 120 + Math.random() * 560;
+    var x, y;
+    if (lane.vertical) { x = lane.fixed; y = along; }
+    else { x = along; y = lane.fixed; }
+    return { x: x, y: y, r: 13, active: true, respawnT: 0, spin: Math.random() * Math.PI * 2 };
+  }
+  stars = [spawnStar()];
+
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_traffic_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; spawnT = 0.8;
+    cars = [];
+    stars = [spawnStar()];
+    particles = []; floats = [];
+    window.__trafficState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(outOfHearts) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.crashes === 0 && S.passes > 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_traffic_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__trafficState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function spawnCar(laneId) {
+    var lane = L.LANES[laneId];
+    var p = L.spawnPos(laneId);
+    // Don't spawn on top of a car already waiting at the entry.
+    for (var i = 0; i < cars.length; i++) {
+      var c = cars[i];
+      if (c.lane === laneId && L.dist(c.x, c.y, p.x, p.y) < 70) return false;
+    }
+    S.spawned++;
+    var golden = L.isGoldenSpawn(S.spawned);
+    cars.push({ x: p.x, y: p.y, lane: laneId,
+      speed: L.carSpeed(elapsed), moving: true,
+      stoppedT: 0, honked: false, golden: golden,
+      color: golden ? "#ffd94a" : CAR_COLORS[S.spawned % CAR_COLORS.length],
+      flash: 0 });
+    return true;
+  }
+  function awardPass(car) {
+    S.passes++;
+    var pts = L.passPoints(S.combo, car.golden);
+    S.score += pts;
+    S.streak++;
+    S.combo = L.comboForStreak(S.streak);
+    addFloat(car.x, car.y - 20, "+" + pts, car.golden);
+    burst(car.x, car.y, car.golden ? "#ffd94a" : "#35f0ff", car.golden ? 18 : 8);
+    tone(car.golden ? 1320 : 880, 0.14, "sine", 0.18, car.golden ? 1760 : 1170);
+    buzz(20);
+    window.__trafficState = S;
+  }
+  function crash(a, b) {
+    S.crashes++;
+    S.hearts--;
+    S.streak = 0; S.combo = 1;
+    burst((a.x + b.x) / 2, (a.y + b.y) / 2, "#ff5e7a", 26);
+    burst((a.x + b.x) / 2, (a.y + b.y) / 2, "#ffd94a", 14);
+    tone(160, 0.35, "sawtooth", 0.2, 70);
+    buzz([50, 40, 50]);
+    cars.splice(cars.indexOf(a), 1);
+    cars.splice(cars.indexOf(b), 1);
+    window.__trafficState = S;
+    if (S.hearts <= 0) endGame(true);
+  }
+  function collectStar(st, car) {
+    var pts = L.starPoints(S.combo);
+    S.score += pts; S.stars++;
+    addFloat(st.x, st.y - 20, "+" + pts, false);
+    burst(st.x, st.y, "#ffd94a", 10);
+    tone(1170, 0.12, "sine", 0.16, 1560);
+    st.active = false; st.respawnT = 7;
+    window.__trafficState = S;
+  }
+  function toggleCar(car) {
+    car.moving = !car.moving;
+    car.stoppedT = 0; car.honked = false;
+    tone(car.moving ? 740 : 420, 0.08, "sine", 0.14);
+  }
+  function carAt(wx, wy) {
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < cars.length; i++) {
+      var d = L.dist(wx, wy, cars[i].x, cars[i].y);
+      if (d < bestD) { bestD = d; best = cars[i]; }
+    }
+    return bestD < 44 ? best : null;
+  }
+
+  // Autopilot: stop the later-arriving car when two crossing cars would
+  // reach the junction together; release stopped cars when the way is clear.
+  function autopilot() {
+    for (var i = 0; i < cars.length; i++) {
+      var c = cars[i];
+      if (c.moving) {
+        if (!L.approaching(c) && !L.pointInJunction(c.x, c.y)) continue;
+        for (var j = 0; j < cars.length; j++) {
+          if (i === j) continue;
+          var o = cars[j];
+          if (!L.wouldCollide(c, o)) continue;
+          if (L.etaToJunction(c) > L.etaToJunction(o)) { toggleCar(c); break; }
+        }
+      } else {
+        // Stopped: go again once no crossing car is due within 2.5s.
+        var blocked = false;
+        for (var k = 0; k < cars.length; k++) {
+          var o2 = cars[k];
+          if (o2 === c || !o2.moving) continue;
+          var lc = L.LANES[c.lane], lo = L.LANES[o2.lane];
+          if (lc.vertical === lo.vertical) continue;
+          if (L.etaToJunction(o2) < 2.5 && (L.approaching(o2) || L.pointInJunction(o2.x, o2.y))) { blocked = true; break; }
+        }
+        if (!blocked) toggleCar(c);
+      }
+    }
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    // Spawning (round-robin lanes, skip a blocked entry).
+    if (spawnT > 0) spawnT -= dt;
+    else if (cars.length < L.maxCars(elapsed)) {
+      var laneId = S.spawned % 4;
+      if (spawnCar(laneId)) spawnT = L.spawnInterval(elapsed);
+      else spawnT = 0.4;
+    }
+    if (auto) autopilot();
+    // Move cars.
+    for (var i = 0; i < cars.length; i++) {
+      var car = cars[i];
+      var lane = L.LANES[car.lane];
+      if (!car.moving) {
+        car.stoppedT += dt;
+        if (car.stoppedT >= L.HONK_AT && !car.honked) {
+          car.honked = true;
+          tone(280, 0.12, "square", 0.12, 280);
+          addFloat(car.x, car.y - 30, "HONK!", false);
+        }
+        if (car.stoppedT >= L.IMPATIENT_AT) {
+          car.moving = true; car.stoppedT = 0; car.honked = false;
+          addFloat(car.x, car.y - 30, "GOING!", false);
+        }
+        continue;
+      }
+      var v = L.followSpeed(car, cars);
+      car.x += lane.vx * v * dt;
+      car.y += lane.vy * v * dt;
+      if (car.flash > 0) car.flash -= dt;
+    }
+    // Crashes inside the junction.
+    for (var a = 0; a < cars.length; a++) {
+      for (var b = a + 1; b < cars.length; b++) {
+        if (L.carsCollide(cars[a], cars[b])) {
+          crash(cars[a], cars[b]);
+          a = cars.length; break;
+        }
+      }
+    }
+    if (S.screen !== "playing") return;
+    // Safe exits.
+    for (var e = cars.length - 1; e >= 0; e--) {
+      if (L.hasExited(cars[e])) {
+        awardPass(cars[e]);
+        cars.splice(e, 1);
+      }
+    }
+    // One star slot: a fresh star appears 7s after the last collection,
+    // so stars stay a side bonus instead of free points on every pass.
+    for (var s = 0; s < stars.length; s++) {
+      var st = stars[s];
+      if (!st.active) {
+        st.respawnT -= dt;
+        if (st.respawnT <= 0) { stars[s] = spawnStar(); }
+        continue;
+      }
+      st.spin += dt * 2;
+      for (var ci = 0; ci < cars.length; ci++) {
+        if (L.dist(cars[ci].x, cars[ci].y, st.x, st.y) < 22) { collectStar(st, cars[ci]); break; }
+      }
+    }
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pt = particles[p];
+      pt.t += dt; pt.x += pt.vx * dt; pt.y += pt.vy * dt; pt.vy += 300 * dt;
+      if (pt.t > 0.6) particles.splice(p, 1);
+    }
+    for (var f = floats.length - 1; f >= 0; f--) {
+      floats[f].t += dt; floats[f].y -= 40 * dt;
+      if (floats[f].t > 1.1) floats.splice(f, 1);
+    }
+  }
+
+  function drawCar(car) {
+    var lane = L.LANES[car.lane];
+    var angle = lane.vertical ? (lane.vy > 0 ? Math.PI / 2 : -Math.PI / 2) : (lane.vx > 0 ? 0 : Math.PI);
+    ctx.save();
+    ctx.translate(car.x, car.y);
+    // Glow halo (gradient created AFTER the translate, in local coords).
+    var g = ctx.createRadialGradient(0, 0, 2, 0, 0, 30);
+    g.addColorStop(0, "#ffffff");
+    g.addColorStop(0.35, car.color);
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, 30, 0, Math.PI * 2); ctx.fill();
+    ctx.rotate(angle);
+    ctx.fillStyle = car.color;
+    ctx.shadowColor = car.color; ctx.shadowBlur = car.moving ? 12 : 6;
+    ctx.beginPath(); ctx.roundRect(-L.CAR_LEN / 2, -L.CAR_WID / 2, L.CAR_LEN, L.CAR_WID, 6); ctx.fill();
+    ctx.shadowBlur = 0;
+    // Windshield + roof.
+    ctx.fillStyle = "rgba(7,5,18,0.85)";
+    ctx.beginPath(); ctx.roundRect(2, -7, 10, 14, 3); ctx.fill();
+    ctx.beginPath(); ctx.roundRect(-12, -7, 8, 14, 3); ctx.fill();
+    // Headlights (front) / brake lights (rear).
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.arc(L.CAR_LEN / 2 - 1, -7, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(L.CAR_LEN / 2 - 1, 7, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = car.moving ? "#ff5e7a" : "#ff2222";
+    ctx.beginPath(); ctx.arc(-L.CAR_LEN / 2 + 1, -7, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(-L.CAR_LEN / 2 + 1, 7, 2.5, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+    // Status ring + labels (world coords, no rotation).
+    ctx.save();
+    ctx.strokeStyle = car.moving ? "rgba(125,255,94,0.9)" : "#ff5e7a";
+    ctx.lineWidth = car.moving ? 2 : 3;
+    if (!car.moving && Math.floor(performance.now() / 200) % 2 === 0) ctx.globalAlpha = 0.55;
+    ctx.beginPath(); ctx.arc(car.x, car.y, 24, 0, Math.PI * 2); ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "center";
+    if (!car.moving) {
+      ctx.fillStyle = "#ff5e7a";
+      ctx.font = "bold 12px 'Segoe UI',sans-serif";
+      ctx.fillText(car.stoppedT >= L.HONK_AT ? "HONK!" : "STOP", car.x, car.y - 30);
+    }
+    if (car.golden) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 11px 'Segoe UI',sans-serif";
+      ctx.fillText("★ GOLD ★", car.x, car.y + 36);
+    }
+    ctx.restore();
+  }
+  function drawStarShape(x, y, r, rot) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.fillStyle = "#ffd94a"; ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    for (var i = 0; i < 8; i++) {
+      var a = i * Math.PI / 4, rr = (i % 2 === 0) ? r : r * 0.45;
+      var px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  function render() {
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    var bg = ctx.createLinearGradient(0, 0, 0, L.H);
+    bg.addColorStop(0, "#04122b");
+    bg.addColorStop(0.5, "#0b1030");
+    bg.addColorStop(1, "#120a2e");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    for (var i = 0; i < bgDots.length; i++) {
+      var bd = bgDots[i];
+      ctx.globalAlpha = 0.3 + 0.4 * Math.abs(Math.sin(bd.tw + performance.now() / 900));
+      ctx.fillStyle = "#3a6bff";
+      ctx.beginPath(); ctx.arc(bd.x, bd.y, bd.s, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Roads.
+    ctx.fillStyle = "#141b3d";
+    ctx.fillRect(L.VROAD.x, 76, L.VROAD.w, L.H - 76);
+    ctx.fillRect(0, L.HROAD.y, L.W, L.HROAD.h);
+    // Junction slab.
+    ctx.fillStyle = "#1a2347";
+    ctx.fillRect(L.JUNCTION.x, L.JUNCTION.y, L.JUNCTION.w, L.JUNCTION.h);
+    // Neon road edges.
+    ctx.strokeStyle = "rgba(53,240,255,0.55)"; ctx.lineWidth = 2;
+    ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 8;
+    ctx.strokeRect(L.VROAD.x, 76, L.VROAD.w, L.H - 76);
+    ctx.strokeRect(0, L.HROAD.y, L.W, L.HROAD.h);
+    ctx.shadowBlur = 0;
+    // Dashed centre lines.
+    ctx.strokeStyle = "rgba(255,217,74,0.7)"; ctx.lineWidth = 2;
+    ctx.setLineDash([14, 12]);
+    ctx.beginPath(); ctx.moveTo(240, 76); ctx.lineTo(240, L.HROAD.y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(240, L.HROAD.y + L.HROAD.h); ctx.lineTo(240, L.H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, 400); ctx.lineTo(L.VROAD.x, 400); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(L.VROAD.x + L.VROAD.w, 400); ctx.lineTo(L.W, 400); ctx.stroke();
+    ctx.setLineDash([]);
+    // Crosswalk stripes at the four entries.
+    ctx.fillStyle = "rgba(255,255,255,0.28)";
+    for (var k = 0; k < 5; k++) {
+      ctx.fillRect(L.VROAD.x + 6 + k * 22, L.HROAD.y - 14, 12, 8);
+      ctx.fillRect(L.VROAD.x + 6 + k * 22, L.HROAD.y + L.HROAD.h + 6, 12, 8);
+      ctx.fillRect(L.VROAD.x - 14, L.HROAD.y + 6 + k * 28, 8, 14);
+      ctx.fillRect(L.VROAD.x + L.VROAD.w + 6, L.HROAD.y + 6 + k * 28, 8, 14);
+    }
+    // Stars.
+    for (var s = 0; s < stars.length; s++) {
+      if (stars[s].active) drawStarShape(stars[s].x, stars[s].y, stars[s].r, stars[s].spin);
+    }
+    // Cars.
+    for (var ci = 0; ci < cars.length; ci++) drawCar(cars[ci]);
+    // Particles.
+    for (var p = 0; p < particles.length; p++) {
+      var pt = particles[p];
+      ctx.globalAlpha = Math.max(0, 1 - pt.t / 0.6);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Floating score text.
+    ctx.textAlign = "center";
+    for (var f = 0; f < floats.length; f++) {
+      var fl = floats[f];
+      ctx.globalAlpha = Math.max(0, 1 - fl.t / 1.1);
+      ctx.fillStyle = fl.golden ? "#ffd94a" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',sans-serif";
+      ctx.fillText(fl.text, fl.x, fl.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    if (S.screen === "playing" || S.screen === "over") drawHUD();
+  }
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.88)";
+    ctx.fillRect(0, 0, L.W, 76);
+    ctx.strokeStyle = "rgba(53,240,255,0.4)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, 76); ctx.lineTo(L.W, 76); ctx.stroke();
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 26px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, 14, 34);
+    ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = S.combo > 1 ? "#ffd94a" : "#9ff3ff";
+    ctx.fillText("COMBO x" + S.combo + "  ·  PASSES " + S.passes, 14, 60);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e7a" : "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 36);
+    ctx.font = "bold 13px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 60);
+    ctx.textAlign = "right";
+    ctx.font = "bold 22px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#ff5e7a";
+    var hearts = "";
+    for (var h = 0; h < L.MAX_HEARTS; h++) hearts += h < S.hearts ? "♥" : "♡";
+    ctx.fillText(hearts, L.W - 14, 34);
+    ctx.font = "bold 13px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("STARS " + S.stars + "  ·  CRASHES " + S.crashes, L.W - 14, 60);
+    ctx.restore();
+  }
+  function drawTitle() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.78)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#35f0ff";
+    ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 50px 'Segoe UI',sans-serif";
+    ctx.fillText("NEON", L.W / 2, 210);
+    ctx.fillStyle = "#ff5e9c";
+    ctx.shadowColor = "#ff5e9c";
+    ctx.fillText("TRAFFIC", L.W / 2, 268);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("60 seconds of neon traffic control!", L.W / 2, 312);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "17px 'Segoe UI',sans-serif";
+    ctx.fillText("Tap a car to STOP it — tap again to GO", L.W / 2, 360);
+    ctx.fillText("Don't let two cars meet in the junction!", L.W / 2, 388);
+    ctx.fillText("Stopped cars get impatient — after 7s", L.W / 2, 416);
+    ctx.fillText("they drive off on their own", L.W / 2, 444);
+    ctx.fillStyle = "#ffd94a";
+    ctx.fillText("Safe exits pay 100 x combo · Golden cars 5x", L.W / 2, 486);
+    ctx.fillText("Stars pay 50 x combo · 3 hearts", L.W / 2, 514);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 21px 'Segoe UI',sans-serif";
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO START", L.W / 2, 580);
+    ctx.globalAlpha = 1;
+    ctx.font = "15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 618);
+    ctx.restore();
+  }
+  function drawOver() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.82)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff";
+    ctx.shadowColor = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 44px 'Segoe UI',sans-serif";
+    ctx.fillText(S.hearts <= 0 ? "GRIDLOCK!" : "TIME'S UP!", L.W / 2, 250);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, L.W / 2, 320);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "19px 'Segoe UI',sans-serif";
+    ctx.fillText("Passes " + S.passes + "  ·  Stars " + S.stars + "  ·  Crashes " + S.crashes, L.W / 2, 360);
+    if (S.flawless) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 20px 'Segoe UI',sans-serif";
+      ctx.fillText("FLAWLESS +500 — no crashes!", L.W / 2, 396);
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("BEST " + S.best, L.W / 2, 440);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 520);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    var w = toWorld(e);
+    var car = carAt(w.x, w.y);
+    if (car) toggleCar(car);
+    e.preventDefault();
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    else if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_traffic_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+
+  window.__trafficState = S;
+  window.__trafficDebug = {
+    cars: function () { return cars.map(function (c) { return { x: Math.round(c.x), y: Math.round(c.y), lane: c.lane, moving: c.moving, golden: c.golden, stoppedT: Math.round(c.stoppedT * 10) / 10 }; }); },
+    setAuto: function (v) { auto = v; },
+    start: function () { start(); },
+    toggleAt: function (x, y) { var c = carAt(x, y); if (c) toggleCar(c); return !!c; },
+    // Spawn a car just before the far exit: the next step must award a
+    // safe exit for exactly 100 x combo (golden-aware).
+    debugPass: function () {
+      if (S.screen !== "playing") return null;
+      var lane = L.LANES[0];
+      S.spawned++;
+      var golden = L.isGoldenSpawn(S.spawned);
+      cars.push({ x: 212, y: 815, lane: 0, speed: 120, moving: true,
+        stoppedT: 0, honked: false, golden: golden, color: golden ? "#ffd94a" : "#35f0ff", flash: 0 });
+      return { golden: golden };
+    },
+    // Drop two cars on a crossing collision course inside the junction:
+    // the next step must crash them and cost exactly one heart. Both
+    // cars are still approaching the crossing point (not past it).
+    debugCrash: function () {
+      if (S.screen !== "playing") return null;
+      cars.push({ x: 212, y: 345, lane: 0, speed: 120, moving: true,
+        stoppedT: 0, honked: false, golden: false, color: "#ff5e9c", flash: 0 });
+      cars.push({ x: 195, y: 357, lane: 2, speed: 120, moving: true,
+        stoppedT: 0, honked: false, golden: false, color: "#7dff5e", flash: 0 });
+      return { a: { x: 212, y: 345 }, b: { x: 195, y: 357 } };
+    },
+    // Place a star right under a moving car: the next step must collect
+    // it for exactly 50 x combo.
+    debugStar: function () {
+      if (S.screen !== "playing") return null;
+      for (var i = 0; i < cars.length; i++) {
+        if (cars[i].moving) {
+          var st = { x: cars[i].x, y: cars[i].y, r: 13, active: true, respawnT: 0, spin: 0 };
+          stars.push(st);
+          return { x: st.x, y: st.y };
+        }
+      }
+      return null;
+    }
+  };
+
+  reset();
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
