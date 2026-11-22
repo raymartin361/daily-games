@@ -1,0 +1,828 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Sumo — Day 58</title>
+<meta name="description" content="Neon Sumo — 60 seconds of ring-out sumo chaos. Drag to shove your wrestler, tap to DASH — throw rivals out of the ring. Ring-outs pay 100 x combo, golden rivals pay 5x.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Sumo — Day 58. You are a neon sumo wrestler in the dohyo ring.
+   Drag to shove yourself around — momentum is everything: slam into a
+   rival and they fly. Tap (quick, no drag) to DASH in that direction.
+   Throw a rival out of the ring for 100 x combo; chain 4 ring-outs to
+   raise the combo x1->x5. Every 6th rival is GOLDEN (5x). Stars in the
+   ring pay 50 x combo. Get thrown out yourself and you lose a heart
+   (3 hearts). Flawless (never thrown out) +500. 60 seconds, best score
+   persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var SumoLogic = (function () {
+  var W = 480, H = 800;
+  var RING = { x: 240, y: 430, r: 165 };
+  var PLAYER_R = 26, RIVAL_R = 24;
+  var PLAYER_MASS = 3, RIVAL_MASS = 2;
+  var GAME_TIME = 60, MAX_HEARTS = 3;
+  // Rivals spawn on a ring of radius RING.r - 40 = 125 from the centre;
+  // the clearance from the player must be SMALLER than that, or a
+  // player camping the centre would never see a spawn.
+  var SPAWN_CLEARANCE = 90;
+  var PLAYER_MAX = 340, PLAYER_ACCEL = 1400;
+  var DASH_SPEED = 620, DASH_COOLDOWN = 1.2, DASH_TIME = 0.45;
+  var RESTITUTION = 0.6;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function dist(ax, ay, bx, by) { var dx = bx - ax, dy = by - ay; return Math.sqrt(dx * dx + dy * dy); }
+
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, combo: 1, streak: 0,
+      outs: 0, playerOuts: 0, hearts: MAX_HEARTS, timeLeft: GAME_TIME,
+      flawless: false, stars: 0, spawned: 0 };
+  }
+  // combo: +1 every 4 consecutive ring-outs, capped at x5.
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function ringOutPoints(combo, golden) { return 100 * combo * (golden ? 5 : 1); }
+  function starPoints(combo) { return 50 * combo; }
+  // 1-based: the 6th, 12th, 18th... rival spawned is GOLDEN.
+  function isGoldenSpawn(n) { return n % 6 === 0; }
+  function maxRivals(elapsed) {
+    var m = 3 + Math.floor(elapsed / 15);
+    return m > 6 ? 6 : m;
+  }
+  function spawnInterval(elapsed) {
+    var iv = 2.6 - elapsed * 0.02;
+    return iv < 1.3 ? 1.3 : iv;
+  }
+  function rivalSpeed(elapsed) {
+    var s = 120 + elapsed * 1.2;
+    return s > 190 ? 190 : s;
+  }
+  function distFromRingCenter(x, y) { return dist(x, y, RING.x, RING.y); }
+  // A wrestler is out when their CENTRE crosses the ring edge (+4 slack).
+  function isOutOfRing(x, y) { return distFromRingCenter(x, y) > RING.r + 4; }
+  // Unit vector from (ax,ay) toward (bx,by); zero vector if coincident.
+  function dirTo(ax, ay, bx, by) {
+    var d = dist(ax, ay, bx, by);
+    if (d < 0.001) return { x: 0, y: 0 };
+    return { x: (bx - ax) / d, y: (by - ay) / d };
+  }
+  // Dash velocity: burst from (ax,ay) toward (bx,by) at DASH_SPEED.
+  function dashVector(ax, ay, bx, by) {
+    var d = dirTo(ax, ay, bx, by);
+    return { x: d.x * DASH_SPEED, y: d.y * DASH_SPEED };
+  }
+  // Circle-circle collision: separate overlap (split by inverse mass)
+  // and exchange velocity along the normal with restitution. Mutates
+  // both bodies. Returns the impulse magnitude (0 when no hit, or when
+  // the bodies were only separating).
+  function resolveCollision(a, b) {
+    var dx = b.x - a.x, dy = b.y - a.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var minD = a.r + b.r;
+    if (d >= minD || d < 0.001) return 0;
+    var nx = dx / d, ny = dy / d;
+    var overlap = minD - d;
+    var invA = 1 / a.mass, invB = 1 / b.mass;
+    var invSum = invA + invB;
+    a.x -= nx * overlap * (invA / invSum);
+    a.y -= ny * overlap * (invA / invSum);
+    b.x += nx * overlap * (invB / invSum);
+    b.y += ny * overlap * (invB / invSum);
+    var rvn = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+    if (rvn < 0) {
+      var j = -(1 + RESTITUTION) * rvn / invSum;
+      a.vx -= j * invA * nx;
+      a.vy -= j * invA * ny;
+      b.vx += j * invB * nx;
+      b.vy += j * invB * ny;
+      return j;
+    }
+    return 0;
+  }
+
+  return { W: W, H: H, RING: RING, PLAYER_R: PLAYER_R, RIVAL_R: RIVAL_R,
+    PLAYER_MASS: PLAYER_MASS, RIVAL_MASS: RIVAL_MASS,
+    GAME_TIME: GAME_TIME, MAX_HEARTS: MAX_HEARTS,
+    PLAYER_MAX: PLAYER_MAX, PLAYER_ACCEL: PLAYER_ACCEL,
+    DASH_SPEED: DASH_SPEED, DASH_COOLDOWN: DASH_COOLDOWN,
+    DASH_TIME: DASH_TIME, RESTITUTION: RESTITUTION,
+    SPAWN_CLEARANCE: SPAWN_CLEARANCE,
+    clamp: clamp, dist: dist, makeState: makeState,
+    comboForStreak: comboForStreak, ringOutPoints: ringOutPoints,
+    starPoints: starPoints, isGoldenSpawn: isGoldenSpawn,
+    maxRivals: maxRivals, spawnInterval: spawnInterval,
+    rivalSpeed: rivalSpeed, distFromRingCenter: distFromRingCenter,
+    isOutOfRing: isOutOfRing, dirTo: dirTo, dashVector: dashVector,
+    resolveCollision: resolveCollision };
+})();
+//LOGIC-END
+
+(function () {
+  var L = SumoLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_sumo_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var RIVAL_COLORS = ["#ff5e7a", "#ff9d5c", "#b98cff", "#5e8cff", "#ff5e9c", "#7dff5e"];
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_sumo_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, spawnT = 0.8;
+  var player = { x: L.RING.x, y: L.RING.y, vx: 0, vy: 0, r: L.PLAYER_R, mass: L.PLAYER_MASS };
+  var rivals = [], flying = [];
+  var stars = [];
+  var particles = [], floats = [], bgDots = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  var dragging = false, dragX = 0, dragY = 0, downT = 0, downX = 0, downY = 0, downWasPlaying = false;
+  var dashT = 0, dashCd = 0, invulnT = 0;
+  var keys = {};
+  var autoTarget = null;
+  for (var i = 0; i < 60; i++) {
+    bgDots.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 0.6 + Math.random() * 1.4, tw: Math.random() * Math.PI * 2 });
+  }
+
+  function spawnStar() {
+    var a = Math.random() * Math.PI * 2, rr = Math.random() * (L.RING.r - 50);
+    return { x: L.RING.x + Math.cos(a) * rr, y: L.RING.y + Math.sin(a) * rr,
+      r: 13, active: true, respawnT: 0, spin: Math.random() * Math.PI * 2 };
+  }
+  stars = [spawnStar()];
+
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_sumo_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; spawnT = 0.8;
+    player = { x: L.RING.x, y: L.RING.y, vx: 0, vy: 0, r: L.PLAYER_R, mass: L.PLAYER_MASS };
+    rivals = []; flying = [];
+    stars = [spawnStar()];
+    particles = []; floats = [];
+    dashT = 0; dashCd = 0; invulnT = 0; dragging = false; autoTarget = null;
+    window.__sumoState = S;
+  }
+  function start() { reset(); S.screen = "playing"; tone(660, 0.12, "sine", 0.2, 990); }
+  function endGame(outOfHearts) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (S.playerOuts === 0 && S.outs > 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_sumo_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__sumoState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function spawnRival() {
+    for (var attempt = 0; attempt < 8; attempt++) {
+      var a = Math.random() * Math.PI * 2;
+      var x = L.RING.x + Math.cos(a) * (L.RING.r - 40);
+      var y = L.RING.y + Math.sin(a) * (L.RING.r - 40);
+      if (L.dist(x, y, player.x, player.y) < L.SPAWN_CLEARANCE) continue;
+      var crowded = false;
+      for (var i = 0; i < rivals.length; i++) {
+        if (L.dist(x, y, rivals[i].x, rivals[i].y) < 70) { crowded = true; break; }
+      }
+      if (crowded) continue;
+      S.spawned++;
+      var golden = L.isGoldenSpawn(S.spawned);
+      rivals.push({ x: x, y: y, vx: 0, vy: 0, r: L.RIVAL_R,
+        mass: L.RIVAL_MASS, golden: golden, phase: Math.random() * Math.PI * 2,
+        color: golden ? "#ffd94a" : RIVAL_COLORS[S.spawned % RIVAL_COLORS.length],
+        spawnFlash: 0.5, stunT: 0 });
+      addFloat(x, y - 34, golden ? "GOLD!" : "FIGHT!", golden);
+      return true;
+    }
+    return false;
+  }
+  function awardRingOut(rival) {
+    S.outs++;
+    var pts = L.ringOutPoints(S.combo, rival.golden);
+    S.score += pts;
+    S.streak++;
+    S.combo = L.comboForStreak(S.streak);
+    addFloat(rival.x, rival.y - 20, "+" + pts, rival.golden);
+    burst(rival.x, rival.y, rival.golden ? "#ffd94a" : "#35f0ff", rival.golden ? 22 : 10);
+    tone(rival.golden ? 1320 : 880, 0.14, "sine", 0.18, rival.golden ? 1760 : 1170);
+    buzz(25);
+    window.__sumoState = S;
+  }
+  function playerThrownOut() {
+    S.playerOuts++;
+    S.hearts--;
+    S.streak = 0; S.combo = 1;
+    burst(player.x, player.y, "#ff5e7a", 26);
+    burst(player.x, player.y, "#ffd94a", 14);
+    tone(160, 0.35, "sawtooth", 0.2, 70);
+    buzz([50, 40, 50]);
+    addFloat(L.RING.x, L.RING.y - 60, "THROWN OUT!", false);
+    player.x = L.RING.x; player.y = L.RING.y; player.vx = 0; player.vy = 0;
+    invulnT = 1.5;
+    window.__sumoState = S;
+    if (S.hearts <= 0) endGame(true);
+  }
+  function collectStar(st) {
+    var pts = L.starPoints(S.combo);
+    S.score += pts; S.stars++;
+    addFloat(st.x, st.y - 20, "+" + pts, false);
+    burst(st.x, st.y, "#ffd94a", 10);
+    tone(1170, 0.12, "sine", 0.16, 1560);
+    st.active = false; st.respawnT = 7;
+    window.__sumoState = S;
+  }
+  function dashToward(wx, wy) {
+    if (dashCd > 0 || S.screen !== "playing") return false;
+    var v = L.dashVector(player.x, player.y, wx, wy);
+    if (v.x === 0 && v.y === 0) return false;
+    player.vx = v.x; player.vy = v.y;
+    dashT = L.DASH_TIME; dashCd = L.DASH_COOLDOWN;
+    tone(300, 0.12, "sine", 0.14, 900);
+    buzz(15);
+    return true;
+  }
+
+  // Autopilot: charge the nearest rival (dash when close), but steer
+  // back to the centre when near the ring edge so we don't throw
+  // ourselves out. Rivals chase us, so one loitering near the edge is
+  // left alone until it comes in — chasing it to the edge is how you
+  // follow it out of the ring.
+  function autopilot() {
+    if (!rivals.length) { autoTarget = { x: L.RING.x, y: L.RING.y }; return; }
+    var pd = L.distFromRingCenter(player.x, player.y);
+    if (pd > L.RING.r - 70) {
+      autoTarget = { x: L.RING.x, y: L.RING.y };
+      return;
+    }
+    var best = null, bestD = Infinity;
+    for (var i = 0; i < rivals.length; i++) {
+      var d = L.dist(player.x, player.y, rivals[i].x, rivals[i].y);
+      if (d < bestD) { bestD = d; best = rivals[i]; }
+    }
+    if (!best) return;
+    if (L.distFromRingCenter(best.x, best.y) > 120) {
+      autoTarget = { x: L.RING.x, y: L.RING.y };
+      return;
+    }
+    // Aim slightly past the rival so we shove THROUGH them, toward the
+    // nearest ring edge behind them — but clamp the target inside the
+    // ring, or we charge straight out of it ourselves.
+    var d = L.dirTo(player.x, player.y, best.x, best.y);
+    var tx = best.x + d.x * 60, ty = best.y + d.y * 60;
+    var td = L.distFromRingCenter(tx, ty);
+    if (td > 110) { tx = L.RING.x + (tx - L.RING.x) / td * 110; ty = L.RING.y + (ty - L.RING.y) / td * 110; }
+    autoTarget = { x: tx, y: ty };
+    // Dash only in the safe central zone: the burst covers ~180px with
+    // no steering, so dashing at a rival near the edge means following
+    // them out. Dash only when the rival is further out than we are, so
+    // the reaction pushes us inward.
+    if (bestD < 110 && dashCd <= 0 &&
+      L.distFromRingCenter(best.x, best.y) < 95 &&
+      L.distFromRingCenter(player.x, player.y) < 80 &&
+      L.distFromRingCenter(best.x, best.y) > L.distFromRingCenter(player.x, player.y) + 10) {
+      dashToward(best.x, best.y);
+    }
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    if (dashT > 0) dashT -= dt;
+    if (dashCd > 0) dashCd -= dt;
+    if (invulnT > 0) invulnT -= dt;
+    // Spawning.
+    if (spawnT > 0) spawnT -= dt;
+    else if (rivals.length < L.maxRivals(elapsed)) {
+      if (spawnRival()) spawnT = L.spawnInterval(elapsed);
+      else spawnT = 0.4;
+    }
+    if (auto) autopilot();
+
+    // Player steering: drag target, autopilot target, or keys.
+    var tx = null, ty = null;
+    if (auto && autoTarget) { tx = autoTarget.x; ty = autoTarget.y; }
+    else if (dragging) { tx = dragX; ty = dragY; }
+    else {
+      var kx = (keys.ArrowRight || keys.d ? 1 : 0) - (keys.ArrowLeft || keys.a ? 1 : 0);
+      var ky = (keys.ArrowDown || keys.s ? 1 : 0) - (keys.ArrowUp || keys.w ? 1 : 0);
+      if (kx || ky) {
+        var kl = Math.sqrt(kx * kx + ky * ky);
+        tx = player.x + kx / kl * 100; ty = player.y + ky / kl * 100;
+      }
+    }
+    if (tx !== null && dashT <= 0) {
+      var dd = L.dirTo(player.x, player.y, tx, ty);
+      var wantVx = dd.x * L.PLAYER_MAX, wantVy = dd.y * L.PLAYER_MAX;
+      var ax = wantVx - player.vx, ay = wantVy - player.vy;
+      var al = Math.sqrt(ax * ax + ay * ay);
+      var step = L.PLAYER_ACCEL * dt;
+      if (al > step) { ax = ax / al * step; ay = ay / al * step; }
+      player.vx += ax; player.vy += ay;
+    } else if (dashT <= 0) {
+      var fr = Math.max(0, 1 - 6 * dt);
+      player.vx *= fr; player.vy *= fr;
+    } else {
+      // Dashing: keep the burst, bleed off slowly.
+      var fr2 = Math.max(0, 1 - 1.5 * dt);
+      player.vx *= fr2; player.vy *= fr2;
+    }
+    player.x += player.vx * dt;
+    player.y += player.vy * dt;
+
+    // Rivals chase the player with a wobble — unless stunned by a hard
+    // hit, in which case they tumble on, unable to steer back.
+    for (var i = 0; i < rivals.length; i++) {
+      var r = rivals[i];
+      if (r.spawnFlash > 0) r.spawnFlash -= dt;
+      if (r.stunT > 0) {
+        r.stunT -= dt;
+        var sfr = Math.max(0, 1 - 0.8 * dt);
+        r.vx *= sfr; r.vy *= sfr;
+        r.x += r.vx * dt;
+        r.y += r.vy * dt;
+        continue;
+      }
+      var d2 = L.dirTo(r.x, r.y, player.x, player.y);
+      var wob = Math.sin(elapsed * 2 + r.phase) * 40;
+      var sp = L.rivalSpeed(elapsed);
+      var wvx = d2.x * sp + (-d2.y) * wob;
+      var wvy = d2.y * sp + (d2.x) * wob;
+      var rx = wvx - r.vx, ry = wvy - r.vy;
+      var rl = Math.sqrt(rx * rx + ry * ry);
+      var rstep = 420 * dt;
+      if (rl > rstep) { rx = rx / rl * rstep; ry = ry / rl * rstep; }
+      r.vx += rx; r.vy += ry;
+      r.x += r.vx * dt;
+      r.y += r.vy * dt;
+    }
+
+    // Collisions: player vs rivals (skipped while invulnerable), rival
+    // vs rival. A dashing player hits extra hard, and a hard hit stuns
+    // the rival so the shove carries them toward the edge.
+    for (var a = 0; a < rivals.length; a++) {
+      if (invulnT <= 0) {
+        var dashing = dashT > 0;
+        if (dashing) { player.mass = L.PLAYER_MASS * 1.6; }
+        var imp = L.resolveCollision(player, rivals[a]);
+        player.mass = L.PLAYER_MASS;
+        if (imp > 150) {
+          rivals[a].stunT = 0.45;
+          burst(rivals[a].x, rivals[a].y, "#ffffff", 6);
+        }
+      }
+    }
+    for (var b = 0; b < rivals.length; b++) {
+      for (var c = b + 1; c < rivals.length; c++) {
+        L.resolveCollision(rivals[b], rivals[c]);
+      }
+    }
+
+    // Ring-outs: rivals first (score), then the player (heart).
+    for (var e = rivals.length - 1; e >= 0; e--) {
+      if (L.isOutOfRing(rivals[e].x, rivals[e].y)) {
+        var out = rivals[e];
+        var od = L.dirTo(L.RING.x, L.RING.y, out.x, out.y);
+        flying.push({ x: out.x, y: out.y, vx: od.x * 260 + out.vx, vy: od.y * 260 + out.vy,
+          r: out.r, color: out.color, golden: out.golden, t: 0, spin: Math.random() * 6 - 3 });
+        awardRingOut(out);
+        rivals.splice(e, 1);
+      }
+    }
+    if (S.screen === "playing" && invulnT <= 0 && L.isOutOfRing(player.x, player.y)) {
+      playerThrownOut();
+    }
+    if (S.screen !== "playing") return;
+
+    // One star slot: a fresh star appears 7s after the last collection.
+    for (var s = 0; s < stars.length; s++) {
+      var st = stars[s];
+      if (!st.active) {
+        st.respawnT -= dt;
+        if (st.respawnT <= 0) { stars[s] = spawnStar(); }
+        continue;
+      }
+      st.spin += dt * 2;
+      if (L.dist(player.x, player.y, st.x, st.y) < player.r + st.r + 4) collectStar(st);
+    }
+    for (var p = flying.length - 1; p >= 0; p--) {
+      var fl = flying[p];
+      fl.t += dt; fl.x += fl.vx * dt; fl.y += fl.vy * dt; fl.vx *= (1 - 2 * dt); fl.vy *= (1 - 2 * dt);
+      if (fl.t > 0.7) flying.splice(p, 1);
+    }
+    for (var pt = particles.length - 1; pt >= 0; pt--) {
+      var pp = particles[pt];
+      pp.t += dt; pp.x += pp.vx * dt; pp.y += pp.vy * dt; pp.vy += 300 * dt;
+      if (pp.t > 0.6) particles.splice(pt, 1);
+    }
+    for (var f = floats.length - 1; f >= 0; f--) {
+      floats[f].t += dt; floats[f].y -= 40 * dt;
+      if (floats[f].t > 1.1) floats.splice(f, 1);
+    }
+  }
+
+  function drawWrestler(x, y, r, color, golden, angle, blink, spawnFlash) {
+    ctx.save();
+    ctx.translate(x, y);
+    // Glow halo (gradient created AFTER the translate, in local coords).
+    var g = ctx.createRadialGradient(0, 0, 2, 0, 0, r + 14);
+    g.addColorStop(0, "#ffffff");
+    g.addColorStop(0.35, color);
+    g.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, r + 14, 0, Math.PI * 2); ctx.fill();
+    if (spawnFlash > 0) ctx.globalAlpha = 0.4 + 0.6 * Math.abs(Math.sin(spawnFlash * 20));
+    // Body.
+    var bg2 = ctx.createRadialGradient(-r * 0.3, -r * 0.35, r * 0.1, 0, 0, r);
+    bg2.addColorStop(0, "#ffffff");
+    bg2.addColorStop(0.45, color);
+    bg2.addColorStop(1, "rgba(0,0,0,0.55)");
+    ctx.fillStyle = bg2;
+    ctx.shadowColor = color; ctx.shadowBlur = 14;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    // Mawashi belt band.
+    ctx.strokeStyle = golden ? "#fff3b0" : "rgba(7,5,18,0.85)";
+    ctx.lineWidth = 7;
+    ctx.beginPath(); ctx.arc(0, 0, r - 5, Math.PI * 0.15, Math.PI * 0.85); ctx.stroke();
+    // Face: eyes look toward movement angle.
+    var ex = Math.cos(angle) * 4, ey = Math.sin(angle) * 4;
+    ctx.fillStyle = "#070512";
+    ctx.beginPath(); ctx.arc(-8 + ex, -6 + ey, 3.4, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(8 + ex, -6 + ey, 3.4, 0, Math.PI * 2); ctx.fill();
+    // Mouth.
+    ctx.strokeStyle = "#070512"; ctx.lineWidth = 2.4;
+    ctx.beginPath(); ctx.arc(ex, 4 + ey, 6, Math.PI * 0.15, Math.PI * 0.85); ctx.stroke();
+    // Topknot.
+    ctx.fillStyle = "#070512";
+    ctx.beginPath(); ctx.arc(0, -r + 2, 5, 0, Math.PI * 2); ctx.fill();
+    if (golden) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 11px 'Segoe UI',sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("★ GOLD ★", 0, r + 18);
+    }
+    ctx.restore();
+  }
+  function drawStarShape(x, y, r, rot) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.fillStyle = "#ffd94a"; ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 12;
+    ctx.beginPath();
+    for (var i = 0; i < 8; i++) {
+      var a = i * Math.PI / 4, rr = (i % 2 === 0) ? r : r * 0.45;
+      var px = Math.cos(a) * rr, py = Math.sin(a) * rr;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+  function render() {
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    var bg = ctx.createLinearGradient(0, 0, 0, L.H);
+    bg.addColorStop(0, "#04122b");
+    bg.addColorStop(0.5, "#0b1030");
+    bg.addColorStop(1, "#120a2e");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    for (var i = 0; i < bgDots.length; i++) {
+      var bd = bgDots[i];
+      ctx.globalAlpha = 0.3 + 0.4 * Math.abs(Math.sin(bd.tw + performance.now() / 900));
+      ctx.fillStyle = "#3a6bff";
+      ctx.beginPath(); ctx.arc(bd.x, bd.y, bd.s, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Dohyo ring: clay floor, straw-bale edge, centre lines.
+    var floor = ctx.createRadialGradient(L.RING.x, L.RING.y, 10, L.RING.x, L.RING.y, L.RING.r);
+    floor.addColorStop(0, "#2b1d12");
+    floor.addColorStop(0.75, "#3a2415");
+    floor.addColorStop(1, "#241608");
+    ctx.fillStyle = floor;
+    ctx.beginPath(); ctx.arc(L.RING.x, L.RING.y, L.RING.r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = "rgba(255,217,74,0.9)"; ctx.lineWidth = 10;
+    ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 12;
+    ctx.setLineDash([18, 10]);
+    ctx.beginPath(); ctx.arc(L.RING.x, L.RING.y, L.RING.r, 0, Math.PI * 2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(53,240,255,0.35)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(L.RING.x, L.RING.y, 90, 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(L.RING.x, L.RING.y, 30, 0, Math.PI * 2); ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,0.18)";
+    ctx.beginPath(); ctx.moveTo(L.RING.x - 90, L.RING.y); ctx.lineTo(L.RING.x + 90, L.RING.y); ctx.stroke();
+    // Stars.
+    for (var s = 0; s < stars.length; s++) {
+      if (stars[s].active) drawStarShape(stars[s].x, stars[s].y, stars[s].r, stars[s].spin);
+    }
+    // Rivals.
+    for (var ri = 0; ri < rivals.length; ri++) {
+      var rv = rivals[ri];
+      var ra = Math.atan2(rv.vy, rv.vx);
+      drawWrestler(rv.x, rv.y, rv.r, rv.color, rv.golden, ra, false, rv.spawnFlash);
+    }
+    // Flying (thrown-out) rivals tumble away.
+    for (var fi = 0; fi < flying.length; fi++) {
+      var fl2 = flying[fi];
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, 1 - fl2.t / 0.7);
+      ctx.translate(fl2.x, fl2.y);
+      ctx.rotate(fl2.spin * fl2.t);
+      ctx.fillStyle = fl2.color;
+      ctx.shadowColor = fl2.color; ctx.shadowBlur = 14;
+      ctx.beginPath(); ctx.arc(0, 0, fl2.r, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+    // Player (blink while invulnerable).
+    if (!(invulnT > 0 && Math.floor(performance.now() / 120) % 2 === 0)) {
+      var pa = Math.atan2(player.vy, player.vx);
+      drawWrestler(player.x, player.y, player.r, "#35f0ff", false, pa, false, 0);
+      // Dash cooldown ring: full circle = ready.
+      var frac = dashCd > 0 ? 1 - dashCd / L.DASH_COOLDOWN : 1;
+      ctx.save();
+      ctx.strokeStyle = frac >= 1 ? "#7dff5e" : "rgba(125,255,94,0.4)";
+      ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(player.x, player.y, player.r + 8, -Math.PI / 2, -Math.PI / 2 + frac * Math.PI * 2); ctx.stroke();
+      ctx.restore();
+    }
+    // Particles.
+    for (var p = 0; p < particles.length; p++) {
+      var pt = particles[p];
+      ctx.globalAlpha = Math.max(0, 1 - pt.t / 0.6);
+      ctx.fillStyle = pt.color;
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 3, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Floating score text.
+    ctx.textAlign = "center";
+    for (var f = 0; f < floats.length; f++) {
+      var fl3 = floats[f];
+      ctx.globalAlpha = Math.max(0, 1 - fl3.t / 1.1);
+      ctx.fillStyle = fl3.golden ? "#ffd94a" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',sans-serif";
+      ctx.fillText(fl3.text, fl3.x, fl3.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.restore();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    if (S.screen === "playing" || S.screen === "over") drawHUD();
+  }
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.88)";
+    ctx.fillRect(0, 0, L.W, 76);
+    ctx.strokeStyle = "rgba(53,240,255,0.4)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, 76); ctx.lineTo(L.W, 76); ctx.stroke();
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 26px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, 14, 34);
+    ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = S.combo > 1 ? "#ffd94a" : "#9ff3ff";
+    ctx.fillText("COMBO x" + S.combo + "  ·  OUTS " + S.outs, 14, 60);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e7a" : "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 36);
+    ctx.font = "bold 13px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 60);
+    ctx.textAlign = "right";
+    ctx.font = "bold 22px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#ff5e7a";
+    var hearts = "";
+    for (var h = 0; h < L.MAX_HEARTS; h++) hearts += h < S.hearts ? "♥" : "♡";
+    ctx.fillText(hearts, L.W - 14, 34);
+    ctx.font = "bold 13px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("STARS " + S.stars + "  ·  THROWN " + S.playerOuts, L.W - 14, 60);
+    ctx.restore();
+  }
+  function drawTitle() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.78)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#35f0ff";
+    ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 50px 'Segoe UI',sans-serif";
+    ctx.fillText("NEON", L.W / 2, 210);
+    ctx.fillStyle = "#ff5e9c";
+    ctx.shadowColor = "#ff5e9c";
+    ctx.fillText("SUMO", L.W / 2, 268);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("60 seconds of ring-out sumo chaos!", L.W / 2, 312);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "17px 'Segoe UI',sans-serif";
+    ctx.fillText("Drag to shove — momentum throws rivals", L.W / 2, 360);
+    ctx.fillText("Tap quickly to DASH at them", L.W / 2, 388);
+    ctx.fillText("Throw rivals OUT of the ring to score", L.W / 2, 416);
+    ctx.fillText("Get thrown out yourself and lose a heart", L.W / 2, 444);
+    ctx.fillStyle = "#ffd94a";
+    ctx.fillText("Ring-outs pay 100 x combo · Golden rivals 5x", L.W / 2, 486);
+    ctx.fillText("Stars pay 50 x combo · 3 hearts", L.W / 2, 514);
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 21px 'Segoe UI',sans-serif";
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO START", L.W / 2, 580);
+    ctx.globalAlpha = 1;
+    ctx.font = "15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 618);
+    ctx.restore();
+  }
+  function drawOver() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.82)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff";
+    ctx.shadowColor = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 44px 'Segoe UI',sans-serif";
+    ctx.fillText(S.hearts <= 0 ? "THROWN OUT!" : "TIME'S UP!", L.W / 2, 250);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, L.W / 2, 320);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "19px 'Segoe UI',sans-serif";
+    ctx.fillText("Ring-outs " + S.outs + "  ·  Stars " + S.stars + "  ·  Thrown " + S.playerOuts, L.W / 2, 360);
+    if (S.flawless) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 20px 'Segoe UI',sans-serif";
+      ctx.fillText("FLAWLESS +500 — never thrown out!", L.W / 2, 396);
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("BEST " + S.best, L.W / 2, 440);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 520);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") {
+      downWasPlaying = false;
+      start();
+      downT = performance.now(); downX = e.clientX; downY = e.clientY;
+      return;
+    }
+    downWasPlaying = true;
+    downT = performance.now(); downX = e.clientX; downY = e.clientY;
+    var w = toWorld(e);
+    dragging = true; dragX = w.x; dragY = w.y;
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!dragging) return;
+    var w = toWorld(e);
+    dragX = w.x; dragY = w.y;
+    e.preventDefault();
+  }
+  function onUp(e) {
+    if (!downWasPlaying) { dragging = false; return; }
+    var dtMs = performance.now() - downT;
+    var moved = Math.sqrt((e.clientX - downX) * (e.clientX - downX) + (e.clientY - downY) * (e.clientY - downY));
+    dragging = false;
+    // Quick tap with almost no movement = DASH toward the tap point.
+    if (dtMs < 250 && moved < 14) {
+      var w = toWorld(e);
+      dashToward(w.x, w.y);
+    }
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", function () { dragging = false; });
+  window.addEventListener("keydown", function (e) {
+    keys[e.key] = true;
+    if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    else if (e.key === " ") {
+      if (S.screen === "playing") {
+        var kx = (keys.ArrowRight || keys.d ? 1 : 0) - (keys.ArrowLeft || keys.a ? 1 : 0);
+        var ky = (keys.ArrowDown || keys.s ? 1 : 0) - (keys.ArrowUp || keys.w ? 1 : 0);
+        if (kx || ky) dashToward(player.x + kx * 100, player.y + ky * 100);
+        else dashToward(player.x, player.y - 100);
+      }
+      e.preventDefault();
+    }
+    else if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_sumo_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+  window.addEventListener("keyup", function (e) { keys[e.key] = false; });
+
+  window.__sumoState = S;
+  window.__sumoDebug = {
+    player: function () { return { x: Math.round(player.x), y: Math.round(player.y), vx: Math.round(player.vx), vy: Math.round(player.vy), dashCd: Math.round(dashCd * 100) / 100, dashT: Math.round(dashT * 100) / 100, invulnT: Math.round(invulnT * 100) / 100 }; },
+    rivals: function () { return rivals.map(function (r) { return { x: Math.round(r.x), y: Math.round(r.y), vx: Math.round(r.vx), vy: Math.round(r.vy), golden: r.golden }; }); },
+    setAuto: function (v) { auto = v; },
+    start: function () { start(); },
+    dash: function (x, y) { return dashToward(x, y); },
+    // Spawn a rival just outside the ring edge, moving outward: the
+    // next step must award a ring-out for exactly 100 x combo
+    // (golden-aware).
+    debugRingOut: function () {
+      if (S.screen !== "playing") return null;
+      S.spawned++;
+      var golden = L.isGoldenSpawn(S.spawned);
+      var a = Math.PI / 4;
+      var x = L.RING.x + Math.cos(a) * (L.RING.r + 8);
+      var y = L.RING.y + Math.sin(a) * (L.RING.r + 8);
+      rivals.push({ x: x, y: y, vx: Math.cos(a) * 120, vy: Math.sin(a) * 120,
+        r: L.RIVAL_R, mass: L.RIVAL_MASS, golden: golden, phase: 0,
+        color: golden ? "#ffd94a" : "#ff5e7a", spawnFlash: 0, stunT: 0 });
+      return { golden: golden, x: Math.round(x), y: Math.round(y) };
+    },
+    // Put the player just outside the ring edge: the next step must
+    // cost exactly one heart and respawn at the centre.
+    debugPlayerOut: function () {
+      if (S.screen !== "playing") return null;
+      invulnT = 0;
+      player.x = L.RING.x + (L.RING.r + 10); player.y = L.RING.y;
+      player.vx = 0; player.vy = 0;
+      return { x: Math.round(player.x), y: Math.round(player.y) };
+    },
+    // Place a star right under the player: the next step must collect
+    // it for exactly 50 x combo.
+    debugStar: function () {
+      if (S.screen !== "playing") return null;
+      var st = { x: player.x, y: player.y, r: 13, active: true, respawnT: 0, spin: 0 };
+      stars.push(st);
+      return { x: st.x, y: st.y };
+    }
+  };
+
+  reset();
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
