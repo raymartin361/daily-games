@@ -1,0 +1,740 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Slugger — Day 60</title>
+<meta name="description" content="Neon Slugger — 60 seconds of neon baseball batting chaos. Tap to SWING — time it in the zone! Perfect timing is a HOME RUN worth 250 x combo, golden pitches pay 5x. 3 strikes is an OUT, 3 hearts.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Slugger — Day 60. You bat for 60 seconds under the neon lights.
+   The pitcher throws fastballs, curveballs and changeups down the lane.
+   Tap (or Space) to SWING. Swing while the ball is in the zone:
+   perfect timing (y 585-615) is a HOME RUN worth 250 x combo, anywhere
+   else in the zone (560-640) is a HIT worth 100 x combo. Swing and
+   miss, or let one sail past the plate, and it's a STRIKE — 3 strikes
+   is an OUT and costs a heart (3 hearts). Chain 4 hits to raise the
+   combo x1->x5. Every 6th pitch is GOLDEN (5x). Bonus stars drift
+   across the outfield — tap one for 50 x combo. Flawless (no hearts
+   lost) +500. Best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var SluggerLogic = (function () {
+  var W = 480, H = 800;
+  var GAME_TIME = 60, MAX_HEARTS = 3, MAX_STRIKES = 3;
+  var HUD_H = 76;
+  var PITCHER = { x: 240, y: 150 };
+  var PLATE = { x: 240, y: 600 };
+  var BALL_Y0 = 150, BALL_Y1 = 710;
+  var ZONE = { y0: 560, y1: 640, perfect0: 585, perfect1: 615 };
+  var SWING_CD = 0.35, SWING_ANIM = 0.28;
+  var PITCH_TYPES = ["fastball", "curveball", "changeup"];
+  var PITCH_BASE_TRAVEL = { fastball: 1.15, curveball: 1.45, changeup: 1.75 };
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, combo: 1, streak: 0,
+      hits: 0, homers: 0, whiffs: 0, strikes: 0, outs: 0, hearts: MAX_HEARTS,
+      timeLeft: GAME_TIME, flawless: false, stars: 0, spawned: 0 };
+  }
+  // combo: +1 every 4 consecutive hits, capped at x5.
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  // kind: "homer" (250) or "hit" (100); golden pitches pay 5x.
+  function hitPoints(kind, combo, golden) {
+    var base = kind === "homer" ? 250 : 100;
+    return base * combo * (golden ? 5 : 1);
+  }
+  function starPoints(combo) { return 50 * combo; }
+  // 1-based: the 6th, 12th, 18th... pitch thrown is GOLDEN.
+  function isGoldenSpawn(n) { return n % 6 === 0; }
+  // Ball y for progress p in [0,1] (p can exceed 1 past the plate).
+  function ballY(p) { return BALL_Y0 + p * (BALL_Y1 - BALL_Y0); }
+  // Ball x: straight lerp plus a sine curve (curveballs bend mid-flight).
+  function ballX(startX, plateX, curveAmp, p) {
+    return startX + (plateX - startX) * p + curveAmp * Math.sin(p * Math.PI);
+  }
+  // Classify a swing by the ball's y at swing time.
+  // "homer" | "hit" | "whiff" — whiff when the ball is outside the zone.
+  function classifySwing(ballYv) {
+    if (ballYv < ZONE.y0 || ballYv > ZONE.y1) return "whiff";
+    if (ballYv >= ZONE.perfect0 && ballYv <= ZONE.perfect1) return "homer";
+    return "hit";
+  }
+  // A pitch the batter never swings at is a called strike once it
+  // passes the plate (y > ZONE.y1 + 8).
+  function isCalledStrike(ballYv) { return ballYv > ZONE.y1 + 8; }
+  // Pitch travel time: base per type, speeding up as the game goes on.
+  function pitchTravel(type, elapsed) {
+    var base = PITCH_BASE_TRAVEL[type] || 1.45;
+    var scale = 1 - elapsed * 0.0045;
+    if (scale < 0.72) scale = 0.72;
+    return base * scale;
+  }
+  // Gap between one pitch resolving and the next being thrown.
+  function pitchInterval(elapsed) {
+    var iv = 1.25 - elapsed * 0.003;
+    return iv < 0.9 ? 0.9 : iv;
+  }
+  // Curve amplitude by type: curveballs bend, changeups wobble a little.
+  function curveAmpFor(type, rand) {
+    if (type === "curveball") return (rand() * 90 - 45);
+    if (type === "changeup") return (rand() * 24 - 12);
+    return 0;
+  }
+  // Plate-side x drift by type: curveballs end up wide of the plate.
+  function plateXFor(type, rand) {
+    if (type === "curveball") return 240 + (rand() * 140 - 70);
+    if (type === "changeup") return 240 + (rand() * 50 - 25);
+    return 240 + (rand() * 24 - 12);
+  }
+  function zoneRect() { return { x: 205, y: ZONE.y0, w: 70, h: ZONE.y1 - ZONE.y0 }; }
+  function perfectRect() { return { x: 205, y: ZONE.perfect0, w: 70, h: ZONE.perfect1 - ZONE.perfect0 }; }
+  function plateRect() { return { x: PLATE.x - 34, y: PLATE.y - 10, w: 68, h: 20 }; }
+  function pointInRect(px, py, r) {
+    return px >= r.x && px <= r.x + r.w && py >= r.y && py <= r.y + r.h;
+  }
+
+  return { W: W, H: H, GAME_TIME: GAME_TIME, MAX_HEARTS: MAX_HEARTS,
+    MAX_STRIKES: MAX_STRIKES, HUD_H: HUD_H, PITCHER: PITCHER, PLATE: PLATE,
+    BALL_Y0: BALL_Y0, BALL_Y1: BALL_Y1, ZONE: ZONE,
+    SWING_CD: SWING_CD, SWING_ANIM: SWING_ANIM,
+    PITCH_TYPES: PITCH_TYPES, PITCH_BASE_TRAVEL: PITCH_BASE_TRAVEL,
+    clamp: clamp, makeState: makeState,
+    comboForStreak: comboForStreak, hitPoints: hitPoints,
+    starPoints: starPoints, isGoldenSpawn: isGoldenSpawn,
+    ballY: ballY, ballX: ballX, classifySwing: classifySwing,
+    isCalledStrike: isCalledStrike, pitchTravel: pitchTravel,
+    pitchInterval: pitchInterval, curveAmpFor: curveAmpFor,
+    plateXFor: plateXFor, zoneRect: zoneRect,
+    perfectRect: perfectRect, plateRect: plateRect,
+    pointInRect: pointInRect };
+})();
+//LOGIC-END
+
+(function () {
+  var L = SluggerLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_slugger_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_slugger_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, pitchT = 0.6, starT = 5, autoT = 0;
+  var ball = null; // {type,t,travel,startX,plateX,curveAmp,golden,resolved,flyT,flyVx,flyVy}
+  var swingT = 0, swingCd = 0;
+  var star = { active: false, x: 0, y: 0, ttl: 0, spin: 0, vx: 0 };
+  var particles = [], floats = [], bgDots = [], crowd = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  var flashRed = 0, flashGold = 0;
+  for (var i = 0; i < 60; i++) {
+    bgDots.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 0.6 + Math.random() * 1.4, tw: Math.random() * Math.PI * 2 });
+  }
+  for (var c = 0; c < 90; c++) {
+    crowd.push({ x: 14 + Math.random() * 452, y: 18 + Math.random() * 44, hue: Math.floor(Math.random() * 360), tw: Math.random() * Math.PI * 2 });
+  }
+
+  function ballPos() {
+    if (!ball) return null;
+    var p = ball.t / ball.travel;
+    return { x: L.ballX(ball.startX, ball.plateX, ball.curveAmp, p),
+             y: L.ballY(p), p: p };
+  }
+  function spawnPitch() {
+    S.spawned++;
+    var type = L.PITCH_TYPES[Math.floor(Math.random() * L.PITCH_TYPES.length)];
+    ball = { type: type, t: 0, travel: L.pitchTravel(type, elapsed),
+      startX: 240 + (Math.random() * 60 - 30),
+      plateX: L.plateXFor(type, Math.random),
+      curveAmp: L.curveAmpFor(type, Math.random),
+      golden: L.isGoldenSpawn(S.spawned), resolved: false,
+      flyT: 0, flyVx: 0, flyVy: 0 };
+    if (ball.golden) addFloat(240, 200, "GOLDEN PITCH!", true);
+  }
+  function spawnStar() {
+    // Drifts across the outfield, clear of the pitch lane and the HUD.
+    var fromLeft = Math.random() < 0.5;
+    star = { active: true, x: fromLeft ? 30 : 450, y: 300 + Math.random() * 120,
+      ttl: 7, spin: 0, vx: fromLeft ? 55 : -55 };
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_slugger_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; pitchT = 0.6; starT = 5; autoT = 0;
+    ball = null; swingT = 0; swingCd = 0;
+    star = { active: false, x: 0, y: 0, ttl: 0, spin: 0, vx: 0 };
+    particles = []; floats = []; flashRed = 0; flashGold = 0;
+    window.__sluggerState = S;
+  }
+  function start() {
+    reset();
+    S.screen = "playing";
+    tone(660, 0.12, "sine", 0.2, 990);
+  }
+  function endGame(outOfHearts) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (!outOfHearts && S.hearts === L.MAX_HEARTS && S.hits > 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_slugger_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__sluggerState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function loseHeart(reason) {
+    S.hearts--;
+    S.streak = 0; S.combo = 1;
+    flashRed = 0.35;
+    tone(160, 0.35, "sawtooth", 0.2, 70);
+    buzz([50, 40, 50]);
+    addFloat(240, 250, reason + "  -1 \u2665", false);
+    window.__sluggerState = S;
+    if (S.hearts <= 0) endGame(true);
+  }
+  // A strike (whiff or called). 3 strikes = an OUT, which costs a heart.
+  function addStrike(kind) {
+    S.strikes++;
+    S.streak = 0; S.combo = 1;
+    if (kind === "whiff") S.whiffs++;
+    tone(200, 0.18, "square", 0.14, 120);
+    if (S.strikes >= L.MAX_STRIKES) {
+      S.strikes = 0; S.outs++;
+      addFloat(240, 480, "STRUCK OUT!", false);
+      loseHeart("OUT!");
+    } else {
+      addFloat(240, 480, (kind === "whiff" ? "SWING AND A MISS!" : "CALLED STRIKE!") + "  " + S.strikes + " \u2715", false);
+    }
+    window.__sluggerState = S;
+  }
+  // Resolve a pitch the moment the bat connects (or whiffs).
+  function resolveSwing() {
+    if (!ball || ball.resolved) return null;
+    var pos = ballPos();
+    var kind = L.classifySwing(pos.y);
+    ball.resolved = true;
+    pitchT = L.pitchInterval(elapsed);
+    if (kind === "whiff") {
+      addStrike("whiff");
+      return { kind: "whiff" };
+    }
+    var pts = L.hitPoints(kind, S.combo, ball.golden);
+    S.score += pts;
+    S.streak++;
+    if (kind === "homer") { S.homers++; flashGold = 0.4; } else { S.hits++; }
+    S.combo = L.comboForStreak(S.streak);
+    addFloat(pos.x, pos.y - 24, (kind === "homer" ? "HOME RUN! +" : "+") + pts, ball.golden);
+    burst(pos.x, pos.y, ball.golden ? "#ffd94a" : (kind === "homer" ? "#ff9d5c" : "#35f0ff"), kind === "homer" ? 26 : 12);
+    tone(kind === "homer" ? 1040 : 880, 0.16, "sine", 0.2, kind === "homer" ? 1560 : 1170);
+    buzz(kind === "homer" ? [30, 30, 60] : 25);
+    // The batted ball flies away: homers leave the park, hits stay in play.
+    ball.flyT = 0.0001;
+    ball.flyVx = (pos.x - 240) * 2 + (Math.random() * 120 - 60);
+    ball.flyVy = kind === "homer" ? -560 : -300;
+    window.__sluggerState = S;
+    return { kind: kind, points: pts, golden: ball.golden };
+  }
+  function swing() {
+    if (S.screen !== "playing" || swingCd > 0) return false;
+    swingCd = L.SWING_CD; swingT = L.SWING_ANIM;
+    tone(300, 0.06, "sine", 0.08, 500);
+    if (ball && !ball.resolved) resolveSwing();
+    return true;
+  }
+  function collectStar() {
+    if (!star.active) return false;
+    var pts = L.starPoints(S.combo);
+    S.score += pts; S.stars++;
+    addFloat(star.x, star.y - 20, "+" + pts, false);
+    burst(star.x, star.y, "#ffd94a", 10);
+    tone(1170, 0.12, "sine", 0.16, 1560);
+    star.active = false; star.ttl = 0; starT = 9;
+    window.__sluggerState = S;
+    return true;
+  }
+  // Autopilot: swing when the ball is in the perfect band, grab stars.
+  function autopilot(dt) {
+    autoT -= dt;
+    if (autoT > 0) return;
+    autoT = 0.05;
+    if (star.active) { collectStar(); return; }
+    if (!ball || ball.resolved || swingCd > 0) return;
+    var pos = ballPos();
+    if (pos.y >= 582 && pos.y <= 618) swing();
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    if (flashRed > 0) flashRed -= dt;
+    if (flashGold > 0) flashGold -= dt;
+    if (swingT > 0) swingT -= dt;
+    if (swingCd > 0) swingCd -= dt;
+    // Pitch spawning.
+    if (!ball) {
+      if (pitchT > 0) pitchT -= dt;
+      else spawnPitch();
+    } else if (!ball.resolved) {
+      if (!ball.frozen) ball.t += dt;
+      var pos = ballPos();
+      if (L.isCalledStrike(pos.y)) {
+        ball.resolved = true;
+        pitchT = L.pitchInterval(elapsed);
+        addStrike("called");
+      }
+    } else if (ball.flyT > 0) {
+      ball.flyT += dt;
+      if (ball.flyT > 0.8) ball = null;
+    } else {
+      // Whiffed / called pitch: ball drifts to the catcher, then clears.
+      ball.t += dt;
+      if (ball.t / ball.travel > 1.12) ball = null;
+    }
+    // Bonus star: one slot, respawns ~9s after the last one leaves.
+    if (star.active) {
+      star.ttl -= dt; star.spin += dt * 2;
+      star.x += star.vx * dt;
+      if (star.ttl <= 0 || star.x < -20 || star.x > L.W + 20) { star.active = false; starT = 9; }
+    } else {
+      starT -= dt;
+      if (starT <= 0) spawnStar();
+    }
+    if (auto) autopilot(dt);
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pp = particles[p];
+      pp.t += dt; pp.x += pp.vx * dt; pp.y += pp.vy * dt; pp.vy += 300 * dt;
+      if (pp.t > 0.6) particles.splice(p, 1);
+    }
+    for (var f = floats.length - 1; f >= 0; f--) {
+      floats[f].t += dt; floats[f].y -= 40 * dt;
+      if (floats[f].t > 1.1) floats.splice(f, 1);
+    }
+  }
+
+  function drawStarShape(x, y, r, rot) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.beginPath();
+    for (var i = 0; i < 10; i++) {
+      var rr = i % 2 === 0 ? r : r * 0.45;
+      var a = -Math.PI / 2 + i * Math.PI / 5;
+      if (i === 0) ctx.moveTo(Math.cos(a) * rr, Math.sin(a) * rr);
+      else ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath();
+    var g = ctx.createRadialGradient(0, 0, r * 0.1, 0, 0, r);
+    g.addColorStop(0, "#ffffff"); g.addColorStop(0.5, "#ffd94a"); g.addColorStop(1, "#ff9d5c");
+    ctx.fillStyle = g; ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 14;
+    ctx.fill();
+    ctx.restore();
+  }
+  function drawBall(x, y, golden) {
+    ctx.save();
+    ctx.translate(x, y);
+    var g = ctx.createRadialGradient(-3, -4, 1, 0, 0, 13);
+    g.addColorStop(0, "#ffffff");
+    g.addColorStop(0.55, golden ? "#ffd94a" : "#e8f4ff");
+    g.addColorStop(1, golden ? "#b8860b" : "#7fa8c9");
+    ctx.fillStyle = g; ctx.shadowColor = golden ? "#ffd94a" : "#ffffff"; ctx.shadowBlur = 14;
+    ctx.beginPath(); ctx.arc(0, 0, 12, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(255,60,80,0.9)"; ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(0, 0, 7, -0.9, 0.9); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, 7, Math.PI - 0.9, Math.PI + 0.9); ctx.stroke();
+    ctx.restore();
+  }
+  function render() {
+    // Clear the whole canvas first: anything drawn outside the world rect
+    // (e.g. a homer flying over the top edge) would otherwise persist in
+    // the letterbox bars forever, since the sky only covers the world.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#070512";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    // Sky.
+    var sky = ctx.createLinearGradient(0, 0, 0, L.H);
+    sky.addColorStop(0, "#0a0620"); sky.addColorStop(0.45, "#141038"); sky.addColorStop(1, "#0a1a0f");
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, L.W, L.H);
+    // Stars in the sky.
+    for (var i = 0; i < bgDots.length; i++) {
+      var d = bgDots[i];
+      ctx.globalAlpha = 0.25 + 0.35 * Math.abs(Math.sin(d.tw + performance.now() / 900));
+      ctx.fillStyle = "#cfe6ff";
+      ctx.fillRect(d.x, d.y, d.s, d.s);
+    }
+    ctx.globalAlpha = 1;
+    // Floodlight towers.
+    ctx.fillStyle = "#2a2350";
+    ctx.fillRect(28, 62, 8, 34); ctx.fillRect(444, 62, 8, 34);
+    ctx.fillStyle = "#fff7c0";
+    ctx.beginPath(); ctx.arc(32, 58, 10, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(448, 58, 10, 0, Math.PI * 2); ctx.fill();
+    // Crowd band.
+    ctx.fillStyle = "#131a3d"; ctx.fillRect(0, 12, L.W, 56);
+    for (var c = 0; c < crowd.length; c++) {
+      var cr = crowd[c];
+      ctx.globalAlpha = 0.5 + 0.4 * Math.abs(Math.sin(cr.tw + performance.now() / 700));
+      ctx.fillStyle = "hsl(" + cr.hue + ",80%,65%)";
+      ctx.beginPath(); ctx.arc(cr.x, cr.y, 3.4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = "#1d2757"; ctx.fillRect(0, 68, L.W, 10);
+    ctx.fillStyle = "#35f0ff"; ctx.font = "bold 11px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("N E O N   S L U G G E R   P A R K", L.W / 2, 118);
+    // Grass stripes.
+    for (var s = 0; s < 8; s++) {
+      ctx.fillStyle = s % 2 === 0 ? "#103a1d" : "#124222";
+      ctx.fillRect(0, 130 + s * 84, L.W, 84);
+    }
+    // Pitch lane (dirt strip down the middle).
+    ctx.fillStyle = "#3d2b18";
+    ctx.beginPath();
+    ctx.moveTo(196, 130); ctx.lineTo(284, 130); ctx.lineTo(300, 760); ctx.lineTo(180, 760); ctx.closePath();
+    ctx.fill();
+    // Pitcher's mound.
+    ctx.fillStyle = "#5a3d22";
+    ctx.beginPath(); ctx.ellipse(L.PITCHER.x, L.PITCHER.y + 8, 52, 16, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.fillRect(L.PITCHER.x - 14, L.PITCHER.y + 4, 28, 4);
+    // Strike zone (faint) + perfect band.
+    var zr = L.zoneRect(), pr = L.perfectRect();
+    ctx.strokeStyle = "rgba(53,240,255,0.35)"; ctx.lineWidth = 2;
+    ctx.setLineDash([8, 6]);
+    ctx.strokeRect(zr.x, zr.y, zr.w, zr.h);
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(255,217,74,0.14)";
+    ctx.fillRect(pr.x, pr.y, pr.w, pr.h);
+    ctx.fillStyle = "rgba(255,217,74,0.75)"; ctx.font = "bold 10px 'Segoe UI',sans-serif";
+    ctx.fillText("PERFECT", 240, pr.y - 5);
+    // Home plate.
+    var pl = L.plateRect();
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.moveTo(pl.x, pl.y); ctx.lineTo(pl.x + pl.w, pl.y);
+    ctx.lineTo(pl.x + pl.w, pl.y + 12); ctx.lineTo(pl.x + pl.w / 2, pl.y + pl.h);
+    ctx.lineTo(pl.x, pl.y + 12); ctx.closePath(); ctx.fill();
+    // Pitcher figure (simple neon player on the mound).
+    ctx.save();
+    ctx.translate(L.PITCHER.x, L.PITCHER.y - 6);
+    ctx.fillStyle = "#ff5e7a"; ctx.shadowColor = "#ff5e7a"; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(0, -16, 9, 0, Math.PI * 2); ctx.fill();
+    ctx.fillRect(-7, -8, 14, 22);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ff8ca0";
+    ctx.fillRect(-14, -4, 8, 18); ctx.fillRect(6, -4, 8, 18);
+    ctx.restore();
+    // Batter figure right of the plate, bat pivots at the hands.
+    var batAng = -1.2;
+    if (swingT > 0) {
+      var k = 1 - swingT / L.SWING_ANIM;
+      batAng = -1.2 + k * 2.4;
+    }
+    ctx.save();
+    ctx.translate(312, 628);
+    ctx.fillStyle = "#35f0ff"; ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 10;
+    ctx.beginPath(); ctx.arc(0, -34, 10, 0, Math.PI * 2); ctx.fill();
+    ctx.fillRect(-8, -26, 16, 30);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillRect(-16, -20, 9, 22); ctx.fillRect(7, -20, 9, 22);
+    // Bat: thick glowing line from the hands, sweeping across the plate.
+    ctx.save();
+    ctx.translate(-6, -22); ctx.rotate(batAng);
+    ctx.strokeStyle = "#ffd94a"; ctx.lineWidth = 7; ctx.lineCap = "round";
+    ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 12;
+    ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-64, -6); ctx.stroke();
+    ctx.restore();
+    ctx.restore();
+    // Bonus star.
+    if (star.active) drawStarShape(star.x, star.y, 20, star.spin);
+    // Ball (with trail while in flight).
+    if (ball) {
+      if (ball.flyT > 0) {
+        var bp = ballPos();
+        var fx = bp.x + ball.flyVx * ball.flyT;
+        var fy = bp.y + ball.flyVy * ball.flyT - 300 * ball.flyT * ball.flyT;
+        drawBall(fx, fy, ball.golden);
+      } else {
+        var pos = ballPos();
+        ctx.strokeStyle = ball.golden ? "rgba(255,217,74,0.5)" : "rgba(255,255,255,0.35)";
+        ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(pos.x, pos.y - 26); ctx.lineTo(pos.x, pos.y - 4); ctx.stroke();
+        drawBall(pos.x, pos.y, ball.golden);
+        if (ball.golden) {
+          ctx.fillStyle = "#ffd94a"; ctx.font = "bold 12px 'Segoe UI',sans-serif";
+          ctx.fillText("GOLDEN", pos.x, pos.y - 34);
+        }
+      }
+    }
+    // Particles.
+    for (var p = 0; p < particles.length; p++) {
+      var pp = particles[p];
+      ctx.globalAlpha = 1 - pp.t / 0.6;
+      ctx.fillStyle = pp.color;
+      ctx.beginPath(); ctx.arc(pp.x, pp.y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Floating score text.
+    ctx.textAlign = "center";
+    for (var f = 0; f < floats.length; f++) {
+      var fl = floats[f];
+      ctx.globalAlpha = 1 - fl.t / 1.1;
+      ctx.fillStyle = fl.golden ? "#ffd94a" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',sans-serif";
+      ctx.fillText(fl.text, fl.x, fl.y);
+    }
+    ctx.globalAlpha = 1;
+    // Red flash on heart loss / gold flash on homer.
+    if (flashRed > 0) { ctx.fillStyle = "rgba(255,40,70," + (flashRed * 0.6) + ")"; ctx.fillRect(0, 0, L.W, L.H); }
+    if (flashGold > 0) { ctx.fillStyle = "rgba(255,217,74," + (flashGold * 0.35) + ")"; ctx.fillRect(0, 0, L.W, L.H); }
+    drawHUD();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    ctx.restore();
+  }
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.72)";
+    ctx.fillRect(0, 0, L.W, L.HUD_H);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 24px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, 14, 32);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e7a" : "#9ff3ff";
+    ctx.font = "bold 28px 'Segoe UI',sans-serif";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 34);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ff5e7a"; ctx.font = "bold 24px 'Segoe UI',sans-serif";
+    var hearts = "";
+    for (var h = 0; h < L.MAX_HEARTS; h++) hearts += h < S.hearts ? "\u2665" : "\u00B7";
+    ctx.fillText(hearts, L.W - 14, 32);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffd94a"; ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillText("COMBO x" + S.combo + "  ·  HITS " + (S.hits + S.homers), 14, 60);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    var st = "";
+    for (var s = 0; s < L.MAX_STRIKES; s++) st += s < S.strikes ? "\u2715" : "\u25CB";
+    ctx.fillText("STRIKES " + st + "  ·  PITCH " + S.spawned, L.W - 14, 60);
+    ctx.restore();
+  }
+  function drawTitle() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.9)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#35f0ff"; ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 22;
+    ctx.font = "bold 52px 'Segoe UI',sans-serif";
+    ctx.fillText("NEON", L.W / 2, 250);
+    ctx.fillStyle = "#ff9d5c"; ctx.shadowColor = "#ff9d5c";
+    ctx.fillText("SLUGGER", L.W / 2, 310);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 20px 'Segoe UI',sans-serif";
+    ctx.fillText("60 seconds at the plate", L.W / 2, 356);
+    ctx.fillStyle = "#9ff3ff"; ctx.font = "17px 'Segoe UI',sans-serif";
+    ctx.fillText("Tap to SWING — time it in the zone!", L.W / 2, 400);
+    ctx.fillText("PERFECT = HOME RUN 250 x combo", L.W / 2, 428);
+    ctx.fillText("HIT = 100 x combo · 3 strikes = OUT", L.W / 2, 456);
+    ctx.fillStyle = "#ffd94a";
+    ctx.fillText("Golden pitches pay 5x · stars pay 50 x combo", L.W / 2, 484);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 22px 'Segoe UI',sans-serif";
+    ctx.fillText("TAP TO START", L.W / 2, 580);
+    ctx.globalAlpha = 1;
+    ctx.font = "15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 618);
+    // Big glowing ball, low on the title screen.
+    ctx.save();
+    ctx.translate(L.W / 2, 712);
+    var tg = ctx.createRadialGradient(-8, -10, 2, 0, 0, 30);
+    tg.addColorStop(0, "#ffffff"); tg.addColorStop(0.55, "#e8f4ff"); tg.addColorStop(1, "#7fa8c9");
+    ctx.fillStyle = tg; ctx.shadowColor = "#ffffff"; ctx.shadowBlur = 24;
+    ctx.beginPath(); ctx.arc(0, 0, 28, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(255,60,80,0.9)"; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(0, 0, 17, -0.9, 0.9); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0, 0, 17, Math.PI - 0.9, Math.PI + 0.9); ctx.stroke();
+    ctx.restore();
+    ctx.restore();
+  }
+  function drawOver() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.82)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff";
+    ctx.shadowColor = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 44px 'Segoe UI',sans-serif";
+    ctx.fillText(S.hearts <= 0 ? "STRUCK OUT!" : "TIME'S UP!", L.W / 2, 250);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, L.W / 2, 320);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "19px 'Segoe UI',sans-serif";
+    ctx.fillText("Hits " + S.hits + "  ·  Homers " + S.homers + "  ·  Stars " + S.stars + "  ·  Outs " + S.outs, L.W / 2, 360);
+    if (S.flawless) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 20px 'Segoe UI',sans-serif";
+      ctx.fillText("FLAWLESS +500 — no hearts lost!", L.W / 2, 396);
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("BEST " + S.best, L.W / 2, 440);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 520);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  function handleTap(w) {
+    if (S.screen !== "playing") return;
+    if (star.active && Math.hypot(w.x - star.x, w.y - star.y) < 26) { collectStar(); return; }
+    swing();
+  }
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    handleTap(toWorld(e));
+    e.preventDefault();
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    else if (S.screen === "playing" && (e.key === " " || e.key === "s" || e.key === "S")) { swing(); e.preventDefault(); }
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_slugger_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+
+  window.__sluggerState = S;
+  window.__sluggerDebug = {
+    state: function () { return { screen: S.screen, score: S.score, combo: S.combo, streak: S.streak, hits: S.hits, homers: S.homers, whiffs: S.whiffs, strikes: S.strikes, outs: S.outs, hearts: S.hearts, timeLeft: Math.round(S.timeLeft * 10) / 10, stars: S.stars, spawned: S.spawned, ball: ball ? { type: ball.type, y: Math.round(ballPos().y), golden: ball.golden, resolved: ball.resolved } : null }; },
+    start: function () { start(); },
+    swing: function () { return swing(); },
+    setAuto: function (v) { auto = v; },
+    // Place a live ball at a given y (unresolved, no swing): the phone
+    // check taps the real screen to swing at it.
+    debugPlaceBall: function (y) {
+      if (S.screen !== "playing") return null;
+      if (!ball) spawnPitch();
+      ball.t = ball.travel * ((y - L.BALL_Y0) / (L.BALL_Y1 - L.BALL_Y0));
+      ball.resolved = false; ball.flyT = 0; ball.frozen = true;
+      swingCd = 0;
+      return { y: y, golden: ball.golden, combo: S.combo, score: S.score, homers: S.homers };
+    },
+    // Put a live ball in the perfect band and swing: must score exactly
+    // 250 x combo (x5 if golden).
+    debugHomer: function () {
+      if (S.screen !== "playing") return null;
+      if (!ball) spawnPitch();
+      ball.t = ball.travel * ((600 - L.BALL_Y0) / (L.BALL_Y1 - L.BALL_Y0));
+      ball.resolved = false; ball.flyT = 0;
+      swingCd = 0;
+      var before = { score: S.score, combo: S.combo, homers: S.homers };
+      var res = swing();
+      return { swung: res, golden: ball ? ball.golden : null, before: before, after: { score: S.score, homers: S.homers } };
+    },
+    // Put a live ball high up the lane and swing: must be a whiff —
+    // exactly one strike, no points.
+    debugWhiff: function () {
+      if (S.screen !== "playing") return null;
+      if (!ball) spawnPitch();
+      ball.t = ball.travel * ((300 - L.BALL_Y0) / (L.BALL_Y1 - L.BALL_Y0));
+      ball.resolved = false; ball.flyT = 0; ball.frozen = true;
+      swingCd = 0;
+      var before = { score: S.score, strikes: S.strikes, whiffs: S.whiffs, combo: S.combo };
+      swing();
+      return { before: before, after: { score: S.score, strikes: S.strikes, whiffs: S.whiffs, combo: S.combo } };
+    },
+    // Put a live ball just past the plate, unresolved: the next update
+    // must call it a strike.
+    debugCalled: function () {
+      if (S.screen !== "playing") return null;
+      if (!ball) spawnPitch();
+      ball.t = ball.travel * ((652 - L.BALL_Y0) / (L.BALL_Y1 - L.BALL_Y0));
+      ball.resolved = false; ball.flyT = 0;
+      return { before: { strikes: S.strikes } };
+    },
+    // Place a bonus star at a fixed spot and return its world coords so
+    // the phone check can tap it for exactly 50 x combo.
+    debugStar: function () {
+      if (S.screen !== "playing") return null;
+      star = { active: true, x: 70, y: 360, ttl: 30, spin: 0, vx: 0 };
+      return { x: 70, y: 360, combo: S.combo, score: S.score, stars: S.stars };
+    }
+  };
+
+  reset();
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
