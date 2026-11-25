@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Curling — Day 61</title>
+<meta name="description" content="Neon Curling — 60 seconds of neon curling chaos. Drag back to aim, release to slide the stone down the sheet, HOLD to sweep! Land in the rings: button pays 250 x combo, golden stones pay 5x. 3 hearts.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Curling — Day 61. You curl for 60 seconds under the neon lights.
+   Drag back from the stone to aim, release to slide it up the sheet.
+   While it slides, HOLD anywhere to SWEEP — sweeping cuts the friction
+   so the stone glides further and steers gently toward your finger.
+   Where the stone stops decides the pay: BUTTON 250, 4-FOOT 150,
+   8-FOOT 100, 12-FOOT 50 — all x combo. Chain 4 scoring stones to
+   raise the combo x1->x5. Every 6th stone is GOLDEN (5x). A stone that
+   stops short of the hog line is a FOUL (heart), and sliding into the
+   gutter or past the back line costs a heart too. A stone that stops
+   past the hog line but outside the rings is just a miss (combo reset).
+   Bonus stars on the sheet pay 50 x combo when the stone runs over
+   them. Flawless (no hearts lost) +500. Best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var CurlingLogic = (function () {
+  var W = 480, H = 800;
+  var GAME_TIME = 60, MAX_HEARTS = 3;
+  var HUD_H = 76;
+  var HOUSE = { x: 240, y: 200 };
+  var RING_R = [112, 84, 56, 28]; // 12-foot, 8-foot, 4-foot, button
+  var RING_BASE = [50, 100, 150, 250];
+  var HACK = { x: 240, y: 700 };
+  var HOG_Y = 520;
+  var BACK_Y = 40;
+  var SHEET = { x0: 40, x1: 440 };
+  var STONE_R = 16;
+  var FRICTION = 0.9;        // exponential decay /s, unswept
+  var SWEEP_FRICTION = 0.30; // exponential decay /s, while sweeping
+  var STOP_SPEED = 8;        // below this the stone is at rest
+  var MAX_LAUNCH = 660;      // px/s, launch speed cap
+  var DRAG_K = 3.4;          // drag px -> launch px/s
+  var MIN_DRAG = 30;         // px, below this a release is not a throw
+  var STAR_R = 26;           // stone collects a star within this distance
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, combo: 1, streak: 0,
+      scored: 0, buttons: 0, fouls: 0, misses: 0, hearts: MAX_HEARTS,
+      timeLeft: GAME_TIME, flawless: false, stars: 0, thrown: 0 };
+  }
+  // combo: +1 every 4 consecutive scoring stones, capped at x5.
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  // Ring index by distance from the house centre: 0 = 12-foot, 1 = 8-foot,
+  // 2 = 4-foot, 3 = button; -1 = outside the house.
+  function ringForDist(d) {
+    if (d <= RING_R[3]) return 3;
+    if (d <= RING_R[2]) return 2;
+    if (d <= RING_R[1]) return 1;
+    if (d <= RING_R[0]) return 0;
+    return -1;
+  }
+  function ringBase(ring) { return ring < 0 ? 0 : RING_BASE[ring]; }
+  function ringName(ring) {
+    return ["12-FOOT", "8-FOOT", "4-FOOT", "BUTTON"][ring] || "MISS";
+  }
+  function scorePoints(base, combo, golden) {
+    return base * combo * (golden ? 5 : 1);
+  }
+  function starPoints(combo) { return 50 * combo; }
+  // 1-based: the 6th, 12th, 18th... stone thrown is GOLDEN.
+  function isGoldenSpawn(n) { return n % 6 === 0; }
+  // Exponential-decay slide: a stone launched at speed v0 with decay k
+  // travels v0/k before stopping.
+  function stopDistance(v0, k) { return v0 / k; }
+  function launchForDistance(d, k) { return d * k; }
+  // Launch velocity from a drag: slingshot — velocity is opposite the
+  // drag vector, scaled, capped at MAX_LAUNCH.
+  function launchVelocity(dragX, dragY) {
+    var vx = -dragX * DRAG_K, vy = -dragY * DRAG_K;
+    var sp = Math.hypot(vx, vy);
+    if (sp > MAX_LAUNCH) { vx *= MAX_LAUNCH / sp; vy *= MAX_LAUNCH / sp; }
+    return { vx: vx, vy: vy, speed: Math.hypot(vx, vy) };
+  }
+  function dragLength(dx, dy) { return Math.hypot(dx, dy); }
+  // A release is a legal throw when the drag is long enough and the
+  // launch heads up the sheet (vy negative enough).
+  function isLegalThrow(dragX, dragY) {
+    if (dragLength(dragX, dragY) < MIN_DRAG) return false;
+    var v = launchVelocity(dragX, dragY);
+    return v.vy < -60;
+  }
+  // A stone at rest has crossed the hog line when its y is above it.
+  function crossedHog(y) { return y < HOG_Y; }
+  // Out of play: past the back line or outside the sheet sides.
+  function outOfPlay(x, y) {
+    return y < BACK_Y || x < SHEET.x0 - 4 || x > SHEET.x1 + 4;
+  }
+  // Sweep steering: while sweeping, the stone drifts toward the finger's x.
+  function sweepSteer(stoneX, fingerX, dt) {
+    return clamp(fingerX - stoneX, -60, 60) * 1.5 * dt;
+  }
+
+  return { W: W, H: H, GAME_TIME: GAME_TIME, MAX_HEARTS: MAX_HEARTS,
+    HUD_H: HUD_H, HOUSE: HOUSE, RING_R: RING_R, RING_BASE: RING_BASE,
+    HACK: HACK, HOG_Y: HOG_Y, BACK_Y: BACK_Y, SHEET: SHEET,
+    STONE_R: STONE_R, FRICTION: FRICTION, SWEEP_FRICTION: SWEEP_FRICTION,
+    STOP_SPEED: STOP_SPEED, MAX_LAUNCH: MAX_LAUNCH, DRAG_K: DRAG_K,
+    MIN_DRAG: MIN_DRAG, STAR_R: STAR_R,
+    clamp: clamp, makeState: makeState,
+    comboForStreak: comboForStreak, ringForDist: ringForDist,
+    ringBase: ringBase, ringName: ringName,
+    scorePoints: scorePoints, starPoints: starPoints,
+    isGoldenSpawn: isGoldenSpawn, stopDistance: stopDistance,
+    launchForDistance: launchForDistance, launchVelocity: launchVelocity,
+    dragLength: dragLength, isLegalThrow: isLegalThrow,
+    crossedHog: crossedHog, outOfPlay: outOfPlay,
+    sweepSteer: sweepSteer };
+})();
+//LOGIC-END
+
+(function () {
+  var L = CurlingLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_curling_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_curling_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, starT = 4, autoT = 0, resetT = 0;
+  var stone = { x: L.HACK.x, y: L.HACK.y, vx: 0, vy: 0, state: "idle", golden: false, sliding: false };
+  var aim = { active: false, sx: 0, sy: 0, cx: 0, cy: 0 };
+  var sweep = { active: false, x: 240 };
+  var star = { active: false, x: 0, y: 0, ttl: 0, spin: 0 };
+  var particles = [], floats = [], iceDots = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  var flashRed = 0, flashGold = 0;
+  for (var i = 0; i < 70; i++) {
+    iceDots.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 0.6 + Math.random() * 1.2, tw: Math.random() * Math.PI * 2 });
+  }
+
+  function spawnStar() {
+    star = { active: true, x: 80 + Math.random() * 320, y: 200 + Math.random() * 280,
+      ttl: 8, spin: 0 };
+  }
+  function resetStone() {
+    stone = { x: L.HACK.x, y: L.HACK.y, vx: 0, vy: 0, state: "idle", golden: false, sliding: false };
+    aim.active = false; sweep.active = false;
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_curling_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; starT = 4; autoT = 0; resetT = 0;
+    star = { active: false, x: 0, y: 0, ttl: 0, spin: 0 };
+    particles = []; floats = []; flashRed = 0; flashGold = 0;
+    resetStone();
+    window.__curlingState = S;
+  }
+  function start() {
+    reset();
+    S.screen = "playing";
+    tone(660, 0.12, "sine", 0.2, 990);
+  }
+  function endGame(outOfHearts) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (!outOfHearts && S.hearts === L.MAX_HEARTS && S.scored > 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_curling_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__curlingState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function loseHeart(reason) {
+    S.hearts--;
+    S.streak = 0; S.combo = 1;
+    flashRed = 0.35;
+    tone(160, 0.35, "sawtooth", 0.2, 70);
+    buzz([50, 40, 50]);
+    addFloat(240, 250, reason + "  -1 \u2665", false);
+    window.__curlingState = S;
+    if (S.hearts <= 0) endGame(true);
+  }
+  function collectStar() {
+    if (!star.active) return false;
+    var pts = L.starPoints(S.combo);
+    S.score += pts; S.stars++;
+    addFloat(star.x, star.y - 20, "+" + pts, false);
+    burst(star.x, star.y, "#ffd94a", 10);
+    tone(1170, 0.12, "sine", 0.16, 1560);
+    star.active = false; star.ttl = 0; starT = 9;
+    window.__curlingState = S;
+    return true;
+  }
+  // Launch the stone from the hack with a drag vector (world coords).
+  function throwStone(dragX, dragY) {
+    if (S.screen !== "playing" || stone.state !== "idle") return false;
+    if (!L.isLegalThrow(dragX, dragY)) return false;
+    var v = L.launchVelocity(dragX, dragY);
+    S.thrown++;
+    stone.vx = v.vx; stone.vy = v.vy;
+    stone.state = "sliding"; stone.sliding = true;
+    stone.golden = L.isGoldenSpawn(S.thrown);
+    if (stone.golden) addFloat(240, 300, "GOLDEN STONE!", true);
+    tone(300, 0.1, "sine", 0.12, 500);
+    window.__curlingState = S;
+    return true;
+  }
+  // Resolve a stone that came to rest: score the rings, or foul/miss.
+  function resolveStop() {
+    stone.sliding = false;
+    stone.state = "done";
+    var d = Math.hypot(stone.x - L.HOUSE.x, stone.y - L.HOUSE.y);
+    var ring = L.ringForDist(d);
+    if (!L.crossedHog(stone.y)) {
+      // Stopped short of the hog line: a foul costs a heart.
+      S.fouls++;
+      addFloat(stone.x, stone.y - 30, "HOG-LINE FOUL!", false);
+      resetT = 0.9;
+      loseHeart("FOUL!");
+      return { kind: "foul" };
+    }
+    if (ring < 0) {
+      S.misses++;
+      S.streak = 0; S.combo = 1;
+      addFloat(stone.x, stone.y - 30, "MISS", false);
+      tone(200, 0.18, "square", 0.12, 120);
+      resetT = 0.9;
+      window.__curlingState = S;
+      return { kind: "miss" };
+    }
+    var base = L.ringBase(ring);
+    var pts = L.scorePoints(base, S.combo, stone.golden);
+    S.score += pts;
+    S.streak++;
+    S.scored++;
+    if (ring === 3) { S.buttons++; flashGold = 0.4; }
+    S.combo = L.comboForStreak(S.streak);
+    addFloat(stone.x, stone.y - 30, L.ringName(ring) + "! +" + pts, stone.golden);
+    burst(stone.x, stone.y, stone.golden ? "#ffd94a" : "#35f0ff", ring === 3 ? 26 : 12);
+    tone(ring === 3 ? 1040 : 880, 0.16, "sine", 0.2, ring === 3 ? 1560 : 1170);
+    buzz(ring === 3 ? [30, 30, 60] : 25);
+    resetT = 0.9;
+    window.__curlingState = S;
+    return { kind: "score", ring: ring, points: pts };
+  }
+  // Resolve a stone that left the sheet: gutter or too far, costs a heart.
+  function resolveOutOfPlay(reason) {
+    stone.sliding = false;
+    stone.state = "done";
+    S.misses++;
+    addFloat(240, 300, reason, false);
+    resetT = 0.9;
+    loseHeart(reason);
+    return { kind: "out", reason: reason };
+  }
+  // Autopilot: aim at the house centre with the exact launch speed for
+  // the distance (plus a small random angle error), no sweeping.
+  function autopilot(dt) {
+    autoT -= dt;
+    if (autoT > 0) return;
+    autoT = 0.05;
+    if (S.screen !== "playing" || stone.state !== "idle") return;
+    var dist = L.HACK.y - L.HOUSE.y;
+    var v0 = L.launchForDistance(dist, L.FRICTION);
+    var err = (Math.random() * 5 - 2.5) * Math.PI / 180;
+    var vx = Math.sin(err) * v0, vy = -Math.cos(err) * v0;
+    S.thrown++;
+    stone.vx = vx; stone.vy = vy;
+    stone.state = "sliding"; stone.sliding = true;
+    stone.golden = L.isGoldenSpawn(S.thrown);
+    if (stone.golden) addFloat(240, 300, "GOLDEN STONE!", true);
+    window.__curlingState = S;
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    if (flashRed > 0) flashRed -= dt;
+    if (flashGold > 0) flashGold -= dt;
+    // Stone sliding physics.
+    if (stone.state === "sliding") {
+      var k = sweep.active ? L.SWEEP_FRICTION : L.FRICTION;
+      var decay = Math.exp(-k * dt);
+      stone.vx *= decay; stone.vy *= decay;
+      if (sweep.active) {
+        stone.vx += L.sweepSteer(stone.x, sweep.x, dt);
+        // Ice spray while sweeping.
+        if (Math.random() < 0.5) {
+          particles.push({ x: stone.x + (Math.random() * 30 - 15), y: stone.y - 14,
+            vx: (Math.random() * 40 - 20), vy: -40 - Math.random() * 40, t: 0, color: "#cfe6ff" });
+        }
+      }
+      stone.x += stone.vx * dt;
+      stone.y += stone.vy * dt;
+      var speed = Math.hypot(stone.vx, stone.vy);
+      // Star pickup: the stone runs over it.
+      if (star.active && Math.hypot(stone.x - star.x, stone.y - star.y) < L.STAR_R + 10) collectStar();
+      if (L.outOfPlay(stone.x, stone.y)) {
+        resolveOutOfPlay(stone.y < L.BACK_Y ? "TOO FAR!" : "GUTTER!");
+      } else if (speed < L.STOP_SPEED) {
+        stone.vx = 0; stone.vy = 0;
+        resolveStop();
+      }
+    } else if (stone.state === "done") {
+      if (resetT > 0) {
+        resetT -= dt;
+        if (resetT <= 0 && S.screen === "playing") resetStone();
+      }
+    }
+    // Bonus star: one slot, respawns ~9s after the last one leaves.
+    if (star.active) {
+      star.ttl -= dt; star.spin += dt * 2;
+      if (star.ttl <= 0) { star.active = false; starT = 9; }
+    } else {
+      starT -= dt;
+      if (starT <= 0) spawnStar();
+    }
+    if (auto) autopilot(dt);
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pp = particles[p];
+      pp.t += dt; pp.x += pp.vx * dt; pp.y += pp.vy * dt; pp.vy += 200 * dt;
+      if (pp.t > 0.6) particles.splice(p, 1);
+    }
+    for (var f = floats.length - 1; f >= 0; f--) {
+      floats[f].t += dt; floats[f].y -= 40 * dt;
+      if (floats[f].t > 1.1) floats.splice(f, 1);
+    }
+  }
+
+  function drawStarShape(x, y, r, rot) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.beginPath();
+    for (var i = 0; i < 10; i++) {
+      var rr = i % 2 === 0 ? r : r * 0.45;
+      var a = -Math.PI / 2 + i * Math.PI / 5;
+      if (i === 0) ctx.moveTo(Math.cos(a) * rr, Math.sin(a) * rr);
+      else ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath();
+    var g = ctx.createRadialGradient(0, 0, r * 0.1, 0, 0, r);
+    g.addColorStop(0, "#ffffff"); g.addColorStop(0.5, "#ffd94a"); g.addColorStop(1, "#ff9d5c");
+    ctx.fillStyle = g; ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 14;
+    ctx.fill();
+    ctx.restore();
+  }
+  function drawStone(x, y, golden) {
+    ctx.save();
+    ctx.translate(x, y);
+    var g = ctx.createRadialGradient(-5, -6, 2, 0, 0, 20);
+    g.addColorStop(0, "#ffffff");
+    g.addColorStop(0.55, golden ? "#ffd94a" : "#3a4a6b");
+    g.addColorStop(1, golden ? "#b8860b" : "#141c33");
+    ctx.fillStyle = g; ctx.shadowColor = golden ? "#ffd94a" : "#35f0ff"; ctx.shadowBlur = 16;
+    ctx.beginPath(); ctx.arc(0, 0, L.STONE_R, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = golden ? "#fff2b0" : "#9ff3ff"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(0, 0, 11, 0, Math.PI * 2); ctx.stroke();
+    // Handle: small bar across the top of the stone.
+    ctx.fillStyle = golden ? "#ffd94a" : "#ff5e7a";
+    ctx.fillRect(-9, -4, 18, 5);
+    if (golden) {
+      ctx.fillStyle = "#ffd94a"; ctx.font = "bold 11px 'Segoe UI',sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("GOLD", 0, -24);
+    }
+    ctx.restore();
+  }
+  function render() {
+    // Clear the whole canvas first: anything drawn outside the world rect
+    // would otherwise persist in the letterbox bars, since the ice only
+    // covers the world.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#070512";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    // Ice.
+    var ice = ctx.createLinearGradient(0, 0, 0, L.H);
+    ice.addColorStop(0, "#0d2a44"); ice.addColorStop(0.5, "#0a2036"); ice.addColorStop(1, "#0d2a44");
+    ctx.fillStyle = ice; ctx.fillRect(0, 0, L.W, L.H);
+    // Ice sparkle.
+    for (var i = 0; i < iceDots.length; i++) {
+      var d = iceDots[i];
+      ctx.globalAlpha = 0.15 + 0.25 * Math.abs(Math.sin(d.tw + performance.now() / 900));
+      ctx.fillStyle = "#cfe6ff";
+      ctx.fillRect(d.x, d.y, d.s, d.s);
+    }
+    ctx.globalAlpha = 1;
+    // Sheet: side lines, centre line, hog line.
+    ctx.fillStyle = "rgba(160,220,255,0.16)";
+    ctx.fillRect(L.SHEET.x0, L.HUD_H, L.SHEET.x1 - L.SHEET.x0, L.H - L.HUD_H);
+    ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(L.SHEET.x0, L.HUD_H); ctx.lineTo(L.SHEET.x0, L.H); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(L.SHEET.x1, L.HUD_H); ctx.lineTo(L.SHEET.x1, L.H); ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.setLineDash([10, 8]);
+    ctx.beginPath(); ctx.moveTo(240, L.HUD_H); ctx.lineTo(240, L.H); ctx.stroke();
+    ctx.setLineDash([]);
+    // Hog line (red).
+    ctx.strokeStyle = "#ff5e7a"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(L.SHEET.x0, L.HOG_Y); ctx.lineTo(L.SHEET.x1, L.HOG_Y); ctx.stroke();
+    ctx.fillStyle = "#ff5e7a"; ctx.font = "bold 11px 'Segoe UI',sans-serif"; ctx.textAlign = "left";
+    ctx.fillText("HOG LINE", L.SHEET.x0 + 6, L.HOG_Y - 6);
+    // Back line sits above the HUD (y < HUD_H) so it is not drawn — the
+    // house top edge is the visible limit; BACK_Y still bounds play.
+    // House: concentric rings (12ft blue, 8ft white, 4ft red, button white).
+    var hc = L.HOUSE;
+    var ringCols = ["#2b6cb0", "#e8f4ff", "#ff5e7a", "#ffffff"];
+    for (var r = 0; r < 4; r++) {
+      ctx.fillStyle = ringCols[r];
+      ctx.beginPath(); ctx.arc(hc.x, hc.y, L.RING_R[r], 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.strokeStyle = "rgba(53,240,255,0.8)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(hc.x, hc.y, L.RING_R[0] + 4, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = "#2b6cb0"; ctx.font = "bold 11px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("BUTTON 250", hc.x, hc.y + 4);
+    ctx.fillStyle = "rgba(255,255,255,0.75)"; ctx.font = "11px 'Segoe UI',sans-serif";
+    ctx.fillText("4-FT 150", hc.x, hc.y - 66);
+    ctx.fillText("8-FT 100", hc.x, hc.y - 94);
+    // Hack (starting foothold) at the bottom.
+    ctx.fillStyle = "#1d2757";
+    ctx.fillRect(L.HACK.x - 30, L.HACK.y - 8, 60, 16);
+    ctx.strokeStyle = "#35f0ff"; ctx.lineWidth = 2;
+    ctx.strokeRect(L.HACK.x - 30, L.HACK.y - 8, 60, 16);
+    // Bonus star.
+    if (star.active) drawStarShape(star.x, star.y, 18, star.spin);
+    // Aim preview: dashed line from the stone along the launch vector.
+    if (aim.active && stone.state === "idle") {
+      var dx = aim.cx - aim.sx, dy = aim.cy - aim.sy;
+      var v = L.launchVelocity(dx, dy);
+      var len = L.dragLength(dx, dy);
+      if (len >= 8) {
+        var ux = v.vx / v.speed, uy = v.vy / v.speed;
+        var reach = Math.min(560, v.speed * 0.9);
+        ctx.strokeStyle = v.vy < -60 ? "rgba(53,240,255,0.9)" : "rgba(255,94,122,0.9)";
+        ctx.lineWidth = 3; ctx.setLineDash([10, 8]);
+        ctx.beginPath();
+        ctx.moveTo(stone.x, stone.y);
+        ctx.lineTo(stone.x + ux * reach, stone.y + uy * reach);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // Power bar.
+        var pw = Math.min(1, v.speed / L.MAX_LAUNCH);
+        ctx.fillStyle = "rgba(4,8,24,0.7)";
+        ctx.fillRect(120, 760, 240, 14);
+        ctx.fillStyle = pw > 0.85 ? "#ff5e7a" : (pw > 0.6 ? "#ffd94a" : "#35f0ff");
+        ctx.fillRect(122, 762, 236 * pw, 10);
+        ctx.fillStyle = "#ffffff"; ctx.font = "bold 12px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+        ctx.fillText("POWER " + Math.round(pw * 100) + "%", 240, 752);
+      }
+    }
+    // Sweep indicator + broom at the finger.
+    if (sweep.active && stone.state === "sliding") {
+      ctx.fillStyle = "#ffd94a"; ctx.font = "bold 18px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("SWEEPING!", 240, 330);
+      ctx.save();
+      ctx.translate(sweep.x, stone.y - 34);
+      ctx.rotate(0.5);
+      ctx.fillStyle = "#8a5a2b"; ctx.fillRect(-3, -26, 6, 30);
+      ctx.fillStyle = "#ffd94a"; ctx.fillRect(-12, 2, 24, 10);
+      ctx.restore();
+    }
+    // The stone.
+    if (stone.state !== "done" || resetT > 0.4) {
+      drawStone(stone.x, stone.y, stone.golden);
+    }
+    // Particles.
+    for (var p = 0; p < particles.length; p++) {
+      var pp = particles[p];
+      ctx.globalAlpha = 1 - pp.t / 0.6;
+      ctx.fillStyle = pp.color;
+      ctx.beginPath(); ctx.arc(pp.x, pp.y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Floating score text.
+    ctx.textAlign = "center";
+    for (var f = 0; f < floats.length; f++) {
+      var fl = floats[f];
+      ctx.globalAlpha = 1 - fl.t / 1.1;
+      ctx.fillStyle = fl.golden ? "#ffd94a" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',sans-serif";
+      ctx.fillText(fl.text, fl.x, fl.y);
+    }
+    ctx.globalAlpha = 1;
+    // Red flash on heart loss / gold flash on button.
+    if (flashRed > 0) { ctx.fillStyle = "rgba(255,40,70," + (flashRed * 0.6) + ")"; ctx.fillRect(0, 0, L.W, L.H); }
+    if (flashGold > 0) { ctx.fillStyle = "rgba(255,217,74," + (flashGold * 0.35) + ")"; ctx.fillRect(0, 0, L.W, L.H); }
+    drawHUD();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    ctx.restore();
+  }
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.72)";
+    ctx.fillRect(0, 0, L.W, L.HUD_H);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 24px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, 14, 32);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e7a" : "#9ff3ff";
+    ctx.font = "bold 28px 'Segoe UI',sans-serif";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 34);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ff5e7a"; ctx.font = "bold 24px 'Segoe UI',sans-serif";
+    var hearts = "";
+    for (var h = 0; h < L.MAX_HEARTS; h++) hearts += h < S.hearts ? "\u2665" : "\u00B7";
+    ctx.fillText(hearts, L.W - 14, 32);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffd94a"; ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillText("COMBO x" + S.combo + "  ·  SCORED " + S.scored, 14, 60);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillText("STONE " + S.thrown + "  ·  BUTTONS " + S.buttons, L.W - 14, 60);
+    ctx.restore();
+  }
+  function drawTitle() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.9)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#35f0ff"; ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 22;
+    ctx.font = "bold 52px 'Segoe UI',sans-serif";
+    ctx.fillText("NEON", L.W / 2, 250);
+    ctx.fillStyle = "#ff5e7a"; ctx.shadowColor = "#ff5e7a";
+    ctx.fillText("CURLING", L.W / 2, 310);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 20px 'Segoe UI',sans-serif";
+    ctx.fillText("60 seconds on the ice", L.W / 2, 356);
+    ctx.fillStyle = "#9ff3ff"; ctx.font = "17px 'Segoe UI',sans-serif";
+    ctx.fillText("Drag back to aim — release to slide!", L.W / 2, 400);
+    ctx.fillText("HOLD anywhere to SWEEP the ice", L.W / 2, 428);
+    ctx.fillText("BUTTON 250 · 4-FT 150 · 8-FT 100 · 12-FT 50", L.W / 2, 456);
+    ctx.fillStyle = "#ffd94a";
+    ctx.fillText("Golden stones pay 5x · stars pay 50 x combo", L.W / 2, 484);
+    ctx.fillStyle = "#ff8ca0";
+    ctx.fillText("Stop short of the hog line and it's a FOUL", L.W / 2, 512);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 22px 'Segoe UI',sans-serif";
+    ctx.fillText("TAP TO START", L.W / 2, 580);
+    ctx.globalAlpha = 1;
+    ctx.font = "15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 618);
+    drawStone(L.W / 2, 712, false);
+    ctx.restore();
+  }
+  function drawOver() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.82)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff";
+    ctx.shadowColor = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 44px 'Segoe UI',sans-serif";
+    ctx.fillText(S.hearts <= 0 ? "OUT OF HEARTS!" : "TIME'S UP!", L.W / 2, 250);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, L.W / 2, 320);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "19px 'Segoe UI',sans-serif";
+    ctx.fillText("Scored " + S.scored + "  ·  Buttons " + S.buttons + "  ·  Stars " + S.stars + "  ·  Fouls " + S.fouls, L.W / 2, 360);
+    if (S.flawless) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 20px 'Segoe UI',sans-serif";
+      ctx.fillText("FLAWLESS +500 — no hearts lost!", L.W / 2, 396);
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("BEST " + S.best, L.W / 2, 440);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 520);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    if (S.screen !== "playing") return;
+    var w = toWorld(e);
+    if (stone.state === "idle") {
+      aim.active = true; aim.sx = w.x; aim.sy = w.y; aim.cx = w.x; aim.cy = w.y;
+    } else if (stone.state === "sliding") {
+      sweep.active = true; sweep.x = w.x;
+    }
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!aim.active && !sweep.active) return;
+    var w = toWorld(e);
+    if (aim.active) { aim.cx = w.x; aim.cy = w.y; }
+    if (sweep.active) { sweep.x = w.x; }
+    e.preventDefault();
+  }
+  function onUp(e) {
+    if (aim.active) {
+      var dx = aim.cx - aim.sx, dy = aim.cy - aim.sy;
+      aim.active = false;
+      throwStone(dx, dy);
+    }
+    sweep.active = false;
+    e.preventDefault();
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", onUp);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    else if (S.screen === "playing" && e.key === " ") { sweep.active = true; sweep.x = stone.x; e.preventDefault(); }
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_curling_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+  window.addEventListener("keyup", function (e) {
+    if (e.key === " ") sweep.active = false;
+  });
+
+  window.__curlingState = S;
+  window.__curlingDebug = {
+    state: function () {
+      return { screen: S.screen, score: S.score, combo: S.combo, streak: S.streak,
+        scored: S.scored, buttons: S.buttons, fouls: S.fouls, misses: S.misses,
+        hearts: S.hearts, timeLeft: Math.round(S.timeLeft * 10) / 10, stars: S.stars,
+        thrown: S.thrown, sweeping: sweep.active,
+        stone: { x: Math.round(stone.x), y: Math.round(stone.y),
+          vx: Math.round(stone.vx), vy: Math.round(stone.vy),
+          state: stone.state, golden: stone.golden } };
+    },
+    start: function () { start(); },
+    setAuto: function (v) { auto = v; },
+    // Throw a stone with a given drag vector (world px): returns the
+    // launch the phone check verifies from a REAL drag.
+    throwDrag: function (dx, dy) { return throwStone(dx, dy); },
+    // Place a sliding stone just short of the house at a known speed so
+    // the phone check can hold SWEEP and watch it carry further.
+    debugPlaceSliding: function () {
+      if (S.screen !== "playing" || stone.state !== "idle") return null;
+      S.thrown++;
+      stone.x = 240; stone.y = 480; stone.vx = 0; stone.vy = -120;
+      stone.state = "sliding"; stone.sliding = true;
+      stone.golden = false;
+      return { x: 240, y: 480, vy: -120, thrown: S.thrown };
+    },
+    // Put the stone at rest exactly on the button and resolve: must score
+    // exactly 250 x combo (x5 if golden).
+    debugButton: function () {
+      if (S.screen !== "playing") return null;
+      if (stone.state === "idle") { S.thrown++; stone.golden = L.isGoldenSpawn(S.thrown); }
+      stone.x = L.HOUSE.x; stone.y = L.HOUSE.y; stone.vx = 0; stone.vy = 0;
+      stone.state = "sliding"; stone.sliding = true;
+      var before = { score: S.score, combo: S.combo, scored: S.scored, buttons: S.buttons, golden: stone.golden };
+      resolveStop();
+      return { before: before, after: { score: S.score, scored: S.scored, buttons: S.buttons } };
+    },
+    // Put the stone at rest short of the hog line and resolve: exactly
+    // -1 heart, foul counted.
+    debugFoul: function () {
+      if (S.screen !== "playing") return null;
+      if (stone.state === "idle") { S.thrown++; stone.golden = L.isGoldenSpawn(S.thrown); }
+      stone.x = 240; stone.y = 600; stone.vx = 0; stone.vy = 0;
+      stone.state = "sliding"; stone.sliding = true;
+      var before = { hearts: S.hearts, fouls: S.fouls, combo: S.combo, score: S.score };
+      resolveStop();
+      return { before: before, after: { hearts: S.hearts, fouls: S.fouls, combo: S.combo, score: S.score } };
+    },
+    // Put the stone at rest past the hog line but outside the rings:
+    // a miss — combo reset, no heart lost.
+    debugMiss: function () {
+      if (S.screen !== "playing") return null;
+      if (stone.state === "idle") { S.thrown++; stone.golden = L.isGoldenSpawn(S.thrown); }
+      stone.x = 400; stone.y = 300; stone.vx = 0; stone.vy = 0;
+      stone.state = "sliding"; stone.sliding = true;
+      var before = { hearts: S.hearts, misses: S.misses, combo: S.combo, score: S.score };
+      resolveStop();
+      return { before: before, after: { hearts: S.hearts, misses: S.misses, combo: S.combo, score: S.score } };
+    },
+    // Place a bonus star on the stone's path and a slow stone sliding
+    // through it: must collect exactly 50 x combo.
+    debugStar: function () {
+      if (S.screen !== "playing" || stone.state !== "idle") return null;
+      S.thrown++;
+      star = { active: true, x: 240, y: 400, ttl: 30, spin: 0 };
+      stone.x = 240; stone.y = 480; stone.vx = 0; stone.vy = -100;
+      stone.state = "sliding"; stone.sliding = true;
+      stone.golden = false;
+      return { x: 240, y: 400, combo: S.combo, score: S.score, stars: S.stars };
+    },
+    // Launch a stone aimed dead-centre at the house with the exact
+    // calibrated speed (no sweep): used by the phone check to prove a
+    // real throw can score on its own.
+    debugPerfectThrow: function () {
+      if (S.screen !== "playing" || stone.state !== "idle") return null;
+      var dist = L.HACK.y - L.HOUSE.y;
+      var v0 = L.launchForDistance(dist, L.FRICTION);
+      S.thrown++;
+      stone.vx = 0; stone.vy = -v0;
+      stone.state = "sliding"; stone.sliding = true;
+      stone.golden = L.isGoldenSpawn(S.thrown);
+      return { v0: Math.round(v0), golden: stone.golden, combo: S.combo, score: S.score, scored: S.scored };
+    }
+  };
+
+  reset();
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
