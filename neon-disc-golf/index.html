@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Disc Golf — Day 62</title>
+<meta name="description" content="Neon Disc Golf — 60 seconds of neon disc golf chaos. Drag back to aim, release to throw — wind bends every disc. Chains pay 250 x combo, golden discs pay 5x. Water costs a heart.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#070512;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Disc Golf — Day 62. You throw discs for 60 seconds under the neon
+   lights. Drag back from the tee to aim, release to throw the disc at the
+   glowing basket — wind bends every throw, so read the flag. A disc that
+   rattles the CHAINS pays 250, one that drops in the BASKET pays 150, and
+   one that lands within 90px pays a NEAR 50 — all x combo. Chain 4 scoring
+   throws to raise the combo x1->x5. Every 6th disc is GOLDEN (5x). Trees
+   knock a disc dead (combo reset), landing in the pond costs a heart, and
+   bonus stars on the fairway pay 50 x combo when the disc flies through
+   them. Flawless (no hearts lost) +500. Best score persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var DiscGolfLogic = (function () {
+  var W = 480, H = 800;
+  var GAME_TIME = 60, MAX_HEARTS = 3;
+  var HUD_H = 76;
+  var GROUND_Y = 720;
+  var TEE = { x: 70, y: 690 };
+  var GRAVITY = 520;         // px/s^2, pulls the disc down
+  var WIND_K = 45;           // wind accel per unit wind
+  var AIR_DRAG = 0.05;       // exponential velocity decay /s
+  var MAX_LAUNCH = 820;      // px/s, launch speed cap
+  var DRAG_K = 3.4;          // drag px -> launch px/s
+  var MIN_DRAG = 30;         // px, below this a release is not a throw
+  var DISC_R = 12;
+  var CHAINS_R = 26;         // disc within this of basket centre: CHAINS
+  var BASKET_R = 55;         // ...within this: BASKET
+  var NEAR_R = 90;           // landing within this of basket x: NEAR
+  var STAR_R = 30;           // disc collects a star within this distance
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, combo: 1, streak: 0,
+      scored: 0, chains: 0, baskets: 0, nears: 0, misses: 0, trees: 0,
+      splashes: 0, hearts: MAX_HEARTS, timeLeft: GAME_TIME,
+      flawless: false, stars: 0, thrown: 0, hole: 1 };
+  }
+  // combo: +1 every 4 consecutive scoring throws, capped at x5.
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  // Chains catch: the disc is within CHAINS_R of the basket centre.
+  function inChains(d) { return d <= CHAINS_R; }
+  // The tray catches: the disc drops into the tray box under the chains.
+  function inTray(x, y, bx, by) {
+    return Math.abs(x - bx) <= 30 && y >= by + 10 && y <= by + 48;
+  }
+  function zoneBase(zone) { return zone === 0 ? 250 : (zone === 1 ? 150 : 0); }
+  function zoneName(zone) { return zone === 0 ? "CHAINS!" : (zone === 1 ? "BASKET!" : "MISS"); }
+  // Landing pay: within NEAR_R of the basket's x, 50; else 0.
+  function landingBase(dx) { return Math.abs(dx) <= NEAR_R ? 50 : 0; }
+  function scorePoints(base, combo, golden) {
+    return base * combo * (golden ? 5 : 1);
+  }
+  function starPoints(combo) { return 50 * combo; }
+  // 1-based: the 6th, 12th, 18th... disc thrown is GOLDEN.
+  function isGoldenSpawn(n) { return n % 6 === 0; }
+  // Launch velocity from a drag: slingshot — velocity is opposite the
+  // drag vector, scaled, capped at MAX_LAUNCH.
+  function launchVelocity(dragX, dragY) {
+    var vx = -dragX * DRAG_K, vy = -dragY * DRAG_K;
+    var sp = Math.hypot(vx, vy);
+    if (sp > MAX_LAUNCH) { vx *= MAX_LAUNCH / sp; vy *= MAX_LAUNCH / sp; }
+    return { vx: vx, vy: vy, speed: Math.hypot(vx, vy) };
+  }
+  function dragLength(dx, dy) { return Math.hypot(dx, dy); }
+  // A release is a legal throw when the drag is long enough and the
+  // launch heads up (vy negative enough).
+  function isLegalThrow(dragX, dragY) {
+    if (dragLength(dragX, dragY) < MIN_DRAG) return false;
+    var v = launchVelocity(dragX, dragY);
+    return v.vy < -60;
+  }
+  // Wind acceleration for a wind value in [-1, 1].
+  function windAccel(wind) { return wind * WIND_K; }
+  // Flight time for a throw covering dist px: ~300 px/s of travel.
+  function flightTime(dist) { return dist / 300; }
+  // Launch velocity that lands exactly on (tx, ty) after T seconds under
+  // gravity G and horizontal accel ax (the autopilot / perfect-throw
+  // formula: vx = (dx - 0.5*ax*T^2)/T, vy = (dy - 0.5*G*T^2)/T).
+  function flightVelocity(sx, sy, tx, ty, T, ax) {
+    var vx = (tx - sx - 0.5 * ax * T * T) / T;
+    var vy = (ty - sy - 0.5 * GRAVITY * T * T) / T;
+    return { vx: vx, vy: vy };
+  }
+  // A disc hits the pole only below the tray bottom (by+44): above that
+  // the chains/basket zone resolves the throw first.
+  function poleHit(x, y, bx, by) {
+    return Math.abs(x - bx) < 10 && y > by + 44 && y < GROUND_Y;
+  }
+  // A disc at (x, y) hits a tree when it overlaps the trunk rect.
+  function treeHit(x, y, tree) {
+    return Math.abs(x - tree.x) < DISC_R + 7 && y > tree.topY && y < GROUND_Y;
+  }
+  // A landing x is in the pond when it falls inside the pond's span.
+  function pondHit(x, pond) {
+    return !!pond && x >= pond.x0 && x <= pond.x1;
+  }
+  // Hole distance in "metres": 10 world px = 1 m.
+  function holeDistance(bx, by) {
+    return Math.round(Math.hypot(bx - TEE.x, by - TEE.y) / 10);
+  }
+
+  return { W: W, H: H, GAME_TIME: GAME_TIME, MAX_HEARTS: MAX_HEARTS,
+    HUD_H: HUD_H, GROUND_Y: GROUND_Y, TEE: TEE, GRAVITY: GRAVITY,
+    WIND_K: WIND_K, AIR_DRAG: AIR_DRAG, MAX_LAUNCH: MAX_LAUNCH,
+    DRAG_K: DRAG_K, MIN_DRAG: MIN_DRAG, DISC_R: DISC_R,
+    CHAINS_R: CHAINS_R, BASKET_R: BASKET_R, NEAR_R: NEAR_R,
+    STAR_R: STAR_R,
+    clamp: clamp, makeState: makeState,
+    comboForStreak: comboForStreak, inChains: inChains,
+    inTray: inTray, zoneBase: zoneBase, zoneName: zoneName,
+    landingBase: landingBase, scorePoints: scorePoints,
+    starPoints: starPoints, isGoldenSpawn: isGoldenSpawn,
+    launchVelocity: launchVelocity, dragLength: dragLength,
+    isLegalThrow: isLegalThrow, windAccel: windAccel,
+    flightTime: flightTime, flightVelocity: flightVelocity,
+    poleHit: poleHit, treeHit: treeHit, pondHit: pondHit, holeDistance: holeDistance };
+})();
+//LOGIC-END
+
+(function () {
+  var L = DiscGolfLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_disc_golf_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_disc_golf_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, starT = 4, autoT = 0, resetT = 0;
+  var disc = { x: L.TEE.x, y: L.TEE.y, vx: 0, vy: 0, state: "idle", golden: false, spin: 0, treeHit: false };
+  var aim = { active: false, sx: 0, sy: 0, cx: 0, cy: 0 };
+  var hole = { bx: 380, by: 300, wind: 0, trees: [], pond: null };
+  var star = { active: false, x: 0, y: 0, ttl: 0, spin: 0 };
+  var particles = [], floats = [], grassDots = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  var flashRed = 0, flashGold = 0;
+  for (var i = 0; i < 70; i++) {
+    grassDots.push({ x: Math.random() * L.W, y: L.GROUND_Y + Math.random() * (L.H - L.GROUND_Y), s: 0.6 + Math.random() * 1.4, tw: Math.random() * Math.PI * 2 });
+  }
+
+  function newHole() {
+    var bx = 300 + Math.random() * 130;
+    var by = 200 + Math.random() * 270;
+    var wind = Math.round((Math.random() * 2 - 1) * 10) / 10;
+    var trees = [];
+    var nTrees = 1 + (Math.random() < 0.5 ? 1 : 0);
+    for (var i = 0; i < nTrees; i++) {
+      trees.push({ x: 150 + Math.random() * Math.max(40, bx - 220), topY: L.GROUND_Y - (110 + Math.random() * 60) });
+    }
+    var pond = null;
+    if (Math.random() < 0.45) {
+      var w = 80 + Math.random() * 30;
+      var x0 = 140 + Math.random() * Math.max(20, bx - 260);
+      pond = { x0: x0, x1: Math.min(x0 + w, bx - 70) };
+    }
+    hole = { bx: bx, by: by, wind: wind, trees: trees, pond: pond };
+  }
+  function spawnStar() {
+    star = { active: true, x: 150 + Math.random() * 270, y: 200 + Math.random() * 350,
+      ttl: 8, spin: 0 };
+  }
+  function resetDisc() {
+    disc = { x: L.TEE.x, y: L.TEE.y, vx: 0, vy: 0, state: "idle", golden: false, spin: 0, treeHit: false };
+    aim.active = false;
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_disc_golf_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; starT = 4; autoT = 0; resetT = 0;
+    star = { active: false, x: 0, y: 0, ttl: 0, spin: 0 };
+    particles = []; floats = []; flashRed = 0; flashGold = 0;
+    newHole();
+    resetDisc();
+    window.__discGolfState = S;
+  }
+  function start() {
+    reset();
+    S.screen = "playing";
+    tone(660, 0.12, "sine", 0.2, 990);
+  }
+  function endGame(outOfHearts) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (!outOfHearts && S.hearts === L.MAX_HEARTS && S.scored > 0) { S.flawless = true; S.score += 500; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_disc_golf_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__discGolfState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function loseHeart(reason) {
+    S.hearts--;
+    S.streak = 0; S.combo = 1;
+    flashRed = 0.35;
+    tone(160, 0.35, "sawtooth", 0.2, 70);
+    buzz([50, 40, 50]);
+    addFloat(240, 300, reason + "  -1 \u2665", false);
+    window.__discGolfState = S;
+    if (S.hearts <= 0) endGame(true);
+  }
+  function collectStar() {
+    if (!star.active) return false;
+    var pts = L.starPoints(S.combo);
+    S.score += pts; S.stars++;
+    addFloat(star.x, star.y - 20, "+" + pts, false);
+    burst(star.x, star.y, "#ffd94a", 10);
+    tone(1170, 0.12, "sine", 0.16, 1560);
+    star.active = false; star.ttl = 0; starT = 9;
+    window.__discGolfState = S;
+    return true;
+  }
+  // Score a throw: base points x combo (x5 if golden), streak/combo update.
+  function scoreThrow(base, kind) {
+    var pts = L.scorePoints(base, S.combo, disc.golden);
+    S.score += pts;
+    S.streak++;
+    S.scored++;
+    S.combo = L.comboForStreak(S.streak);
+    addFloat(hole.bx, hole.by - 60, kind + " +" + pts, disc.golden);
+    burst(hole.bx, hole.by, disc.golden ? "#ffd94a" : "#35f0ff", kind === "CHAINS!" ? 26 : 14);
+    tone(kind === "CHAINS!" ? 1040 : 880, 0.16, "sine", 0.2, kind === "CHAINS!" ? 1560 : 1170);
+    buzz(kind === "CHAINS!" ? [30, 30, 60] : 25);
+    if (kind === "CHAINS!") { S.chains++; flashGold = 0.4; }
+    else if (kind === "BASKET!") S.baskets++;
+    else S.nears++;
+    window.__discGolfState = S;
+    return pts;
+  }
+  // Resolve a disc that hit the chains or the basket mid-flight.
+  function resolveZone(zone) {
+    disc.state = "done";
+    var base = L.zoneBase(zone);
+    scoreThrow(base, L.zoneName(zone));
+    resetT = 0.9;
+  }
+  // Resolve a disc that landed on the ground.
+  function resolveLanding() {
+    disc.state = "done";
+    if (L.pondHit(disc.x, hole.pond)) {
+      S.splashes++;
+      burst(disc.x, L.GROUND_Y, "#4db8ff", 18);
+      tone(300, 0.3, "sine", 0.18, 90);
+      resetT = 0.9;
+      loseHeart("SPLASH!");
+      return { kind: "water" };
+    }
+    var base = L.landingBase(disc.x - hole.bx);
+    if (base > 0) {
+      scoreThrow(base, "NEAR!");
+    } else {
+      S.misses++;
+      S.streak = 0; S.combo = 1;
+      addFloat(disc.x, disc.y - 30, "MISS", false);
+      tone(200, 0.18, "square", 0.12, 120);
+    }
+    resetT = 0.9;
+    window.__discGolfState = S;
+    return { kind: base > 0 ? "near" : "miss" };
+  }
+  // A tree hit kills the disc's forward motion: it drops straight down.
+  // It may still land NEAR the basket afterwards.
+  function resolveTreeHit() {
+    if (disc.treeHit) return;
+    disc.treeHit = true;
+    disc.vx = 0;
+    disc.vy = Math.max(60, Math.abs(disc.vy) * 0.25);
+    S.trees++;
+    S.streak = 0; S.combo = 1;
+    addFloat(disc.x, disc.y - 26, "TREE!", false);
+    tone(180, 0.2, "square", 0.16, 90);
+    buzz(40);
+    window.__discGolfState = S;
+  }
+  // Launch the disc from the tee with a drag vector (world coords).
+  function throwDisc(dragX, dragY) {
+    if (S.screen !== "playing" || disc.state !== "idle") return false;
+    if (!L.isLegalThrow(dragX, dragY)) return false;
+    var v = L.launchVelocity(dragX, dragY);
+    S.thrown++;
+    disc.vx = v.vx; disc.vy = v.vy;
+    disc.state = "flying"; disc.spin = 0;
+    disc.golden = L.isGoldenSpawn(S.thrown);
+    if (disc.golden) addFloat(240, 300, "GOLDEN DISC!", true);
+    tone(300, 0.1, "sine", 0.12, 500);
+    window.__discGolfState = S;
+    return true;
+  }
+  // Autopilot: solve the flight to the basket centre, with a small
+  // random angle error so it sometimes lands BASKET/NEAR instead of CHAINS.
+  function autopilot(dt) {
+    autoT -= dt;
+    if (autoT > 0) return;
+    autoT = 0.05;
+    if (S.screen !== "playing" || disc.state !== "idle") return;
+    var dist = Math.hypot(hole.bx - L.TEE.x, hole.by - L.TEE.y);
+    var T = L.flightTime(dist);
+    var ax = L.windAccel(hole.wind);
+    var v = L.flightVelocity(L.TEE.x, L.TEE.y, hole.bx, hole.by, T, ax);
+    var err = (Math.random() * 6 - 3) * Math.PI / 180;
+    var sp = Math.hypot(v.vx, v.vy);
+    var ang = Math.atan2(v.vy, v.vx) + err;
+    S.thrown++;
+    disc.vx = Math.cos(ang) * sp * 1.03;
+    disc.vy = Math.sin(ang) * sp * 1.03;
+    disc.state = "flying"; disc.spin = 0;
+    disc.golden = L.isGoldenSpawn(S.thrown);
+    if (disc.golden) addFloat(240, 300, "GOLDEN DISC!", true);
+    window.__discGolfState = S;
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    if (flashRed > 0) flashRed -= dt;
+    if (flashGold > 0) flashGold -= dt;
+    // Disc flight physics, substepped so a fast disc cannot tunnel
+    // through the 26px chains zone.
+    if (disc.state === "flying") {
+      var ax = L.windAccel(hole.wind);
+      var speed = Math.hypot(disc.vx, disc.vy);
+      var steps = Math.max(1, Math.ceil(speed * dt / 6));
+      var sdt = dt / steps;
+      for (var s = 0; s < steps && disc.state === "flying"; s++) {
+        var decay = Math.exp(-L.AIR_DRAG * sdt);
+        disc.vx = disc.vx * decay + ax * sdt;
+        disc.vy = disc.vy * decay + L.GRAVITY * sdt;
+        disc.x += disc.vx * sdt;
+        disc.y += disc.vy * sdt;
+        disc.spin += sdt * 14;
+        // Star pickup mid-flight.
+        if (star.active && Math.hypot(disc.x - star.x, disc.y - star.y) < L.STAR_R + 6) collectStar();
+        // Chains / tray catch. The chains zone is checked first: a disc
+        // aimed at the centre must rattle the chains, not stop at the
+        // outer basket radius (the old 55px catch-all resolved BASKET
+        // the moment a centre-aimed disc entered it, so CHAINS could
+        // never happen).
+        var d = Math.hypot(disc.x - hole.bx, disc.y - hole.by);
+        if (L.inChains(d)) { resolveZone(0); break; }
+        if (L.inTray(disc.x, disc.y, hole.bx, hole.by)) { resolveZone(1); break; }
+        // Pole: a disc flying low through the pole below the tray bounces
+        // off it. Only below the tray bottom (by+44): above that the
+        // chains/basket zone (55px) resolves the throw first.
+        if (L.poleHit(disc.x, disc.y, hole.bx, hole.by)) {
+          disc.vx *= -0.4;
+          disc.x = hole.bx + (disc.x < hole.bx ? -10 : 10);
+          tone(500, 0.08, "square", 0.1, 300);
+        }
+        // Trees.
+        for (var t = 0; t < hole.trees.length; t++) {
+          if (L.treeHit(disc.x, disc.y, hole.trees[t])) { resolveTreeHit(); break; }
+        }
+        // Out of bounds sideways: the disc is lost.
+        if (disc.x < -40 || disc.x > L.W + 40) {
+          disc.state = "done";
+          S.misses++; S.streak = 0; S.combo = 1;
+          addFloat(240, 300, "OUT OF BOUNDS!", false);
+          resetT = 0.9;
+          window.__discGolfState = S;
+          break;
+        }
+        // Ground landing.
+        if (disc.y >= L.GROUND_Y) {
+          disc.y = L.GROUND_Y;
+          resolveLanding();
+          break;
+        }
+      }
+    } else if (disc.state === "done") {
+      if (resetT > 0) {
+        resetT -= dt;
+        if (resetT <= 0 && S.screen === "playing") {
+          S.hole++;
+          newHole();
+          resetDisc();
+        }
+      }
+    }
+    // Bonus star: one slot, respawns ~9s after the last one leaves.
+    if (star.active) {
+      star.ttl -= dt; star.spin += dt * 2;
+      if (star.ttl <= 0) { star.active = false; starT = 9; }
+    } else {
+      starT -= dt;
+      if (starT <= 0) spawnStar();
+    }
+    if (auto) autopilot(dt);
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pp = particles[p];
+      pp.t += dt; pp.x += pp.vx * dt; pp.y += pp.vy * dt; pp.vy += 200 * dt;
+      if (pp.t > 0.6) particles.splice(p, 1);
+    }
+    for (var f = floats.length - 1; f >= 0; f--) {
+      floats[f].t += dt; floats[f].y -= 40 * dt;
+      if (floats[f].t > 1.1) floats.splice(f, 1);
+    }
+  }
+
+  function drawStarShape(x, y, r, rot) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.beginPath();
+    for (var i = 0; i < 10; i++) {
+      var rr = i % 2 === 0 ? r : r * 0.45;
+      var a = -Math.PI / 2 + i * Math.PI / 5;
+      if (i === 0) ctx.moveTo(Math.cos(a) * rr, Math.sin(a) * rr);
+      else ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath();
+    var g = ctx.createRadialGradient(0, 0, r * 0.1, 0, 0, r);
+    g.addColorStop(0, "#ffffff"); g.addColorStop(0.5, "#ffd94a"); g.addColorStop(1, "#ff9d5c");
+    ctx.fillStyle = g; ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 14;
+    ctx.fill();
+    ctx.restore();
+  }
+  function drawDisc(x, y, golden, spin) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(spin * 0.4);
+    var g = ctx.createRadialGradient(-4, -3, 2, 0, 0, 14);
+    g.addColorStop(0, "#ffffff");
+    g.addColorStop(0.55, golden ? "#ffd94a" : "#35f0ff");
+    g.addColorStop(1, golden ? "#b8860b" : "#0a5a8a");
+    ctx.fillStyle = g; ctx.shadowColor = golden ? "#ffd94a" : "#35f0ff"; ctx.shadowBlur = 16;
+    ctx.beginPath(); ctx.ellipse(0, 0, 15, 7, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = golden ? "#fff2b0" : "#9ff3ff"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.ellipse(0, 0, 10, 4, 0, 0, Math.PI * 2); ctx.stroke();
+    if (golden) {
+      ctx.fillStyle = "#ffd94a"; ctx.font = "bold 10px 'Segoe UI',sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("GOLD", 0, -18);
+    }
+    ctx.restore();
+  }
+  function drawBasket() {
+    var bx = hole.bx, by = hole.by;
+    ctx.save();
+    // Pole from the ground up past the chains.
+    ctx.strokeStyle = "#8a94b8"; ctx.lineWidth = 6;
+    ctx.beginPath(); ctx.moveTo(bx, L.GROUND_Y); ctx.lineTo(bx, by - 42); ctx.stroke();
+    // Flag pennant on top.
+    ctx.fillStyle = "#ff5e7a";
+    ctx.beginPath(); ctx.moveTo(bx, by - 42); ctx.lineTo(bx + 26, by - 34); ctx.lineTo(bx, by - 26); ctx.closePath(); ctx.fill();
+    // Chains: lines from the top ring down to the tray.
+    ctx.strokeStyle = "rgba(220,230,255,0.85)"; ctx.lineWidth = 1.5;
+    for (var i = -3; i <= 3; i++) {
+      ctx.beginPath(); ctx.moveTo(bx + i * 7, by - 18); ctx.lineTo(bx + i * 4, by + 20); ctx.stroke();
+    }
+    // Top ring.
+    ctx.strokeStyle = "#ffd94a"; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(bx, by - 18, 24, 0, Math.PI * 2); ctx.stroke();
+    // Tray (catching basket).
+    var tg = ctx.createLinearGradient(bx - 28, by + 20, bx + 28, by + 20);
+    tg.addColorStop(0, "#2b6cb0"); tg.addColorStop(0.5, "#6cf0ff"); tg.addColorStop(1, "#2b6cb0");
+    ctx.fillStyle = tg;
+    ctx.beginPath();
+    ctx.moveTo(bx - 28, by + 20); ctx.lineTo(bx + 28, by + 20);
+    ctx.lineTo(bx + 18, by + 44); ctx.lineTo(bx - 18, by + 44);
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = "#ffd94a"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(bx - 28, by + 20); ctx.lineTo(bx + 28, by + 20); ctx.stroke();
+    // Glow ring marking the chains zone.
+    ctx.strokeStyle = "rgba(255,217,74,0.7)"; ctx.lineWidth = 2;
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath(); ctx.arc(bx, by, L.CHAINS_R, 0, Math.PI * 2); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+  function render() {
+    // Clear the whole canvas first: anything drawn outside the world rect
+    // would otherwise persist in the letterbox bars.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#070512";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    // Night sky.
+    var sky = ctx.createLinearGradient(0, 0, 0, L.H);
+    sky.addColorStop(0, "#0d1030"); sky.addColorStop(0.55, "#131a4d"); sky.addColorStop(0.75, "#0a2036"); sky.addColorStop(1, "#0d2a44");
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, L.W, L.H);
+    // Stars in the sky.
+    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    for (var i = 0; i < 40; i++) {
+      var sx = (i * 97) % 480, sy = (i * 53) % 300;
+      ctx.globalAlpha = 0.2 + 0.3 * Math.abs(Math.sin(i * 1.7 + performance.now() / 1200));
+      ctx.fillRect(sx, sy, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+    // Moon.
+    ctx.fillStyle = "#f4f1d8"; ctx.shadowColor = "#f4f1d8"; ctx.shadowBlur = 24;
+    ctx.beginPath(); ctx.arc(420, 90, 26, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    // Distant hills.
+    ctx.fillStyle = "#0a1a33";
+    ctx.beginPath(); ctx.moveTo(0, L.GROUND_Y); ctx.quadraticCurveTo(140, 640, 300, L.GROUND_Y); ctx.lineTo(480, L.GROUND_Y); ctx.lineTo(480, L.H); ctx.lineTo(0, L.H); ctx.closePath(); ctx.fill();
+    // Fairway ground.
+    var gr = ctx.createLinearGradient(0, L.GROUND_Y, 0, L.H);
+    gr.addColorStop(0, "#123d2a"); gr.addColorStop(1, "#0a2418");
+    ctx.fillStyle = gr; ctx.fillRect(0, L.GROUND_Y, L.W, L.H - L.GROUND_Y);
+    ctx.strokeStyle = "rgba(120,255,170,0.5)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0, L.GROUND_Y); ctx.lineTo(L.W, L.GROUND_Y); ctx.stroke();
+    // Grass sparkle.
+    for (var g = 0; g < grassDots.length; g++) {
+      var gd = grassDots[g];
+      ctx.globalAlpha = 0.15 + 0.25 * Math.abs(Math.sin(gd.tw + performance.now() / 900));
+      ctx.fillStyle = "#7dffb0";
+      ctx.fillRect(gd.x, gd.y, gd.s, gd.s);
+    }
+    ctx.globalAlpha = 1;
+    // Pond.
+    if (hole.pond) {
+      ctx.fillStyle = "#1a6fd4";
+      ctx.fillRect(hole.pond.x0, L.GROUND_Y, hole.pond.x1 - hole.pond.x0, L.H - L.GROUND_Y);
+      ctx.fillStyle = "rgba(255,255,255,0.35)";
+      ctx.fillRect(hole.pond.x0 + 6, L.GROUND_Y + 8, (hole.pond.x1 - hole.pond.x0) - 12, 3);
+      ctx.fillStyle = "#4db8ff"; ctx.font = "bold 11px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("POND", (hole.pond.x0 + hole.pond.x1) / 2, L.GROUND_Y + 34);
+    }
+    // Trees.
+    for (var t = 0; t < hole.trees.length; t++) {
+      var tr = hole.trees[t];
+      ctx.fillStyle = "#5a3a22";
+      ctx.fillRect(tr.x - 7, tr.topY + 40, 14, L.GROUND_Y - tr.topY - 40);
+      var tg2 = ctx.createRadialGradient(tr.x, tr.topY + 20, 4, tr.x, tr.topY + 20, 46);
+      tg2.addColorStop(0, "#2fae5f"); tg2.addColorStop(1, "#0d5c2e");
+      ctx.fillStyle = tg2;
+      ctx.beginPath(); ctx.arc(tr.x, tr.topY + 20, 44, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#2fae5f";
+      ctx.beginPath(); ctx.arc(tr.x - 26, tr.topY + 38, 26, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.arc(tr.x + 26, tr.topY + 38, 26, 0, Math.PI * 2); ctx.fill();
+    }
+    // Tee pad.
+    ctx.fillStyle = "#1d2757";
+    ctx.fillRect(L.TEE.x - 34, L.GROUND_Y - 6, 68, 8);
+    ctx.strokeStyle = "#35f0ff"; ctx.lineWidth = 2;
+    ctx.strokeRect(L.TEE.x - 34, L.GROUND_Y - 6, 68, 8);
+    ctx.fillStyle = "#9ff3ff"; ctx.font = "bold 11px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("TEE", L.TEE.x, L.GROUND_Y - 12);
+    // Basket.
+    drawBasket();
+    // Distance + wind labels near the basket.
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 13px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(L.holeDistance(hole.bx, hole.by) + "m", hole.bx, hole.by - 58);
+    // Bonus star.
+    if (star.active) drawStarShape(star.x, star.y, 18, star.spin);
+    // Aim preview: dotted predicted trajectory from the tee.
+    if (aim.active && disc.state === "idle") {
+      var dx = aim.cx - aim.sx, dy = aim.cy - aim.sy;
+      var v = L.launchVelocity(dx, dy);
+      var len = L.dragLength(dx, dy);
+      if (len >= 8) {
+        var px = L.TEE.x, py = L.TEE.y, pvx = v.vx, pvy = v.vy;
+        var pax = L.windAccel(hole.wind);
+        ctx.fillStyle = v.vy < -60 ? "rgba(53,240,255,0.9)" : "rgba(255,94,122,0.9)";
+        for (var d2 = 0; d2 < 26; d2++) {
+          pvx += pax * 0.06; pvy += L.GRAVITY * 0.06;
+          px += pvx * 0.06; py += pvy * 0.06;
+          if (py >= L.GROUND_Y || px < 0 || px > L.W) break;
+          ctx.globalAlpha = 1 - d2 / 26;
+          ctx.beginPath(); ctx.arc(px, py, 3.5, 0, Math.PI * 2); ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+        // Power bar.
+        var pw = Math.min(1, v.speed / L.MAX_LAUNCH);
+        ctx.fillStyle = "rgba(4,8,24,0.7)";
+        ctx.fillRect(120, 760, 240, 14);
+        ctx.fillStyle = pw > 0.85 ? "#ff5e7a" : (pw > 0.6 ? "#ffd94a" : "#35f0ff");
+        ctx.fillRect(122, 762, 236 * pw, 10);
+        ctx.fillStyle = "#ffffff"; ctx.font = "bold 12px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+        ctx.fillText("POWER " + Math.round(pw * 100) + "%", 240, 752);
+      }
+    }
+    // The disc.
+    if (disc.state !== "done" || resetT > 0.4) {
+      drawDisc(disc.x, disc.y, disc.golden, disc.spin);
+    }
+    // Particles.
+    for (var p = 0; p < particles.length; p++) {
+      var pp = particles[p];
+      ctx.globalAlpha = 1 - pp.t / 0.6;
+      ctx.fillStyle = pp.color;
+      ctx.beginPath(); ctx.arc(pp.x, pp.y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Floating score text.
+    ctx.textAlign = "center";
+    for (var f = 0; f < floats.length; f++) {
+      var fl = floats[f];
+      ctx.globalAlpha = 1 - fl.t / 1.1;
+      ctx.fillStyle = fl.golden ? "#ffd94a" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',sans-serif";
+      ctx.fillText(fl.text, fl.x, fl.y);
+    }
+    ctx.globalAlpha = 1;
+    // Red flash on heart loss / gold flash on chains.
+    if (flashRed > 0) { ctx.fillStyle = "rgba(255,40,70," + (flashRed * 0.6) + ")"; ctx.fillRect(0, 0, L.W, L.H); }
+    if (flashGold > 0) { ctx.fillStyle = "rgba(255,217,74," + (flashGold * 0.35) + ")"; ctx.fillRect(0, 0, L.W, L.H); }
+    drawHUD();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    ctx.restore();
+  }
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.72)";
+    ctx.fillRect(0, 0, L.W, L.HUD_H);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 24px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, 14, 32);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e7a" : "#9ff3ff";
+    ctx.font = "bold 28px 'Segoe UI',sans-serif";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 34);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ff5e7a"; ctx.font = "bold 24px 'Segoe UI',sans-serif";
+    var hearts = "";
+    for (var h = 0; h < L.MAX_HEARTS; h++) hearts += h < S.hearts ? "\u2665" : "\u00B7";
+    ctx.fillText(hearts, L.W - 14, 32);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffd94a"; ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillText("COMBO x" + S.combo + "  ·  HOLE " + S.hole, 14, 60);
+    ctx.textAlign = "right";
+    // Wind: arrow + strength.
+    var wArrow = hole.wind > 0.05 ? "\u2192" : (hole.wind < -0.05 ? "\u2190" : "\u2014");
+    var wMag = Math.abs(hole.wind);
+    var wBars = wMag < 0.34 ? "|" : (wMag < 0.67 ? "||" : "|||");
+    ctx.fillStyle = "#9ff3ff"; ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillText("WIND " + wArrow + " " + wBars, L.W - 14, 60);
+    ctx.restore();
+  }
+  function drawTitle() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.9)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#35f0ff"; ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 22;
+    ctx.font = "bold 52px 'Segoe UI',sans-serif";
+    ctx.fillText("NEON", L.W / 2, 250);
+    ctx.fillStyle = "#7dffb0"; ctx.shadowColor = "#7dffb0";
+    ctx.fillText("DISC GOLF", L.W / 2, 310);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 20px 'Segoe UI',sans-serif";
+    ctx.fillText("60 seconds on the fairway", L.W / 2, 356);
+    ctx.fillStyle = "#9ff3ff"; ctx.font = "17px 'Segoe UI',sans-serif";
+    ctx.fillText("Drag back to aim — release to throw!", L.W / 2, 400);
+    ctx.fillText("Wind bends every disc — read the flag", L.W / 2, 428);
+    ctx.fillText("CHAINS 250 · BASKET 150 · NEAR 50", L.W / 2, 456);
+    ctx.fillStyle = "#ffd94a";
+    ctx.fillText("Golden discs pay 5x · stars pay 50 x combo", L.W / 2, 484);
+    ctx.fillStyle = "#ff8ca0";
+    ctx.fillText("Trees kill your throw — the pond costs a heart", L.W / 2, 512);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 22px 'Segoe UI',sans-serif";
+    ctx.fillText("TAP TO START", L.W / 2, 580);
+    ctx.globalAlpha = 1;
+    ctx.font = "15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 618);
+    drawDisc(L.W / 2, 712, false, 0);
+    ctx.restore();
+  }
+  function drawOver() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,8,24,0.82)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff";
+    ctx.shadowColor = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 44px 'Segoe UI',sans-serif";
+    ctx.fillText(S.hearts <= 0 ? "OUT OF HEARTS!" : "TIME'S UP!", L.W / 2, 250);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, L.W / 2, 320);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "19px 'Segoe UI',sans-serif";
+    ctx.fillText("Chains " + S.chains + "  ·  Baskets " + S.baskets + "  ·  Nears " + S.nears + "  ·  Stars " + S.stars, L.W / 2, 360);
+    if (S.flawless) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 20px 'Segoe UI',sans-serif";
+      ctx.fillText("FLAWLESS +500 — no hearts lost!", L.W / 2, 396);
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("BEST " + S.best, L.W / 2, 440);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 520);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    if (S.screen !== "playing") return;
+    var w = toWorld(e);
+    if (disc.state === "idle") {
+      aim.active = true; aim.sx = w.x; aim.sy = w.y; aim.cx = w.x; aim.cy = w.y;
+    }
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (!aim.active) return;
+    var w = toWorld(e);
+    aim.cx = w.x; aim.cy = w.y;
+    e.preventDefault();
+  }
+  function onUp(e) {
+    if (aim.active) {
+      var dx = aim.cx - aim.sx, dy = aim.cy - aim.sy;
+      aim.active = false;
+      throwDisc(dx, dy);
+    }
+    e.preventDefault();
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  canvas.addEventListener("pointerup", onUp);
+  canvas.addEventListener("pointercancel", onUp);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_disc_golf_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+
+  window.__discGolfState = S;
+  window.__discGolfDebug = {
+    state: function () {
+      return { screen: S.screen, score: S.score, combo: S.combo, streak: S.streak,
+        scored: S.scored, chains: S.chains, baskets: S.baskets, nears: S.nears,
+        misses: S.misses, trees: S.trees, splashes: S.splashes,
+        hearts: S.hearts, timeLeft: Math.round(S.timeLeft * 10) / 10, stars: S.stars,
+        thrown: S.thrown, hole: S.hole, wind: hole.wind, basket: { x: Math.round(hole.bx), y: Math.round(hole.by) },
+        pond: hole.pond ? { x0: Math.round(hole.pond.x0), x1: Math.round(hole.pond.x1) } : null,
+        disc: { x: Math.round(disc.x), y: Math.round(disc.y),
+          vx: Math.round(disc.vx), vy: Math.round(disc.vy),
+          state: disc.state, golden: disc.golden, treeHit: disc.treeHit } };
+    },
+    start: function () { start(); },
+    setAuto: function (v) { auto = v; },
+    // Throw a disc with a given drag vector (world px): returns the
+    // launch the phone check verifies from a REAL drag.
+    throwDrag: function (dx, dy) { return throwDisc(dx, dy); },
+    // Launch a disc aimed dead-centre at the basket with the autopilot
+    // formula (no random error): used by the phone check to prove a real
+    // throw can score on its own.
+    debugPerfectThrow: function () {
+      if (S.screen !== "playing" || disc.state !== "idle") return null;
+      var dist = Math.hypot(hole.bx - L.TEE.x, hole.by - L.TEE.y);
+      var T = L.flightTime(dist);
+      var ax = L.windAccel(hole.wind);
+      var v = L.flightVelocity(L.TEE.x, L.TEE.y, hole.bx, hole.by, T, ax);
+      S.thrown++;
+      disc.vx = v.vx * 1.03; disc.vy = v.vy * 1.03;
+      disc.state = "flying"; disc.spin = 0;
+      disc.golden = L.isGoldenSpawn(S.thrown);
+      return { v0: Math.round(Math.hypot(disc.vx, disc.vy)), golden: disc.golden, combo: S.combo, score: S.score, scored: S.scored, chains: S.chains, baskets: S.baskets };
+    },
+    // Place a flying disc exactly on the basket centre: must score
+    // CHAINS, exactly 250 x combo (x5 if golden).
+    debugChains: function () {
+      if (S.screen !== "playing" || disc.state !== "idle") return null;
+      S.thrown++;
+      disc.x = hole.bx; disc.y = hole.by; disc.vx = 0; disc.vy = 0;
+      disc.state = "flying"; disc.spin = 0;
+      disc.golden = L.isGoldenSpawn(S.thrown);
+      return { score: S.score, combo: S.combo, scored: S.scored, chains: S.chains, golden: disc.golden };
+    },
+    // Place a flying disc 10px from the basket centre inside the tray
+    // box: must score BASKET, exactly 150 x combo (x5 if golden).
+    debugBasket: function () {
+      if (S.screen !== "playing" || disc.state !== "idle") return null;
+      S.thrown++;
+      disc.x = hole.bx + 10; disc.y = hole.by + 30; disc.vx = 0; disc.vy = 0;
+      disc.state = "flying"; disc.spin = 0;
+      disc.golden = L.isGoldenSpawn(S.thrown);
+      return { score: S.score, combo: S.combo, scored: S.scored, baskets: S.baskets, golden: disc.golden };
+    },
+    // Place a disc 50px from the basket's x, falling to the ground:
+    // must score NEAR, exactly 50 x combo.
+    debugNear: function () {
+      if (S.screen !== "playing" || disc.state !== "idle") return null;
+      S.thrown++;
+      disc.x = hole.bx + 50; disc.y = L.GROUND_Y - 60; disc.vx = 0; disc.vy = 200;
+      disc.state = "flying"; disc.spin = 0;
+      disc.golden = L.isGoldenSpawn(S.thrown);
+      return { score: S.score, combo: S.combo, scored: S.scored, nears: S.nears, golden: disc.golden };
+    },
+    // Drop a disc into the pond (creating one under it if this hole has
+    // none): exactly -1 heart, splash counted.
+    debugWater: function () {
+      if (S.screen !== "playing" || disc.state !== "idle") return null;
+      if (!hole.pond) hole.pond = { x0: 180, x1: 280 };
+      var px = (hole.pond.x0 + hole.pond.x1) / 2;
+      S.thrown++;
+      disc.x = px; disc.y = L.GROUND_Y - 60; disc.vx = 0; disc.vy = 200;
+      disc.state = "flying"; disc.spin = 0;
+      disc.golden = false;
+      return { hearts: S.hearts, splashes: S.splashes, combo: S.combo, score: S.score, pond: { x0: hole.pond.x0, x1: hole.pond.x1 } };
+    },
+    // Fly a disc into the first tree: combo reset, trees counted, no
+    // heart lost. The pond is cleared for this check so the dropped disc
+    // lands on grass, not in the water.
+    debugTree: function () {
+      if (S.screen !== "playing" || disc.state !== "idle") return null;
+      if (!hole.trees.length) hole.trees.push({ x: 240, topY: 560 });
+      hole.pond = null;
+      var tr = hole.trees[0];
+      S.thrown++;
+      disc.x = tr.x - 40; disc.y = tr.topY + 80; disc.vx = 300; disc.vy = 0;
+      disc.state = "flying"; disc.spin = 0;
+      disc.golden = false;
+      return { hearts: S.hearts, trees: S.trees, combo: S.combo, score: S.score, tree: { x: tr.x, topY: tr.topY } };
+    },
+    // Place a bonus star on the disc's flight path and a disc flying
+    // through it: must collect exactly 50 x combo.
+    debugStar: function () {
+      if (S.screen !== "playing" || disc.state !== "idle") return null;
+      S.thrown++;
+      star = { active: true, x: 240, y: 400, ttl: 30, spin: 0 };
+      disc.x = 240; disc.y = 500; disc.vx = 0; disc.vy = -300;
+      disc.state = "flying"; disc.spin = 0;
+      disc.golden = false;
+      return { x: 240, y: 400, combo: S.combo, score: S.score, stars: S.stars };
+    }
+  };
+
+  reset();
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
