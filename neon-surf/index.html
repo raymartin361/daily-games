@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Neon Surf — Day 63</title>
+<meta name="description" content="Neon Surf — 60 seconds of neon surfing chaos. Drag to carve the wave, grab stars, ride golden rings, dodge the rocks. Stars pay 100 x combo, rings pay 250, golden stars pay 5x. Wipeouts cost a heart.">
+<script data-goatcounter="https://raymartin.goatcounter.com/count" async src="//gc.zgo.at/count.js"></script>
+<style>
+html,body{overflow:hidden;position:fixed;width:100%;overscroll-behavior:none}
+html,body{height:100%;margin:0;padding:0;background:#040a1e;touch-action:none;-webkit-user-select:none;user-select:none;font-family:'Segoe UI',system-ui,sans-serif}
+#c{position:fixed;inset:0;display:block;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* Neon Surf — Day 63. You ride a neon wave for 60 seconds. Drag (or
+   arrow keys) to carve left and right, grab glowing stars for 100 x combo,
+   ride through golden ring gates for 250 x combo, dodge the rocks and
+   buoys. Chain 4 pickups to raise the combo x1->x5. Every 6th star is
+   GOLDEN (5x) and every 3rd ring is GOLDEN (5x). A wipeout costs a heart
+   and resets your combo. Flawless (no hearts lost) +500. Best score
+   persisted. */
+if (typeof document !== "undefined") {
+  document.addEventListener("touchmove", function (e) { e.preventDefault(); }, { passive: false });
+}
+
+//LOGIC-START
+var SurfLogic = (function () {
+  var W = 480, H = 800;
+  var GAME_TIME = 60, MAX_HEARTS = 3;
+  var HUD_H = 76;
+  var SURFER_Y = 560, SURFER_R = 16, STEER_SPEED = 560;
+  var STAR_R = 16, STAR_POINTS = 100, RING_POINTS = 250;
+  var FLAWLESS_BONUS = 500;
+  var RING_GAP = 130, POST_R = 14;
+
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function makeState() {
+    return { screen: "title", score: 0, best: 0, combo: 1, streak: 0,
+      scored: 0, stars: 0, rings: 0, goldenStars: 0, goldenRings: 0,
+      wipeouts: 0, hearts: MAX_HEARTS, timeLeft: GAME_TIME,
+      flawless: false, starSpawns: 0, ringSpawns: 0 };
+  }
+  // combo: +1 every 4 consecutive pickups, capped at x5.
+  function comboForStreak(streak) {
+    var c = 1 + Math.floor(streak / 4);
+    return c > 5 ? 5 : c;
+  }
+  function scorePoints(base, combo, golden) {
+    return base * combo * (golden ? 5 : 1);
+  }
+  function starPoints(combo) { return STAR_POINTS * combo; }
+  function ringPoints(combo) { return RING_POINTS * combo; }
+  // 1-based: the 6th, 12th, 18th... star spawned is GOLDEN.
+  function isGoldenStar(n) { return n % 6 === 0; }
+  // 1-based: the 3rd, 6th, 9th... ring spawned is GOLDEN.
+  function isGoldenRing(n) { return n % 3 === 0; }
+  // Circle overlap (strict): two circles touch when centre distance is
+  // less than the sum of their radii.
+  function circleHit(ax, ay, ar, bx, by, br) {
+    var dx = ax - bx, dy = ay - by, rr = ar + br;
+    return dx * dx + dy * dy < rr * rr;
+  }
+  // A ring is ridden when the surfer is inside the gap (with a
+  // surfer-radius margin) as the gate crosses the surfer's line.
+  function ringPass(surferX, ring) {
+    return Math.abs(surferX - ring.x) <= ring.gapW / 2 - SURFER_R;
+  }
+  // The wave rushes faster as the minute goes on: 200 -> 420 px/s.
+  function scrollSpeed(elapsed) {
+    return 200 + 220 * Math.min(1, elapsed / GAME_TIME);
+  }
+  // Obstacles spawn faster as the minute goes on: 1.15s -> 0.6s.
+  function obstacleInterval(elapsed) {
+    return Math.max(0.6, 1.15 - elapsed * 0.007);
+  }
+  // Steering: move x toward target at STEER_SPEED, never past it.
+  function steerStep(x, target, dt) {
+    var d = target - x, maxStep = STEER_SPEED * dt;
+    if (Math.abs(d) <= maxStep) return target;
+    return x + (d > 0 ? maxStep : -maxStep);
+  }
+
+  return { W: W, H: H, GAME_TIME: GAME_TIME, MAX_HEARTS: MAX_HEARTS,
+    HUD_H: HUD_H, SURFER_Y: SURFER_Y, SURFER_R: SURFER_R,
+    STEER_SPEED: STEER_SPEED, STAR_R: STAR_R, STAR_POINTS: STAR_POINTS,
+    RING_POINTS: RING_POINTS, FLAWLESS_BONUS: FLAWLESS_BONUS,
+    RING_GAP: RING_GAP, POST_R: POST_R,
+    clamp: clamp, makeState: makeState,
+    comboForStreak: comboForStreak, scorePoints: scorePoints,
+    starPoints: starPoints, ringPoints: ringPoints,
+    isGoldenStar: isGoldenStar, isGoldenRing: isGoldenRing,
+    circleHit: circleHit, ringPass: ringPass,
+    scrollSpeed: scrollSpeed, obstacleInterval: obstacleInterval,
+    steerStep: steerStep };
+})();
+//LOGIC-END
+
+(function () {
+  var L = SurfLogic;
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var vw = 0, vh = 0, dpr = 1, scale = 1, ox = 0, oy = 0;
+  function resize() {
+    vw = window.innerWidth; vh = window.innerHeight;
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    canvas.width = vw * dpr; canvas.height = vh * dpr;
+    canvas.style.width = vw + "px"; canvas.style.height = vh + "px";
+    scale = Math.min(vw / L.W, vh / L.H);
+    ox = (vw - L.W * scale) / 2; oy = (vh - L.H * scale) / 2;
+  }
+  window.addEventListener("resize", resize);
+  window.addEventListener("orientationchange", resize);
+  resize();
+
+  var AC = null, muted = false;
+  try { muted = localStorage.getItem("neon_surf_mute") === "1"; } catch (e) {}
+  function ac() {
+    if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+    if (AC && AC.state === "suspended") AC.resume();
+    return AC;
+  }
+  function tone(freq, dur, type, vol, slideTo) {
+    if (muted) return;
+    var a = ac(); if (!a) return;
+    var o = a.createOscillator(), g = a.createGain();
+    o.type = type || "sine"; o.frequency.setValueAtTime(freq, a.currentTime);
+    if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
+    g.gain.setValueAtTime(vol || 0.15, a.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + dur);
+    o.connect(g); g.connect(a.destination); o.start(); o.stop(a.currentTime + dur);
+  }
+  function buzz(p) { try { if (navigator.vibrate && !muted) navigator.vibrate(p); } catch (e) {} }
+
+  var S = L.makeState();
+  try { S.best = parseInt(localStorage.getItem("neon_surf_best") || "0", 10) || 0; } catch (e) {}
+  var elapsed = 0, obstacleT = 1.2, starT = 1.0, ringT = 6.0, safeT = 0, invuln = 0;
+  var surfer = { x: 240, targetX: 240 };
+  var obstacles = [], stars = [], rings = [];
+  var particles = [], floats = [], foam = [];
+  var auto = (location.search.indexOf("auto=1") !== -1);
+  var flashRed = 0, flashGold = 0, scrollOff = 0;
+  var keys = { left: false, right: false };
+  for (var i = 0; i < 40; i++) {
+    foam.push({ x: Math.random() * L.W, y: Math.random() * L.H, s: 1 + Math.random() * 2.5, ph: Math.random() * Math.PI * 2 });
+  }
+
+  function spawnObstacle() {
+    var kind = Math.random() < 0.55 ? "rock" : "buoy";
+    var x = 30 + Math.random() * (L.W - 60);
+    // Don't wall the wave: keep a horizontal gap from any obstacle
+    // still near the top, so there is always a lane through.
+    for (var i = 0; i < obstacles.length; i++) {
+      var ob = obstacles[i];
+      if (ob.y < 150 && Math.abs(x - ob.x) < 110) {
+        x += 150;
+        if (x > L.W - 30) x -= 300;
+        break;
+      }
+    }
+    var r = kind === "rock" ? 20 + Math.random() * 10 : 16;
+    obstacles.push({ kind: kind, x: x, y: -40, r: r, wob: Math.random() * Math.PI * 2, wobK: 0.6 + Math.random() * 0.8 });
+  }
+  function spawnStar() {
+    S.starSpawns++;
+    var golden = L.isGoldenStar(S.starSpawns);
+    stars.push({ x: 40 + Math.random() * (L.W - 80), y: -30, golden: golden, spin: 0 });
+  }
+  function spawnRing() {
+    S.ringSpawns++;
+    var golden = L.isGoldenRing(S.ringSpawns);
+    var x = 90 + Math.random() * (L.W - 180);
+    rings.push({ x: x, y: -50, gapW: L.RING_GAP, golden: golden, scored: false });
+  }
+  function reset() {
+    S = L.makeState();
+    try { S.best = parseInt(localStorage.getItem("neon_surf_best") || "0", 10) || 0; } catch (e) {}
+    elapsed = 0; obstacleT = 1.2; starT = 1.0; ringT = 6.0; safeT = 0; invuln = 0;
+    surfer = { x: 240, targetX: 240 };
+    obstacles = []; stars = []; rings = [];
+    particles = []; floats = []; flashRed = 0; flashGold = 0; scrollOff = 0;
+    window.__surfState = S;
+  }
+  function start() {
+    reset();
+    S.screen = "playing";
+    tone(660, 0.12, "sine", 0.2, 990);
+  }
+  function endGame(outOfHearts) {
+    if (S.screen !== "playing") return;
+    S.screen = "over";
+    if (!outOfHearts && S.hearts === L.MAX_HEARTS && S.scored > 0) { S.flawless = true; S.score += L.FLAWLESS_BONUS; }
+    if (S.score > S.best) { S.best = S.score; try { localStorage.setItem("neon_surf_best", String(S.best)); } catch (e) {} }
+    tone(220, 0.4, "sawtooth", 0.15, 110);
+    tone(880, 0.3, "sine", 0.12, 660);
+    window.__surfState = S;
+  }
+  function addFloat(x, y, text, golden) {
+    floats.push({ x: x, y: y, text: text, t: 0, golden: !!golden });
+  }
+  function burst(x, y, color, n) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2, sp = 60 + Math.random() * 180;
+      particles.push({ x: x, y: y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 0, color: color });
+    }
+  }
+  function wipeout(reason) {
+    if (invuln > 0) return;
+    S.hearts--;
+    S.wipeouts++;
+    S.streak = 0; S.combo = 1;
+    invuln = 1.2;
+    flashRed = 0.35;
+    tone(160, 0.35, "sawtooth", 0.2, 70);
+    buzz([50, 40, 50]);
+    addFloat(surfer.x, L.SURFER_Y - 40, reason + "  -1 \u2665", false);
+    burst(surfer.x, L.SURFER_Y, "#ff5e7a", 16);
+    window.__surfState = S;
+    if (S.hearts <= 0) endGame(true);
+  }
+  function collectStar(st) {
+    var pts = L.scorePoints(L.STAR_POINTS, S.combo, st.golden);
+    S.score += pts;
+    S.stars++; S.scored++;
+    if (st.golden) S.goldenStars++;
+    S.streak++;
+    S.combo = L.comboForStreak(S.streak);
+    addFloat(st.x, st.y - 20, (st.golden ? "GOLD STAR +" : "+") + pts, st.golden);
+    burst(st.x, st.y, st.golden ? "#ffd94a" : "#35f0ff", st.golden ? 22 : 10);
+    tone(st.golden ? 1170 : 880, 0.14, "sine", 0.18, st.golden ? 1760 : 1170);
+    buzz(st.golden ? [30, 30, 60] : 20);
+    if (st.golden) flashGold = 0.35;
+    window.__surfState = S;
+  }
+  function scoreRing(rg) {
+    var pts = L.scorePoints(L.RING_POINTS, S.combo, rg.golden);
+    S.score += pts;
+    S.rings++; S.scored++;
+    if (rg.golden) S.goldenRings++;
+    S.streak++;
+    S.combo = L.comboForStreak(S.streak);
+    addFloat(rg.x, L.SURFER_Y - 50, (rg.golden ? "GOLD RING +" : "RING +") + pts, rg.golden);
+    burst(surfer.x, L.SURFER_Y, rg.golden ? "#ffd94a" : "#7dffb0", rg.golden ? 26 : 14);
+    tone(rg.golden ? 1040 : 920, 0.18, "sine", 0.2, rg.golden ? 1560 : 1240);
+    buzz(rg.golden ? [30, 30, 60] : 30);
+    if (rg.golden) flashGold = 0.4;
+    window.__surfState = S;
+  }
+  // Autopilot: pick the best lane by scoring candidate x positions —
+  // stars and open ring gaps pull, rocks and buoys ahead push away, and
+  // staying near the current x is preferred so the surfer doesn't
+  // zig-zag. (The first version chased the farthest star and dodged only
+  // 170px ahead, and died in ~11s; this lane scorer survives the minute.)
+  function autopilot(dt) {
+    if (S.screen !== "playing") return;
+    var bestX = surfer.x, bestScore = -1e9, lx, i;
+    for (lx = 24; lx <= L.W - 24; lx += 24) {
+      var score = -Math.abs(lx - surfer.x) * 0.4;
+      for (i = 0; i < stars.length; i++) {
+        var st = stars[i];
+        if (st.y < L.SURFER_Y && st.y > L.SURFER_Y - 340) score += 120 - Math.abs(lx - st.x) * 0.5;
+      }
+      for (i = 0; i < rings.length; i++) {
+        var rg = rings[i];
+        if (!rg.scored && rg.y < L.SURFER_Y && rg.y > L.SURFER_Y - 340) score += 150 - Math.abs(lx - rg.x) * 0.5;
+      }
+      for (i = 0; i < obstacles.length; i++) {
+        var ob = obstacles[i];
+        var gap = L.SURFER_Y - ob.y;
+        if (ob.y < L.SURFER_Y && gap < 320) {
+          var prox = 1 - Math.abs(lx - ob.x) / 90;
+          // Closer rocks matter more: weight by how soon they arrive.
+          if (prox > 0) score -= 500 * prox * (1 - gap / 400);
+        }
+      }
+      // Ring gate posts are hazards too: don't chase a star into one.
+      for (i = 0; i < rings.length; i++) {
+        var rg2 = rings[i];
+        var rgap = L.SURFER_Y - rg2.y;
+        if (rg2.y < L.SURFER_Y && rgap < 320) {
+          var pprox = 1 - Math.abs(lx - (rg2.x - rg2.gapW / 2)) / 70;
+          if (pprox > 0) score -= 500 * pprox * (1 - rgap / 400);
+          var pprox2 = 1 - Math.abs(lx - (rg2.x + rg2.gapW / 2)) / 70;
+          if (pprox2 > 0) score -= 500 * pprox2 * (1 - rgap / 400);
+        }
+      }
+      if (score > bestScore) { bestScore = score; bestX = lx; }
+    }
+    surfer.targetX = bestX;
+  }
+
+  function update(dt) {
+    if (S.screen !== "playing") return;
+    elapsed += dt;
+    S.timeLeft = Math.max(0, L.GAME_TIME - elapsed);
+    if (S.timeLeft <= 0) { endGame(false); return; }
+    if (flashRed > 0) flashRed -= dt;
+    if (flashGold > 0) flashGold -= dt;
+    if (invuln > 0) invuln -= dt;
+    if (safeT > 0) safeT -= dt;
+    var speed = L.scrollSpeed(elapsed);
+    scrollOff += speed * dt;
+    // Steering: keys move the target, pointer sets it directly.
+    if (keys.left) surfer.targetX = L.clamp(surfer.targetX - 420 * dt, 24, L.W - 24);
+    if (keys.right) surfer.targetX = L.clamp(surfer.targetX + 420 * dt, 24, L.W - 24);
+    surfer.x = L.steerStep(surfer.x, surfer.targetX, dt);
+    surfer.x = L.clamp(surfer.x, 24, L.W - 24);
+    // Spawning (paused during a debug safe window).
+    if (safeT <= 0) {
+      obstacleT -= dt;
+      if (obstacleT <= 0) { spawnObstacle(); obstacleT = L.obstacleInterval(elapsed); }
+      starT -= dt;
+      if (starT <= 0) { spawnStar(); starT = 1.5 + Math.random() * 0.7; }
+      ringT -= dt;
+      if (ringT <= 0) { spawnRing(); ringT = 9 + Math.random() * 2; }
+    }
+    // Move everything down the wave.
+    var i, ob, st, rg;
+    for (i = obstacles.length - 1; i >= 0; i--) {
+      ob = obstacles[i];
+      ob.y += speed * dt;
+      ob.wob += dt * 2;
+      if (ob.y > L.H + 60) obstacles.splice(i, 1);
+    }
+    for (i = stars.length - 1; i >= 0; i--) {
+      st = stars[i];
+      st.y += speed * dt; st.spin += dt * 2;
+      if (st.y > L.H + 40) stars.splice(i, 1);
+    }
+    for (i = rings.length - 1; i >= 0; i--) {
+      rg = rings[i];
+      var prevY = rg.y;
+      rg.y += speed * dt;
+      if (!rg.scored && prevY < L.SURFER_Y && rg.y >= L.SURFER_Y) {
+        rg.scored = true;
+        if (L.ringPass(surfer.x, rg)) scoreRing(rg);
+      }
+      if (rg.y > L.H + 60) rings.splice(i, 1);
+    }
+    // Collisions.
+    if (invuln <= 0) {
+      for (i = obstacles.length - 1; i >= 0; i--) {
+        ob = obstacles[i];
+        var obx = ob.x + Math.sin(ob.wob) * (ob.kind === "buoy" ? 14 : 0);
+        if (L.circleHit(surfer.x, L.SURFER_Y, L.SURFER_R, obx, ob.y, ob.r)) {
+          wipeout(ob.kind === "rock" ? "ROCK!" : "BUOY!");
+          break;
+        }
+      }
+      if (invuln <= 0) {
+        for (i = rings.length - 1; i >= 0; i--) {
+          rg = rings[i];
+          if (L.circleHit(surfer.x, L.SURFER_Y, L.SURFER_R, rg.x - rg.gapW / 2, rg.y, L.POST_R) ||
+              L.circleHit(surfer.x, L.SURFER_Y, L.SURFER_R, rg.x + rg.gapW / 2, rg.y, L.POST_R)) {
+            wipeout("GATE POST!");
+            break;
+          }
+        }
+      }
+    }
+    for (i = stars.length - 1; i >= 0; i--) {
+      st = stars[i];
+      if (L.circleHit(surfer.x, L.SURFER_Y, L.SURFER_R, st.x, st.y, L.STAR_R)) {
+        collectStar(st);
+        stars.splice(i, 1);
+      }
+    }
+    if (auto) autopilot(dt);
+    for (var p = particles.length - 1; p >= 0; p--) {
+      var pp = particles[p];
+      pp.t += dt; pp.x += pp.vx * dt; pp.y += pp.vy * dt; pp.vy += 200 * dt;
+      if (pp.t > 0.6) particles.splice(p, 1);
+    }
+    for (var f = floats.length - 1; f >= 0; f--) {
+      floats[f].t += dt; floats[f].y -= 40 * dt;
+      if (floats[f].t > 1.1) floats.splice(f, 1);
+    }
+  }
+
+  function drawStarShape(x, y, r, rot, golden) {
+    ctx.save();
+    ctx.translate(x, y); ctx.rotate(rot);
+    ctx.beginPath();
+    for (var i = 0; i < 10; i++) {
+      var rr = i % 2 === 0 ? r : r * 0.45;
+      var a = -Math.PI / 2 + i * Math.PI / 5;
+      if (i === 0) ctx.moveTo(Math.cos(a) * rr, Math.sin(a) * rr);
+      else ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr);
+    }
+    ctx.closePath();
+    // Gradient created AFTER the translate: gradients sample through the
+    // fill-time CTM, so creating one before the transform paints it white.
+    var g = ctx.createRadialGradient(0, 0, r * 0.1, 0, 0, r);
+    if (golden) { g.addColorStop(0, "#ffffff"); g.addColorStop(0.5, "#ffd94a"); g.addColorStop(1, "#ff9d5c"); }
+    else { g.addColorStop(0, "#ffffff"); g.addColorStop(0.5, "#35f0ff"); g.addColorStop(1, "#0a5a8a"); }
+    ctx.fillStyle = g; ctx.shadowColor = golden ? "#ffd94a" : "#35f0ff"; ctx.shadowBlur = 14;
+    ctx.fill();
+    ctx.restore();
+  }
+  function drawSurfer() {
+    ctx.save();
+    ctx.translate(surfer.x, L.SURFER_Y);
+    if (invuln > 0 && Math.floor(performance.now() / 120) % 2 === 0) ctx.globalAlpha = 0.35;
+    // Board: glowing surfboard, angled with the carve.
+    var lean = L.clamp((surfer.targetX - surfer.x) / 120, -0.35, 0.35);
+    ctx.rotate(lean);
+    var bg = ctx.createLinearGradient(-26, 0, 26, 0);
+    bg.addColorStop(0, "#ff8cd1"); bg.addColorStop(0.5, "#35f0ff"); bg.addColorStop(1, "#7dffb0");
+    ctx.fillStyle = bg; ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.beginPath(); ctx.ellipse(0, 8, 26, 7, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    // Wake trail.
+    ctx.strokeStyle = "rgba(255,255,255,0.5)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(-14, 14); ctx.lineTo(-30, 34); ctx.moveTo(14, 14); ctx.lineTo(30, 34); ctx.stroke();
+    // Surfer: simple neon figure standing on the board.
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 5; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(0, 6); ctx.lineTo(-2, -14); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-2, -8); ctx.lineTo(-14, -2); ctx.moveTo(-2, -8); ctx.lineTo(12, -16); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, 6); ctx.lineTo(-10, 2); ctx.moveTo(0, 6); ctx.lineTo(10, 4); ctx.stroke();
+    var hg = ctx.createRadialGradient(-3, -24, 1, 0, -20, 8);
+    hg.addColorStop(0, "#ffffff"); hg.addColorStop(1, "#ffd94a");
+    ctx.fillStyle = hg;
+    ctx.beginPath(); ctx.arc(0, -20, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+  function drawRock(ob) {
+    var x = ob.x + Math.sin(ob.wob) * (ob.kind === "buoy" ? 14 : 0);
+    ctx.save();
+    ctx.translate(x, ob.y);
+    if (ob.kind === "rock") {
+      var g = ctx.createRadialGradient(-ob.r * 0.3, -ob.r * 0.3, 2, 0, 0, ob.r);
+      g.addColorStop(0, "#8a94b8"); g.addColorStop(0.6, "#4a5170"); g.addColorStop(1, "#232842");
+      ctx.fillStyle = g; ctx.shadowColor = "#8a94b8"; ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.moveTo(-ob.r, ob.r * 0.4);
+      ctx.lineTo(-ob.r * 0.5, -ob.r * 0.8);
+      ctx.lineTo(0, -ob.r);
+      ctx.lineTo(ob.r * 0.6, -ob.r * 0.6);
+      ctx.lineTo(ob.r, ob.r * 0.3);
+      ctx.lineTo(ob.r * 0.4, ob.r * 0.8);
+      ctx.lineTo(-ob.r * 0.4, ob.r * 0.9);
+      ctx.closePath(); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "rgba(255,255,255,0.35)"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(-ob.r * 0.4, -ob.r * 0.4); ctx.lineTo(ob.r * 0.3, -ob.r * 0.1); ctx.stroke();
+    } else {
+      // Buoy: red/white striped cone on a base.
+      ctx.fillStyle = "#ff5e7a"; ctx.shadowColor = "#ff5e7a"; ctx.shadowBlur = 12;
+      ctx.beginPath(); ctx.arc(0, 0, ob.r, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath(); ctx.arc(0, 0, ob.r * 0.55, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#ff5e7a";
+      ctx.beginPath(); ctx.arc(0, 0, ob.r * 0.25, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(0, 0, ob.r, 0, Math.PI * 2); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  function drawRing(rg) {
+    ctx.save();
+    // Golden band across the gap.
+    ctx.strokeStyle = rg.golden ? "rgba(255,217,74,0.9)" : "rgba(125,255,176,0.85)";
+    ctx.lineWidth = 4; ctx.shadowColor = rg.golden ? "#ffd94a" : "#7dffb0"; ctx.shadowBlur = 12;
+    ctx.setLineDash([10, 8]);
+    ctx.beginPath(); ctx.moveTo(rg.x - rg.gapW / 2, rg.y); ctx.lineTo(rg.x + rg.gapW / 2, rg.y); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.shadowBlur = 0;
+    // Gate posts: glowing buoys.
+    var i, px;
+    for (i = 0; i < 2; i++) {
+      px = i === 0 ? rg.x - rg.gapW / 2 : rg.x + rg.gapW / 2;
+      var pg = ctx.createRadialGradient(px - 4, rg.y - 4, 2, px, rg.y, L.POST_R + 4);
+      pg.addColorStop(0, "#ffffff");
+      pg.addColorStop(0.5, rg.golden ? "#ffd94a" : "#7dffb0");
+      pg.addColorStop(1, rg.golden ? "#b8860b" : "#0d5c2e");
+      ctx.fillStyle = pg; ctx.shadowColor = rg.golden ? "#ffd94a" : "#7dffb0"; ctx.shadowBlur = 14;
+      ctx.beginPath(); ctx.arc(px, rg.y, L.POST_R, 0, Math.PI * 2); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+    ctx.fillStyle = rg.golden ? "#ffd94a" : "#7dffb0";
+    ctx.font = "bold 13px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(rg.golden ? "GOLD RING x5" : "RING 250", rg.x, rg.y - 22);
+    ctx.restore();
+  }
+  function render() {
+    // Clear the whole canvas first: anything drawn outside the world rect
+    // would otherwise persist in the letterbox bars.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#040a1e";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
+    ctx.save();
+    ctx.beginPath(); ctx.rect(0, 0, L.W, L.H); ctx.clip();
+    // Ocean: deep blue sky-to-sea gradient.
+    var sea = ctx.createLinearGradient(0, 0, 0, L.H);
+    sea.addColorStop(0, "#0a1a4d"); sea.addColorStop(0.45, "#0d2a6b"); sea.addColorStop(0.75, "#0a4a6b"); sea.addColorStop(1, "#063a52");
+    ctx.fillStyle = sea; ctx.fillRect(0, 0, L.W, L.H);
+    // Sun glow on the horizon.
+    var sg = ctx.createRadialGradient(240, 120, 4, 240, 120, 130);
+    sg.addColorStop(0, "rgba(255,217,74,0.55)"); sg.addColorStop(1, "rgba(255,217,74,0)");
+    ctx.fillStyle = sg; ctx.fillRect(80, 0, 320, 260);
+    ctx.fillStyle = "#ffe9a8"; ctx.shadowColor = "#ffd94a"; ctx.shadowBlur = 26;
+    ctx.beginPath(); ctx.arc(240, 120, 24, 0, Math.PI * 2); ctx.fill();
+    ctx.shadowBlur = 0;
+    // Rolling wave lines, scrolling with the wave.
+    ctx.strokeStyle = "rgba(108,240,255,0.28)"; ctx.lineWidth = 3;
+    for (var w = 0; w < 7; w++) {
+      var wy = ((w * 130 + scrollOff * 0.9) % 910) - 60;
+      ctx.beginPath();
+      for (var wx = 0; wx <= L.W; wx += 16) {
+        var yy = wy + Math.sin(wx / 70 + w * 1.3 + scrollOff / 90) * 10;
+        if (wx === 0) ctx.moveTo(wx, yy); else ctx.lineTo(wx, yy);
+      }
+      ctx.stroke();
+    }
+    // Foam sparkles drifting down.
+    for (var f = 0; f < foam.length; f++) {
+      var fd = foam[f];
+      var fy = (fd.y + scrollOff * 1.1) % L.H;
+      ctx.globalAlpha = 0.2 + 0.3 * Math.abs(Math.sin(fd.ph + scrollOff / 120));
+      ctx.fillStyle = "#bff6ff";
+      ctx.fillRect(fd.x, fy, fd.s, fd.s);
+    }
+    ctx.globalAlpha = 1;
+    // Rings, then stars, then obstacles, then the surfer.
+    for (var r = 0; r < rings.length; r++) drawRing(rings[r]);
+    for (var s = 0; s < stars.length; s++) {
+      drawStarShape(stars[s].x, stars[s].y, stars[s].golden ? 20 : 16, stars[s].spin, stars[s].golden);
+      if (stars[s].golden) {
+        ctx.fillStyle = "#ffd94a"; ctx.font = "bold 10px 'Segoe UI',sans-serif"; ctx.textAlign = "center";
+        ctx.fillText("GOLD", stars[s].x, stars[s].y - 26);
+      }
+    }
+    for (var o = 0; o < obstacles.length; o++) drawRock(obstacles[o]);
+    drawSurfer();
+    // Particles.
+    for (var p = 0; p < particles.length; p++) {
+      var pp = particles[p];
+      ctx.globalAlpha = 1 - pp.t / 0.6;
+      ctx.fillStyle = pp.color;
+      ctx.beginPath(); ctx.arc(pp.x, pp.y, 4, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    // Floating score text.
+    ctx.textAlign = "center";
+    for (var fl2 = 0; fl2 < floats.length; fl2++) {
+      var fl = floats[fl2];
+      ctx.globalAlpha = 1 - fl.t / 1.1;
+      ctx.fillStyle = fl.golden ? "#ffd94a" : "#ffffff";
+      ctx.font = "bold 22px 'Segoe UI',sans-serif";
+      ctx.fillText(fl.text, fl.x, fl.y);
+    }
+    ctx.globalAlpha = 1;
+    // Red flash on wipeout / gold flash on golden pickup.
+    if (flashRed > 0) { ctx.fillStyle = "rgba(255,40,70," + (flashRed * 0.6) + ")"; ctx.fillRect(0, 0, L.W, L.H); }
+    if (flashGold > 0) { ctx.fillStyle = "rgba(255,217,74," + (flashGold * 0.35) + ")"; ctx.fillRect(0, 0, L.W, L.H); }
+    drawHUD();
+    if (S.screen === "title") drawTitle();
+    else if (S.screen === "over") drawOver();
+    ctx.restore();
+  }
+  function drawHUD() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,10,30,0.72)";
+    ctx.fillRect(0, 0, L.W, L.HUD_H);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 24px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, 14, 32);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.timeLeft <= 10 ? "#ff5e7a" : "#9ff3ff";
+    ctx.font = "bold 28px 'Segoe UI',sans-serif";
+    ctx.fillText(Math.ceil(S.timeLeft) + "s", L.W / 2, 34);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#ff5e7a"; ctx.font = "bold 24px 'Segoe UI',sans-serif";
+    var hearts = "";
+    for (var h = 0; h < L.MAX_HEARTS; h++) hearts += h < S.hearts ? "\u2665" : "\u00B7";
+    ctx.fillText(hearts, L.W - 14, 32);
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#ffd94a"; ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillText("COMBO x" + S.combo + "  ·  STARS " + S.stars + "  ·  RINGS " + S.rings, 14, 60);
+    ctx.textAlign = "right";
+    ctx.fillStyle = "#9ff3ff"; ctx.font = "bold 15px 'Segoe UI',sans-serif";
+    ctx.fillText("WAVE " + Math.round(L.scrollSpeed(elapsed)) + " px/s", L.W - 14, 60);
+    ctx.restore();
+  }
+  function drawTitle() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,10,30,0.9)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#35f0ff"; ctx.shadowColor = "#35f0ff"; ctx.shadowBlur = 22;
+    ctx.font = "bold 52px 'Segoe UI',sans-serif";
+    ctx.fillText("NEON", L.W / 2, 250);
+    ctx.fillStyle = "#7dffb0"; ctx.shadowColor = "#7dffb0";
+    ctx.fillText("SURF", L.W / 2, 310);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 20px 'Segoe UI',sans-serif";
+    ctx.fillText("60 seconds on the wave", L.W / 2, 356);
+    ctx.fillStyle = "#9ff3ff"; ctx.font = "17px 'Segoe UI',sans-serif";
+    ctx.fillText("Drag to carve — steer into the stars!", L.W / 2, 400);
+    ctx.fillText("Stars 100 · Rings 250 · Golden pays 5x", L.W / 2, 428);
+    ctx.fillStyle = "#ffd94a";
+    ctx.fillText("Chain 4 pickups to raise your combo to x5", L.W / 2, 456);
+    ctx.fillStyle = "#ff8ca0";
+    ctx.fillText("Rocks and buoys wipe you out — 3 hearts", L.W / 2, 484);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = "#ffffff"; ctx.font = "bold 22px 'Segoe UI',sans-serif";
+    ctx.fillText("TAP TO START", L.W / 2, 580);
+    ctx.globalAlpha = 1;
+    ctx.font = "15px 'Segoe UI',sans-serif";
+    ctx.fillStyle = "#9ff3ff";
+    ctx.fillText("BEST " + S.best, L.W / 2, 618);
+    ctx.restore();
+  }
+  function drawOver() {
+    ctx.save();
+    ctx.fillStyle = "rgba(4,10,30,0.82)";
+    ctx.fillRect(0, 0, L.W, L.H);
+    ctx.textAlign = "center";
+    ctx.fillStyle = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff";
+    ctx.shadowColor = S.hearts <= 0 ? "#ff5e7a" : "#35f0ff"; ctx.shadowBlur = 18;
+    ctx.font = "bold 44px 'Segoe UI',sans-serif";
+    ctx.fillText(S.hearts <= 0 ? "WIPED OUT!" : "TIME'S UP!", L.W / 2, 250);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 30px 'Segoe UI',sans-serif";
+    ctx.fillText("SCORE " + S.score, L.W / 2, 320);
+    ctx.fillStyle = "#9ff3ff";
+    ctx.font = "19px 'Segoe UI',sans-serif";
+    ctx.fillText("Stars " + S.stars + "  ·  Rings " + S.rings + "  ·  Wipeouts " + S.wipeouts, L.W / 2, 360);
+    if (S.flawless) {
+      ctx.fillStyle = "#ffd94a";
+      ctx.font = "bold 20px 'Segoe UI',sans-serif";
+      ctx.fillText("FLAWLESS +500 — no wipeouts!", L.W / 2, 396);
+    }
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "bold 19px 'Segoe UI',sans-serif";
+    ctx.fillText("BEST " + S.best, L.W / 2, 440);
+    var pulse = 0.7 + 0.3 * Math.sin(performance.now() / 300);
+    ctx.globalAlpha = pulse;
+    ctx.fillText("TAP TO PLAY AGAIN", L.W / 2, 520);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+  }
+
+  function toWorld(e) {
+    var r = canvas.getBoundingClientRect();
+    return { x: (e.clientX - r.left - ox) / scale, y: (e.clientY - r.top - oy) / scale };
+  }
+  function onDown(e) {
+    if (S.screen === "title" || S.screen === "over") { start(); return; }
+    if (S.screen !== "playing") return;
+    var w = toWorld(e);
+    surfer.targetX = L.clamp(w.x, 24, L.W - 24);
+    e.preventDefault();
+  }
+  function onMove(e) {
+    if (S.screen !== "playing") return;
+    var w = toWorld(e);
+    surfer.targetX = L.clamp(w.x, 24, L.W - 24);
+    e.preventDefault();
+  }
+  canvas.addEventListener("pointerdown", onDown);
+  canvas.addEventListener("pointermove", onMove);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" && (S.screen === "title" || S.screen === "over")) start();
+    if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") keys.left = true;
+    if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") keys.right = true;
+    if (e.key === "m" || e.key === "M") { muted = !muted; try { localStorage.setItem("neon_surf_mute", muted ? "1" : "0"); } catch (err) {} }
+  });
+  window.addEventListener("keyup", function (e) {
+    if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") keys.left = false;
+    if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") keys.right = false;
+  });
+
+  window.__surfState = S;
+  window.__surfDebug = {
+    state: function () {
+      return { screen: S.screen, score: S.score, combo: S.combo, streak: S.streak,
+        scored: S.scored, stars: S.stars, rings: S.rings,
+        goldenStars: S.goldenStars, goldenRings: S.goldenRings,
+        wipeouts: S.wipeouts, hearts: S.hearts,
+        timeLeft: Math.round(S.timeLeft * 10) / 10,
+        surfer: { x: Math.round(surfer.x), targetX: Math.round(surfer.targetX) },
+        obstacles: obstacles.length, starCount: stars.length, ringCount: rings.length,
+        invuln: Math.round(invuln * 100) / 100 };
+    },
+    start: function () { start(); },
+    setAuto: function (v) { auto = v; },
+    // Place a star right above the surfer: must collect exactly
+    // 100 x combo. Spawning is paused 2s so nothing else interferes.
+    debugStar: function () {
+      if (S.screen !== "playing") return null;
+      obstacles = []; stars = []; rings = []; safeT = 2;
+      stars.push({ x: surfer.x, y: L.SURFER_Y - 30, golden: false, spin: 0 });
+      return { score: S.score, combo: S.combo, stars: S.stars };
+    },
+    // Place a GOLDEN star right above the surfer: exactly 500 x combo.
+    debugGoldenStar: function () {
+      if (S.screen !== "playing") return null;
+      obstacles = []; stars = []; rings = []; safeT = 2;
+      stars.push({ x: surfer.x, y: L.SURFER_Y - 30, golden: true, spin: 0 });
+      return { score: S.score, combo: S.combo, stars: S.stars, goldenStars: S.goldenStars };
+    },
+    // Place a rock overlapping the surfer: exactly -1 heart, combo reset.
+    debugRock: function () {
+      if (S.screen !== "playing") return null;
+      obstacles = []; stars = []; rings = []; safeT = 2; invuln = 0;
+      obstacles.push({ kind: "rock", x: surfer.x, y: L.SURFER_Y - 10, r: 24, wob: 0, wobK: 0 });
+      return { hearts: S.hearts, wipeouts: S.wipeouts, combo: S.combo, score: S.score };
+    },
+    // Place a ring gate just above the surfer, gap centred on the
+    // surfer: must score exactly 250 x combo when it crosses.
+    debugRing: function () {
+      if (S.screen !== "playing") return null;
+      obstacles = []; stars = []; rings = []; safeT = 2;
+      rings.push({ x: surfer.x, y: L.SURFER_Y - 60, gapW: L.RING_GAP, golden: false, scored: false });
+      return { score: S.score, combo: S.combo, rings: S.rings };
+    },
+    // Place a ring gate whose gap is far from the surfer: no score,
+    // no heart lost.
+    debugRingMiss: function () {
+      if (S.screen !== "playing") return null;
+      obstacles = []; stars = []; rings = []; safeT = 2;
+      var gx = surfer.x > 240 ? 90 : 390;
+      rings.push({ x: gx, y: L.SURFER_Y - 60, gapW: L.RING_GAP, golden: false, scored: false });
+      return { score: S.score, combo: S.combo, rings: S.rings, hearts: S.hearts, gapX: gx };
+    }
+  };
+
+  reset();
+  var last = performance.now();
+  function frame(now) {
+    var dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    update(dt);
+    render();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  if (auto) start();
+})();
+</script>
+</body>
+</html>
